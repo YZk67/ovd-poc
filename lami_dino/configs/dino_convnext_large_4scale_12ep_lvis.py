@@ -15,25 +15,35 @@ model.novel_scale = 5.0
 dataloader = get_config("common/data/lvis_detr.py").dataloader
 optimizer = get_config("common/optim.py").AdamW
 lr_multiplier = get_config("common/lvis_schedule.py").lr_multiplier_12ep_warmup
+# lr_multiplier = get_config("common/lvis_schedule.py").lr_multiplier_12ep_64bs  # Use 64bs scheduler for batch size 64
 train = get_config("common/train.py").train
 
 
 # modify training config
 # train.init_checkpoint = "clip_convnext_large_trans.pth"
 train.init_checkpoint = "./pretrained_models/lami_convnext_large_12ep_lvis/model_final.pth"
-train.output_dir = "./output/lami_convnext_large_12ep_lvis"
+train.output_dir = "/root/autodl-tmp/lami_convnext_large_12ep_lvis"
 
 # max training iterations
-train.max_iter = 85200# TODO
+# - Original COCO dataset: 113600 images
+# Calculation logic:
+# - LVIS dataset: 100,170 images
+# - Formula: total_iterations = (dataset_size / total_batch_size) * num_epochs
+# - Batch size 16: 100,170 ÷ 16 = 6,260 iter/epoch → 75,120 total (12 epochs)
+# - Batch size 32: 100,170 ÷ 32 = 3,130 iter/epoch → 37,560 total (12 epochs)
+# - Batch size 64: 100,170 ÷ 64 = 1,565 iter/epoch → 18,780 total (12 epochs)
+# - Standardized values: 7,100 (bs16), 3,550 (bs32), 1,775 (bs64)
+# - LR scheduler: use lr_multiplier_12ep_warmup for batch size 32
+train.max_iter = 37560  # 12 epochs with batch size 32: 100170/32*12
 
-# run evaluation every 5000 iters
-train.eval_period = 85200
+# run evaluation every 3130 iters
+train.eval_period = 3130  # Evaluate after each epoch
 
 # log training infomation every 20 iters
-train.log_period = 200
+train.log_period = 20
 
-# save checkpoint every 5000 iters
-train.checkpointer.period = 7100//2
+# save checkpoint every 3130 iters
+train.checkpointer.period = 3130  # 1 epoch worth of iterations
 
 # gradient clipping for training
 train.clip_grad.enabled = True
@@ -62,12 +72,12 @@ optimizer.weight_decay = 1e-4
 optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 1
 
 # modify dataloader config
-dataloader.train.num_workers = 8
+dataloader.train.num_workers = 8  # More stable for 8-GPU training
 
 # please notice that this is total batch size.
 # surpose you're using 4 gpus for training and the batch size for
 # each gpu is 16/4 = 4
-dataloader.train.total_batch_size = 32
+dataloader.train.total_batch_size = 32  # 8 GPUs × 4 images/GPU (more conservative)
 
 # dump the testing results into output_dir for visualization
 dataloader.evaluator.output_dir = train.output_dir

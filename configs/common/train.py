@@ -12,7 +12,7 @@ train = dict(
     # options for DistributedDataParallel
     ddp=dict(
         broadcast_buffers=False,
-        find_unused_parameters=False,
+        find_unused_parameters=True,
         fp16_compression=False,
     ),
     # options for Gradient Clipping during training
