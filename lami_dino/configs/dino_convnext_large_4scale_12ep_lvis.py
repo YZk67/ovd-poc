@@ -82,3 +82,7 @@ dataloader.train.total_batch_size = 32  # 8 GPUs × 4 images/GPU (more conservat
 # dump the testing results into output_dir for visualization
 dataloader.evaluator.output_dir = train.output_dir
 dataloader.test.dataset.names = "lvis_v1_val"
+
+model.language.use_tpa = True
+model.language.text_embed_path = model.query_path
+model.language.eval_text_embed_path = model.eval_query_path

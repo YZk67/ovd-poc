@@ -7,7 +7,6 @@ from detectron2.config import LazyCall as L
 from detrex.modeling.backbone import ConvNeXt
 from detrex.modeling.matcher import HungarianMatcher
 from detrex.modeling.neck import ChannelMapper
-from detrex.modeling.classifier import ZeroShotClassifier
 from detrex.layers import PositionEmbeddingSine
 
 from lami_dino.modeling import (
@@ -16,6 +15,7 @@ from lami_dino.modeling import (
     DINOTransformerDecoder,
     DINOTransformer,
     DINOCriterion,
+    TextClassifier,
 )
 
 model = L(DINO)(
@@ -98,15 +98,32 @@ model = L(DINO)(
         gamma=2.0,
         two_stage_binary_cls=False,
     ),
-    classifier=L(ZeroShotClassifier)( 
+    classifier=L(TextClassifier)( 
         input_shape=256,
         num_classes="${..num_classes}", 
         zs_weight_dim=768,
         zs_weight_path="${..query_path}",
         eval_zs_weight_path="${..eval_query_path}",
-        norm_weight=True,),
+        norm_weight=True,
+        use_tpa="${..language.use_tpa}",
+        text_embed_path="${..language.text_embed_path}",
+        eval_text_embed_path="${..language.eval_text_embed_path}",
+        tpa_num_prototypes="${..language.num_prototypes}",
+        tpa_hidden_dim="${..language.hidden_dim}",
+        tpa_dropout="${..language.dropout}",
+        tpa_tau="${..language.tau}",
+    ),
     query_path="dataset/metadata/coco_clip_convnextl_a+cname.npy",
     eval_query_path="dataset/metadata/coco_clip_convnextl_a+cname.npy",
+    language=dict(
+        use_tpa=False,
+        text_embed_path="${..query_path}",
+        eval_text_embed_path="${..eval_query_path}",
+        num_prototypes=4,
+        hidden_dim=256,
+        dropout=0.1,
+        tau=0.1,
+    ),
     vlm_query_path = None,
     save_dir = None,
     score_ensemble = False,

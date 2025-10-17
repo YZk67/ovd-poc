@@ -46,6 +46,8 @@ model.device = train.device
 model.num_classes = 8212
 model.query_path = "dataset/metadata/concept_dict_visual_desc_convnextl.npy"
 model.eval_query_path = "dataset/metadata/lvis_visual_desc_convnextl.npy"
+model.language.text_embed_path = model.query_path
+model.language.eval_text_embed_path = model.eval_query_path
 
 model.use_fed_loss = True
 model.cluster_fed_loss = True
