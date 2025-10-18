@@ -2,6 +2,11 @@ from detrex.config import get_config
 from .models.dino_convnextl import model
 from datetime import datetime
 
+# Remove 'language' key from model config as it's not a parameter for DINO.__init__()
+# The language config is only used for TextClassifier via ${..language.xxx} references
+if "language" in model:
+    del model["language"]
+
 model.vlm_query_path = "dataset/metadata/lvis_visual_desc_confuse_lvis_convnextl.npy"
 model.score_ensemble = True
 model.backbone.score_ensemble = model.score_ensemble
@@ -32,21 +37,22 @@ train.output_dir = f"/root/autodl-tmp/lami_convnext_large_12ep_lvis_{timestamp}"
 # Calculation logic:
 # - LVIS dataset: 100,170 images
 # - Formula: total_iterations = (dataset_size / total_batch_size) * num_epochs
+# - Batch size 4: 100,170 ÷ 4 = 25,042.5 iter/epoch → 300,510 total (12 epochs) Single GPU A100
 # - Batch size 16: 100,170 ÷ 16 = 6,260 iter/epoch → 75,120 total (12 epochs)
 # - Batch size 32: 100,170 ÷ 32 = 3,130 iter/epoch → 37,560 total (12 epochs)
 # - Batch size 64: 100,170 ÷ 64 = 1,565 iter/epoch → 18,780 total (12 epochs)
 # - Standardized values: 7,100 (bs16), 3,550 (bs32), 1,775 (bs64)
 # - LR scheduler: use lr_multiplier_12ep_warmup for batch size 32
-train.max_iter = 37560  # 12 epochs with batch size 32: 100170/32*12 -- 85200
+train.max_iter = 100170  # Single GPU A100 4 epochs 12 epochs with batch size 32: 100170/32*12 -- 85200
 
 # run evaluation every 3130 iters
-train.eval_period = 3130  # Evaluate after each epoch 7100//2
+train.eval_period = 25042  # Evaluate after each epoch 7100//2
 
 # log training infomation every 20 iters
-train.log_period = 20
+train.log_period = 50
 
 # save checkpoint every 3130 iters
-train.checkpointer.period = 3130  # 1 epoch worth of iterations
+train.checkpointer.period = 25042  # 1 epoch worth of iterations
 
 # gradient clipping for training
 train.clip_grad.enabled = True
@@ -58,8 +64,9 @@ train.device = "cuda"
 model.device = train.device
 
 model.num_classes = 1203
-# model.query_path = "dataset/metadata/lvis_visual_desc_convnextl.npy"
-# model.eval_query_path = "dataset/metadata/lvis_visual_desc_convnextl.npy"
+# Set the text embedding paths for TPA
+model.query_path = "dataset/metadata/lvis_tpa_prompts_convnextl.npy"
+model.eval_query_path = "dataset/metadata/lvis_tpa_prompts_convnextl.npy"
 
 # model.use_fed_loss = True
 # model.cluster_fed_loss = True
@@ -69,18 +76,20 @@ model.num_classes = 1203
 # model.select_box_nums_for_evaluation = 300
 
 # modify optimizer config
-optimizer.lr = 1e-4
+optimizer.lr = 1.25e-5 #(1 GPU)  - 1e-4 (8 GPUs)
 optimizer.betas = (0.9, 0.999)
 optimizer.weight_decay = 1e-4
 optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 1
 
 # modify dataloader config
-dataloader.train.num_workers = 8  # More stable for 8-GPU training
+dataloader.train.num_workers = 4  # More stable for 8-GPU training
 
 # please notice that this is total batch size.
 # surpose you're using 4 gpus for training and the batch size for
 # each gpu is 16/4 = 4
-dataloader.train.total_batch_size = 32  # 8 GPUs × 4 images/GPU (more conservative)
+# Note: Using Option 3 (averaged embeddings), batch_size can remain at 4
+# If using Option 2 (6015 queries), reduce to batch_size=1
+dataloader.train.total_batch_size = 4  # Can use 4 with Option 3
 
 # dump the testing results into output_dir for visualization
 dataloader.evaluator.output_dir = train.output_dir
@@ -95,12 +104,14 @@ model.cat_freq_path = "dataset/lvis/lvis_v1_train_norare_cat_info.json"
 # model.fed_loss_num_cat=100
 model.select_box_nums_for_evaluation = 300
 
-model.language.use_tpa = True
-model.language.text_embed_path = "dataset/metadata/lvis_tpa_prompts_convnextl.npy"
-model.language.eval_text_embed_path = "dataset/metadata/lvis_tpa_prompts_convnextl.npy"
+# Enable TPA (Text Prototype Aggregator) by modifying the classifier
+model.classifier.use_tpa = True
+model.classifier.text_embed_path = "dataset/metadata/lvis_tpa_prompts_convnextl.npy"
+model.classifier.eval_text_embed_path = "dataset/metadata/lvis_tpa_prompts_convnextl.npy"
+model.classifier.tpa_num_prototypes = 4
+model.classifier.tpa_hidden_dim = 256
+model.classifier.tpa_dropout = 0.0
+model.classifier.tpa_tau = 0.07
 
-# TPA 的基础超参（与你实现一致；Phase 1 先保持稳定）
-model.language.num_prototypes = 4
-model.language.hidden_dim = 256
-model.language.dropout = 0.0
-model.language.tau = 0.07
+# Enable Automatic Mixed Precision (AMP) for faster training
+train.amp.enabled = True

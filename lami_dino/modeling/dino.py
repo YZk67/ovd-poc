@@ -167,13 +167,46 @@ class DINO(nn.Module):
         self.select_box_nums_for_evaluation = select_box_nums_for_evaluation
 
         content_query_embedding = torch.tensor(np.load(query_path), dtype=torch.float32, device=device).contiguous()
+        
+        # Handle multi-prototype embeddings: support both 2D [C, D] and 3D [C, K, D] formats
+        if content_query_embedding.ndim == 3:
+            # Multi-prototype mode: [C, K, D] where C=num_classes, K=num_prototypes
+            num_classes_from_embed, num_prototypes, feat_dim = content_query_embedding.shape
+            print(f"[Multi-Prototype Mode] Loaded {num_classes_from_embed} classes × {num_prototypes} prototypes × {feat_dim}D")
+            
+            # Store original multi-prototype embeddings for future advanced aggregation
+            self.content_query_embedding_raw = content_query_embedding  # Keep [C, K, D]
+            
+            # Current strategy: Simple averaging
+            # TODO: Future improvements can use attention-based or gating aggregation
+            # Options: (1) Attention-weighted (2) Top-1 selection (3) Learnable gating
+            content_query_embedding = self._aggregate_prototypes(content_query_embedding, method='mean')
+            
+            print(f"[TPA Mode] Aggregated {num_prototypes} prototypes to [C={num_classes_from_embed}, D={feat_dim}] using mean")
+            print(f"[TPA Mode] TextClassifier will use TPA with {num_prototypes} prototypes independently")
+            
+            self.num_prototypes = num_prototypes
+            self.use_multi_prototype_queries = False  # Not expanding queries, using aggregation
+        else:
+            # Standard mode: [C, D]
+            feat_dim = content_query_embedding.shape[1]
+            self.num_prototypes = 1
+            self.use_multi_prototype_queries = False
+            self.content_query_embedding_raw = None
+        
         self.content_query_embedding = F.normalize(content_query_embedding, p=2, dim=1)
 
         eval_content_query_embedding = torch.tensor(np.load(eval_query_path), dtype=torch.float32, device=device).contiguous()
+        if eval_content_query_embedding.ndim == 3:
+            # Average eval embeddings if multi-prototype format
+            eval_content_query_embedding = eval_content_query_embedding.mean(dim=1)
         self.eval_content_query_embedding = F.normalize(eval_content_query_embedding, p=2, dim=1)
+        
         # self.eval_content_id = torch.tensor(np.load(eval_id_path), dtype=torch.int64, device=device)
         if vlm_query_path:
             vlm_content_query_embedding = torch.tensor(np.load(vlm_query_path), dtype=torch.float32, device=device).contiguous()# [1203, 768]
+            if vlm_content_query_embedding.ndim == 3:
+                vlm_content_query_embedding = vlm_content_query_embedding.mean(dim=1)  # VLM queries use average
             self.vlm_content_query_embedding = F.normalize(vlm_content_query_embedding, p=2, dim=1)
         
         _, feat_dim = self.content_query_embedding.shape
@@ -209,6 +242,42 @@ class DINO(nn.Module):
         self.save_dir = save_dir
         if self.save_dir:
             os.makedirs(self.save_dir, exist_ok=True)
+    
+    def _aggregate_prototypes(self, embeddings, method='mean'):
+        """
+        Aggregate multiple prototypes into a single embedding.
+        
+        Args:
+            embeddings: [C, K, D] multi-prototype embeddings
+            method: aggregation method - 'mean', 'max', 'attention', 'gating'
+        
+        Returns:
+            aggregated: [C, D] aggregated embeddings
+        
+        Future extensions:
+            - 'attention': Region-aware attention weighting (requires region features)
+            - 'max': Max pooling across prototypes
+            - 'gating': Learnable gating network
+            - 'top1': Select most confident prototype
+        """
+        if method == 'mean':
+            # Simple averaging: mathematically equivalent to pre-averaging before indexing
+            return embeddings.mean(dim=1)
+        
+        elif method == 'max':
+            # Max pooling: select strongest feature per dimension
+            return embeddings.max(dim=1)[0]
+        
+        # TODO: Implement advanced methods
+        # elif method == 'attention':
+        #     # Requires region features - implement in transformer forward
+        #     pass
+        # elif method == 'gating':
+        #     # Learnable gating - requires additional network
+        #     pass
+        
+        else:
+            raise ValueError(f"Unknown aggregation method: {method}")
 
     def filter_content_info(self, batched_inputs):
         freq_weight = self.freq_weight if self.freq_weight is not None else torch.ones(self.num_classes, device=self.device)
@@ -302,6 +371,7 @@ class DINO(nn.Module):
             multi_level_position_embeddings.append(self.position_embedding(multi_level_masks[-1]))
 
         if self.training:
+            # Select content queries based on Fed Loss sampling (if enabled)
             content_query_embeds = self.content_query_embedding[content_inds] if content_inds is not None else self.content_query_embedding
             content_query_embeds = self.content_layer(content_query_embeds)
             content_query_embeds = F.normalize(content_query_embeds, p=2, dim=1)
