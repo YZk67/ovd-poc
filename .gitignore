@@ -147,3 +147,4 @@ lvis-debug/*
 pretrained_models/*
 .DS_Store
 .zipignore
+dataset2/
