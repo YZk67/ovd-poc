@@ -1,5 +1,6 @@
 from detrex.config import get_config
 from .models.dino_convnextl import model
+from datetime import datetime
 
 model.vlm_query_path = "dataset/metadata/lvis_visual_desc_confuse_lvis_convnextl.npy"
 model.score_ensemble = True
@@ -22,7 +23,9 @@ train = get_config("common/train.py").train
 # modify training config
 # train.init_checkpoint = "clip_convnext_large_trans.pth"
 train.init_checkpoint = "./pretrained_models/lami_convnext_large_12ep_lvis/model_final.pth"
-train.output_dir = "/root/autodl-tmp/lami_convnext_large_12ep_lvis"
+# Add timestamp to output directory
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+train.output_dir = f"/root/autodl-tmp/lami_convnext_large_12ep_lvis_{timestamp}"
 
 # max training iterations
 # - Original COCO dataset: 113600 images
@@ -34,10 +37,10 @@ train.output_dir = "/root/autodl-tmp/lami_convnext_large_12ep_lvis"
 # - Batch size 64: 100,170 ÷ 64 = 1,565 iter/epoch → 18,780 total (12 epochs)
 # - Standardized values: 7,100 (bs16), 3,550 (bs32), 1,775 (bs64)
 # - LR scheduler: use lr_multiplier_12ep_warmup for batch size 32
-train.max_iter = 37560  # 12 epochs with batch size 32: 100170/32*12
+train.max_iter = 37560  # 12 epochs with batch size 32: 100170/32*12 -- 85200
 
 # run evaluation every 3130 iters
-train.eval_period = 3130  # Evaluate after each epoch
+train.eval_period = 3130  # Evaluate after each epoch 7100//2
 
 # log training infomation every 20 iters
 train.log_period = 20
@@ -55,15 +58,15 @@ train.device = "cuda"
 model.device = train.device
 
 model.num_classes = 1203
-model.query_path = "dataset/metadata/lvis_visual_desc_convnextl.npy"
-model.eval_query_path = "dataset/metadata/lvis_visual_desc_convnextl.npy"
+# model.query_path = "dataset/metadata/lvis_visual_desc_convnextl.npy"
+# model.eval_query_path = "dataset/metadata/lvis_visual_desc_convnextl.npy"
 
-model.use_fed_loss = True
-model.cluster_fed_loss = True
-model.cluster_label_path = 'dataset/cluster/lvis_cluster_128.npy'
-model.cat_freq_path = "dataset/lvis/lvis_v1_train_norare_cat_info.json"
-model.fed_loss_num_cat=100
-model.select_box_nums_for_evaluation = 300
+# model.use_fed_loss = True
+# model.cluster_fed_loss = True
+# model.cluster_label_path = 'dataset/cluster/lvis_cluster_128.npy'
+# model.cat_freq_path = "dataset/lvis/lvis_v1_train_norare_cat_info.json"
+# model.fed_loss_num_cat=100
+# model.select_box_nums_for_evaluation = 300
 
 # modify optimizer config
 optimizer.lr = 1e-4
@@ -83,6 +86,21 @@ dataloader.train.total_batch_size = 32  # 8 GPUs × 4 images/GPU (more conservat
 dataloader.evaluator.output_dir = train.output_dir
 dataloader.test.dataset.names = "lvis_v1_val"
 
+# ====== Phase 1：显式稳定化开关（强烈建议开启，避免隐式变更） ======
+# 关闭长尾 re-weight / 聚类增强，避免训练不稳（尽管 dino.py 默认就是 False）
+model.use_fed_loss = False
+model.cluster_fed_loss = False
+# model.cluster_label_path = None
+model.cat_freq_path = "dataset/lvis/lvis_v1_train_norare_cat_info.json"
+# model.fed_loss_num_cat=100
+model.select_box_nums_for_evaluation = 300
+
 model.language.use_tpa = True
-model.language.text_embed_path = model.query_path
-model.language.eval_text_embed_path = model.eval_query_path
+model.language.text_embed_path = "dataset/metadata/lvis_tpa_prompts_convnextl.npy"
+model.language.eval_text_embed_path = "dataset/metadata/lvis_tpa_prompts_convnextl.npy"
+
+# TPA 的基础超参（与你实现一致；Phase 1 先保持稳定）
+model.language.num_prototypes = 4
+model.language.hidden_dim = 256
+model.language.dropout = 0.0
+model.language.tau = 0.07
