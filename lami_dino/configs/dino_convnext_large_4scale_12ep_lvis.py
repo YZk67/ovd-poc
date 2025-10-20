@@ -64,9 +64,9 @@ train.device = "cuda"
 model.device = train.device
 
 model.num_classes = 1203
-# Set the text embedding paths for TPA
-model.query_path = "dataset/metadata/lvis_tpa_prompts_convnextl.npy"
-model.eval_query_path = "dataset/metadata/lvis_tpa_prompts_convnextl.npy"
+# Set the text embedding paths for TPA (using Claude-generated 8 prompts per class)
+model.query_path = "dataset2/metadata/lvis_claude_prompts_convnextl.npy"
+model.eval_query_path = "dataset2/metadata/lvis_claude_prompts_convnextl.npy"
 
 # model.use_fed_loss = True
 # model.cluster_fed_loss = True
@@ -106,11 +106,11 @@ model.select_box_nums_for_evaluation = 300
 
 # Enable TPA (Text Prototype Aggregator) by modifying the classifier
 model.classifier.use_tpa = True
-model.classifier.text_embed_path = "dataset/metadata/lvis_tpa_prompts_convnextl.npy"
-model.classifier.eval_text_embed_path = "dataset/metadata/lvis_tpa_prompts_convnextl.npy"
-model.classifier.tpa_num_prototypes = 4
+model.classifier.text_embed_path = "dataset2/metadata/lvis_claude_prompts_convnextl.npy"
+model.classifier.eval_text_embed_path = "dataset2/metadata/lvis_claude_prompts_convnextl.npy"
+model.classifier.tpa_num_prototypes = 5  # 8 prompts -> 5 prototypes (better utilization)
 model.classifier.tpa_hidden_dim = 256
-model.classifier.tpa_dropout = 0.0
+model.classifier.tpa_dropout = 0.1  # Add dropout for regularization
 model.classifier.tpa_tau = 0.07
 
 # Enable Automatic Mixed Precision (AMP) for faster training
