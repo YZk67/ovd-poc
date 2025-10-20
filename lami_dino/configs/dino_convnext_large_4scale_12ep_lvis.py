@@ -95,23 +95,23 @@ dataloader.train.total_batch_size = 4  # Can use 4 with Option 3
 dataloader.evaluator.output_dir = train.output_dir
 dataloader.test.dataset.names = "lvis_v1_val"
 
-# ====== Phase 1：显式稳定化开关（强烈建议开启，避免隐式变更） ======
-# 关闭长尾 re-weight / 聚类增强，避免训练不稳（尽管 dino.py 默认就是 False）
+# ====== Phase 1：测试 Claude Prompts 单独效果 ======
+# 暂时关闭 fed loss，只测试 Claude prompts 的贡献
 model.use_fed_loss = False
 model.cluster_fed_loss = False
-# model.cluster_label_path = None
+# model.cluster_label_path = 'dataset/cluster/lvis_cluster_128.npy'
 model.cat_freq_path = "dataset/lvis/lvis_v1_train_norare_cat_info.json"
-# model.fed_loss_num_cat=100
+# model.fed_loss_num_cat = 100
 model.select_box_nums_for_evaluation = 300
 
 # Enable TPA (Text Prototype Aggregator) by modifying the classifier
 model.classifier.use_tpa = True
-model.classifier.text_embed_path = "dataset2/metadata/lvis_claude_prompts_convnextl.npy"
-model.classifier.eval_text_embed_path = "dataset2/metadata/lvis_claude_prompts_convnextl.npy"
+model.classifier.text_embed_path = "dataset/metadata/lvis_claude_prompts_convnextl.npy"
+model.classifier.eval_text_embed_path = "dataset/metadata/lvis_claude_prompts_convnextl.npy"
 model.classifier.tpa_num_prototypes = 5  # 8 prompts -> 5 prototypes (better utilization)
 model.classifier.tpa_hidden_dim = 256
 model.classifier.tpa_dropout = 0.1  # Add dropout for regularization
-model.classifier.tpa_tau = 0.07
+model.classifier.tpa_tau = 0.10  # Slightly larger for better utilization of 8 Claude prompts
 
 # Enable Automatic Mixed Precision (AMP) for faster training
 train.amp.enabled = True
