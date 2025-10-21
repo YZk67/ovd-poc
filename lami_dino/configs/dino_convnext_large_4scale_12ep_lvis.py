@@ -24,6 +24,9 @@ lr_multiplier = get_config("common/lvis_schedule.py").lr_multiplier_12ep_warmup
 # lr_multiplier = get_config("common/lvis_schedule.py").lr_multiplier_12ep_64bs  # Use 64bs scheduler for batch size 64
 train = get_config("common/train.py").train
 
+# Set random seed for reproducibility
+train.seed = 42  # Fixed seed for fair comparison
+
 
 # modify training config
 # train.init_checkpoint = "clip_convnext_large_trans.pth"
@@ -95,23 +98,23 @@ dataloader.train.total_batch_size = 4  # Can use 4 with Option 3
 dataloader.evaluator.output_dir = train.output_dir
 dataloader.test.dataset.names = "lvis_v1_val"
 
-# ====== Phase 1：显式稳定化开关（强烈建议开启，避免隐式变更） ======
-# 关闭长尾 re-weight / 聚类增强，避免训练不稳（尽管 dino.py 默认就是 False）
-model.use_fed_loss = False
+# ====== Baseline Experiment: Old Prompts (5 prompts per class) ======
+# Fed Loss是LVIS必须的基础设施，所有实验都需要使用
+model.use_fed_loss = True  # ✅ 必须开启，处理长尾分布
 model.cluster_fed_loss = False
-# model.cluster_label_path = None
+model.cluster_label_path = 'dataset/cluster/lvis_cluster_128.npy'
 model.cat_freq_path = "dataset/lvis/lvis_v1_train_norare_cat_info.json"
-# model.fed_loss_num_cat=100
+model.fed_loss_num_cat = 100  # 每次采样100个类别计算loss
 model.select_box_nums_for_evaluation = 300
 
 # Enable TPA (Text Prototype Aggregator) by modifying the classifier
 model.classifier.use_tpa = True
 model.classifier.text_embed_path = "dataset/metadata/lvis_tpa_prompts_convnextl.npy"
 model.classifier.eval_text_embed_path = "dataset/metadata/lvis_tpa_prompts_convnextl.npy"
-model.classifier.tpa_num_prototypes = 4
+model.classifier.tpa_num_prototypes = 4 # 5 prompts -> 4 prototypes
 model.classifier.tpa_hidden_dim = 256
-model.classifier.tpa_dropout = 0.0
-model.classifier.tpa_tau = 0.07
+model.classifier.tpa_dropout = 0.1  # Add dropout for regularization (same as Claude version)
+model.classifier.tpa_tau = 0.10  # Same tau as Claude version for fair comparison
 
 # Enable Automatic Mixed Precision (AMP) for faster training
 train.amp.enabled = True
