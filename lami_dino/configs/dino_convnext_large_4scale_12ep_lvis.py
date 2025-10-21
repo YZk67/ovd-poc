@@ -68,8 +68,8 @@ model.device = train.device
 
 model.num_classes = 1203
 # Set the text embedding paths for TPA (using Claude-generated 8 prompts per class)
-model.query_path = "dataset2/metadata/lvis_claude_prompts_convnextl.npy"
-model.eval_query_path = "dataset2/metadata/lvis_claude_prompts_convnextl.npy"
+model.query_path = "dataset/metadata/lvis_claude_prompts_convnextl.npy"
+model.eval_query_path = "dataset/metadata/lvis_claude_prompts_convnextl.npy"
 
 # model.use_fed_loss = True
 # model.cluster_fed_loss = True
