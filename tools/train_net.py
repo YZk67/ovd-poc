@@ -127,9 +127,9 @@ class Trainer(SimpleTrainer):
             logger.info(f"soft_attention_tau: {self.model.transformer.soft_attention_tau}")
             
             # 检查 TPA 参数的梯度
-            if hasattr(self.model.decoder.class_embed[0], 'tpa'):
+            if hasattr(self.model.transformer.decoder.class_embed[0], 'tpa'):
                 logger.info("TPA parameters gradient status:")
-                for n, p in self.model.decoder.class_embed[0].tpa.named_parameters():
+                for n, p in self.model.transformer.decoder.class_embed[0].tpa.named_parameters():
                     logger.info(f"  {n}: grad={'Yes' if p.grad is not None else 'No'}")
             else:
                 logger.info("TPA not found in class_embed[0]")
