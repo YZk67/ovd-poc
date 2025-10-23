@@ -79,7 +79,7 @@ model.eval_query_path = "dataset/metadata/lvis_claude_prompts_convnextl.npy"
 # model.select_box_nums_for_evaluation = 300
 
 # modify optimizer config
-optimizer.lr = 1.25e-5 # (1GPU); 1e-4 (8 GPUs) - 使用原来成功的学习率
+optimizer.lr = 1e-4 # (1GPU); 1e-4 (8 GPUs) - 使用原来成功的学习率
 optimizer.betas = (0.9, 0.999)
 optimizer.weight_decay = 1e-4
 optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 1
