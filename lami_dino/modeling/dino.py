@@ -395,7 +395,7 @@ class DINO(nn.Module):
             )
             proto_ckd = F.normalize(proto_ckd, p=2, dim=-1)
             raw_content_query_embeds = proto_ckd  # [C,K,embed_dim]
-            print(f"[TPA Mode] Using TPA to aggregate {self.num_prompts} prompts into prototypes with shape {proto_ckd.shape}")
+            print(f"[TPA Mode] Using TPA to aggregate prompts into {proto_ckd.shape[1]} prototypes with shape {proto_ckd.shape}")
         else:
             # Fallback to aggregated version
             content_query_embedding = self.content_layer(self.content_query_embedding)
