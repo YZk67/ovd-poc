@@ -96,12 +96,16 @@ class DINO(nn.Module):
         beta: float =0.7,
         novel_scale: float =5.0,
         clip_head_path=None,
+        use_soft_attention: bool = True,
+        soft_attention_tau: float = 0.1,
     ):
         super().__init__()
         self.vlm_temperature = vlm_temperature
         self.alpha = alpha
         self.beta = beta
         self.novel_scale = novel_scale
+        self.use_soft_attention = use_soft_attention
+        self.soft_attention_tau = soft_attention_tau
         # define backbone and position embedding module
         self.backbone = backbone
         self.position_embedding = position_embedding
@@ -174,19 +178,21 @@ class DINO(nn.Module):
             num_classes_from_embed, num_prototypes, feat_dim = content_query_embedding.shape
             print(f"[Multi-Prototype Mode] Loaded {num_classes_from_embed} classes × {num_prototypes} prototypes × {feat_dim}D")
             
-            # Store original multi-prototype embeddings for future advanced aggregation
+            # Store original multi-prototype embeddings
             self.content_query_embedding_raw = content_query_embedding  # Keep [C, K, D]
             
-            # Current strategy: Simple averaging
-            # TODO: Future improvements can use attention-based or gating aggregation
-            # Options: (1) Attention-weighted (2) Top-1 selection (3) Learnable gating
-            content_query_embedding = self._aggregate_prototypes(content_query_embedding, method='mean')
+            # For compatibility with existing code, create aggregated version
+            # This is only used for dimension compatibility and Fed Loss sampling
+            content_query_embedding_agg = self._aggregate_prototypes(content_query_embedding, method='mean')
             
-            print(f"[TPA Mode] Aggregated {num_prototypes} prototypes to [C={num_classes_from_embed}, D={feat_dim}] using mean")
+            print(f"[TPA Mode] Loaded {num_prototypes} prototypes per class [C={num_classes_from_embed}, K={num_prototypes}, D={feat_dim}]")
             print(f"[TPA Mode] TextClassifier will use TPA with {num_prototypes} prototypes independently")
+            print(f"[TPA Mode] Soft-attention aggregation enabled for query initialization")
             
             self.num_prototypes = num_prototypes
             self.use_multi_prototype_queries = False  # Not expanding queries, using aggregation
+            # Use aggregated version for compatibility
+            content_query_embedding = content_query_embedding_agg
         else:
             # Standard mode: [C, D]
             feat_dim = content_query_embedding.shape[1]
@@ -243,22 +249,24 @@ class DINO(nn.Module):
         if self.save_dir:
             os.makedirs(self.save_dir, exist_ok=True)
     
-    def _aggregate_prototypes(self, embeddings, method='mean'):
+    def _aggregate_prototypes(self, embeddings, method='mean', region_feats=None, tau=0.1):
         """
         Aggregate multiple prototypes into a single embedding.
         
         Args:
             embeddings: [C, K, D] multi-prototype embeddings
-            method: aggregation method - 'mean', 'max', 'attention', 'gating'
+            method: aggregation method - 'mean', 'max', 'soft_attention'
+            region_feats: [B, N, D] region features for soft-attention (required for 'soft_attention')
+            tau: temperature parameter for soft-attention (default: 0.1)
         
         Returns:
-            aggregated: [C, D] aggregated embeddings
+            aggregated: [C, D] aggregated embeddings for 'mean'/'max'
+            OR similarity scores: [B, C, N] for 'soft_attention'
         
-        Future extensions:
-            - 'attention': Region-aware attention weighting (requires region features)
-            - 'max': Max pooling across prototypes
-            - 'gating': Learnable gating network
-            - 'top1': Select most confident prototype
+        Methods:
+            - 'mean': Simple averaging (current baseline)
+            - 'max': Max pooling across prototypes  
+            - 'soft_attention': Soft-attention aggregation preserving semantic granularity
         """
         if method == 'mean':
             # Simple averaging: mathematically equivalent to pre-averaging before indexing
@@ -268,13 +276,27 @@ class DINO(nn.Module):
             # Max pooling: select strongest feature per dimension
             return embeddings.max(dim=1)[0]
         
-        # TODO: Implement advanced methods
-        # elif method == 'attention':
-        #     # Requires region features - implement in transformer forward
-        #     pass
-        # elif method == 'gating':
-        #     # Learnable gating - requires additional network
-        #     pass
+        elif method == 'soft_attention':
+            # Soft-attention aggregation: preserves semantic granularity
+            # Formula: s_i,c = sum_k α_i,c,k * cos(f_i, t_c,k)
+            # where α_i,c,k = softmax(cos(f_i, t_c,k) / τ)
+            if region_feats is None:
+                raise ValueError("region_feats required for soft_attention method")
+            
+            # Normalize embeddings and region features
+            embeddings_norm = F.normalize(embeddings, p=2, dim=-1)  # [C, K, D]
+            region_feats_norm = F.normalize(region_feats, p=2, dim=-1)  # [B, N, D]
+            
+            # Compute similarity: [B, N, D] @ [C, K, D]^T -> [B, C, N, K]
+            sim = torch.einsum("bnd,ckd->bcnk", region_feats_norm, embeddings_norm)
+            
+            # Soft-attention weights: α_i,c,k = softmax(cos(f_i, t_c,k) / τ)
+            alpha = F.softmax(sim / tau, dim=-1)  # [B, C, N, K]
+            
+            # Weighted aggregation: s_i,c = sum_k α_i,c,k * cos(f_i, t_c,k)
+            sim_aggregated = (alpha * sim).sum(dim=-1)  # [B, C, N]
+            
+            return sim_aggregated
         
         else:
             raise ValueError(f"Unknown aggregation method: {method}")
@@ -370,14 +392,28 @@ class DINO(nn.Module):
             )
             multi_level_position_embeddings.append(self.position_embedding(multi_level_masks[-1]))
 
-        if self.training:
-            # Select content queries based on Fed Loss sampling (if enabled)
-            content_query_embeds = self.content_query_embedding[content_inds] if content_inds is not None else self.content_query_embedding
+        # Handle multi-prototype vs single-prototype modes
+        if hasattr(self, 'content_query_embedding_raw') and self.content_query_embedding_raw is not None:
+            # Multi-prototype mode: use raw embeddings and apply content_layer to each prototype
+            raw_content_query_embeds = self.content_query_embedding_raw[content_inds] if content_inds is not None else self.content_query_embedding_raw
+            # Apply content_layer to each prototype: [C, K, D] -> [C, K, embed_dim]
+            C, K, D = raw_content_query_embeds.shape
+            raw_content_query_embeds = raw_content_query_embeds.view(-1, D)  # [C*K, D]
+            raw_content_query_embeds = self.content_layer(raw_content_query_embeds)  # [C*K, embed_dim]
+            raw_content_query_embeds = raw_content_query_embeds.view(C, K, -1)  # [C, K, embed_dim]
+            raw_content_query_embeds = F.normalize(raw_content_query_embeds, p=2, dim=-1)
+            
+            # For compatibility, also create aggregated version
+            content_query_embeds = raw_content_query_embeds.mean(dim=1)  # [C, embed_dim]
+        else:
+            # Single-prototype mode: use aggregated embeddings
+            if self.training:
+                content_query_embeds = self.content_query_embedding[content_inds] if content_inds is not None else self.content_query_embedding
+            else:
+                content_query_embeds = self.eval_content_query_embedding
             content_query_embeds = self.content_layer(content_query_embeds)
             content_query_embeds = F.normalize(content_query_embeds, p=2, dim=1)
-        else:
-            content_query_embeds = self.content_layer(self.eval_content_query_embedding)
-            content_query_embeds = F.normalize(content_query_embeds, p=2, dim=1)
+            raw_content_query_embeds = content_query_embeds
  
         # denoising preprocessing
         # prepare label query embedding
@@ -394,11 +430,16 @@ class DINO(nn.Module):
                 num_classes=cdn_num_classes,
                 hidden_dim=self.embed_dim,
                 # label_enc=self.label_enc,
-                content_query_embeds=content_query_embeds,
+                content_query_embeds=raw_content_query_embeds,
             )
         else:
             input_query_label, input_query_bbox, attn_mask, dn_meta = None, None, None, None
         query_embeds = (input_query_label, input_query_bbox)
+
+        # Set soft-attention parameters for transformer if using multi-prototype mode
+        if hasattr(self, 'use_soft_attention') and self.use_soft_attention and raw_content_query_embeds.ndim == 3:
+            self.transformer.use_soft_attention = self.use_soft_attention
+            self.transformer.soft_attention_tau = self.soft_attention_tau
 
         # feed into transformer
         (
@@ -413,7 +454,7 @@ class DINO(nn.Module):
             multi_level_position_embeddings,
             query_embeds,
             attn_masks=[attn_mask, None],
-            content_query_embeds=content_query_embeds,
+            content_query_embeds=raw_content_query_embeds,  # Pass raw multi-prototype embeddings
             content_inds=content_inds, 
         )
         # hack implementation for distributed training
@@ -648,7 +689,14 @@ class DINO(nn.Module):
         # input_label_embed = label_enc(m)
         
         if content_query_embeds is not None:
-            input_label_content = content_query_embeds[m]
+            if content_query_embeds.ndim == 3:
+                # Multi-prototype mode: [C, K, embed_dim]
+                # For CDN, we need to aggregate prototypes first
+                content_query_embeds_agg = content_query_embeds.mean(dim=1)  # [C, embed_dim]
+                input_label_content = content_query_embeds_agg[m]
+            else:
+                # Single-prototype mode: [C, embed_dim]
+                input_label_content = content_query_embeds[m]
             input_label_embed = input_label_content
 
         input_bbox_embed = inverse_sigmoid(known_bbox_expand)

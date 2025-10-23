@@ -79,7 +79,7 @@ model.eval_query_path = "dataset/metadata/lvis_claude_prompts_convnextl.npy"
 # model.select_box_nums_for_evaluation = 300
 
 # modify optimizer config
-optimizer.lr = 1.25e-5 #(1 GPU)  - 1e-4 (8 GPUs)
+optimizer.lr = 1.25e-5 # (1GPU); 1e-4 (8 GPUs) - 使用原来成功的学习率
 optimizer.betas = (0.9, 0.999)
 optimizer.weight_decay = 1e-4
 optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 1
@@ -115,6 +115,10 @@ model.classifier.tpa_num_prototypes = 5  # 8 prompts -> 5 prototypes (better uti
 model.classifier.tpa_hidden_dim = 256
 model.classifier.tpa_dropout = 0.1  # Add dropout for regularization
 model.classifier.tpa_tau = 0.10  # Slightly larger for better utilization of 8 Claude prompts
+
+# Soft-attention aggregation parameters for multi-prototype query initialization
+model.use_soft_attention = True  # Enable soft-attention aggregation in query initialization
+model.soft_attention_tau = 0.08  # Temperature parameter for soft-attention (τ ≈ 0.05–0.1 recommended)
 
 # Enable Automatic Mixed Precision (AMP) for faster training
 train.amp.enabled = True
