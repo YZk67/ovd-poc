@@ -16,6 +16,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from detectron2.utils.logger import setup_logger
+
+logger = setup_logger()
 
 from detrex.layers import (
     FFN,
@@ -436,56 +439,37 @@ class DINOTransformer(nn.Module):
         )
 
         # Check if we have multi-prototype embeddings and should use soft-attention
-        if hasattr(self, 'use_soft_attention') and self.use_soft_attention and content_query_embeds.ndim == 3:
-            # Multi-prototype mode with soft-attention aggregation
-            # content_query_embeds: [C, K, embed_dim] where K is num_prototypes
-            num_classes, num_prototypes, embed_dim = content_query_embeds.shape
+        if getattr(self, 'use_soft_attention', False) and content_query_embeds.ndim == 3:
+            logger.info(f"[Soft-Attention] Using soft-attention aggregation with {content_query_embeds.shape[1]} prototypes per class")
             
-            # Normalize embeddings and region features
-            embeddings_norm = F.normalize(content_query_embeds, p=2, dim=-1)  # [C, K, embed_dim]
-            region_feats_norm = F.normalize(target_unact.detach(), p=2, dim=-1)  # [B, N, embed_dim]
-            
-            # Compute similarity: [B, N, embed_dim] @ [C, K, embed_dim]^T -> [B, C, N, K]
-            sim = torch.einsum("bnd,ckd->bcnk", region_feats_norm, embeddings_norm)
-            
-            # Soft-attention weights: α_i,c,k = softmax(cos(f_i, t_c,k) / τ)
-            tau = getattr(self, 'soft_attention_tau', 0.1)
-            alpha = F.softmax(sim / tau, dim=-1)  # [B, C, N, K]
-            
-            # Weighted aggregation: s_i,c = sum_k α_i,c,k * cos(f_i, t_c,k)
-            sim_aggregated = (alpha * sim).sum(dim=-1)  # [B, C, N]
-            
-            # Get max scores and labels from soft-attention aggregated similarities
-            max_scores_soft, max_labels_soft = torch.max(sim_aggregated, dim=1)  # [B, N]
-            
-            # Use soft-attention based selection for top-k proposals
-            topk_proposals_soft = torch.topk(max_scores_soft, topk, dim=1)[1]
-            content_ids = torch.gather(max_labels_soft, 1, topk_proposals_soft)
-            
-            # For each selected region, compute its soft-attention aggregated embedding
-            # Gather the attention weights for selected regions: [B, topk, C, K]
-            selected_alpha = torch.gather(alpha, 2, topk_proposals_soft.unsqueeze(1).unsqueeze(-1).repeat(1, num_classes, 1, num_prototypes))
-            
-            # For each selected region, compute weighted aggregation based on its class
-            content_query_list = []
-            for b in range(bs):
-                batch_queries = []
-                for k in range(topk):
-                    class_id = content_ids[b, k]
-                    # Get attention weights for this region and class: [K]
-                    region_alpha = selected_alpha[b, class_id, k, :]
-                    # Weighted aggregation: sum_k α_k * t_c,k
-                    weighted_embed = torch.einsum("k,kd->d", region_alpha, content_query_embeds[class_id])
-                    batch_queries.append(weighted_embed)
-                content_query_list.append(torch.stack(batch_queries))
-            content_query = torch.stack(content_query_list)  # [B, topk, embed_dim]
-        else:
-            # Standard single-prototype mode
+            # === Vectorized multi-prototype soft-attention aggregation ===
+            tau = getattr(self, 'soft_attention_tau', 0.07)
+            # Gather selected visual features and class ids
+            content_ids = torch.gather(max_labels, 1, topk_proposals)  # [B, topk]
+            target_unact = torch.gather(output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, output_memory.shape[-1]))  # [B, topk, D]
+
+            # Prototypes per region: [B, topk, K, D]
+            proto_per_region = content_query_embeds[content_ids]
+            # Cosine similarities: [B, topk, K]
+            sim = torch.einsum('bqd,bqkd->bqk',
+                            F.normalize(target_unact, dim=-1),
+                            F.normalize(proto_per_region, dim=-1)) / tau
+            attn = F.softmax(sim, dim=-1)  # [B, topk, K]
+            content_query = torch.einsum('bqk,bqkd->bqd', attn, proto_per_region)  # [B, topk, D]
+        elif content_query_embeds.ndim == 3:
+            # === Mean aggregation fallback over K prototypes ===
             content_ids = torch.gather(max_labels, 1, topk_proposals)
-            embed_dim = content_query_embeds.shape[-1]  # Get actual feature dimension
+            # [B, topk, K, D]
+            proto_per_region = content_query_embeds[content_ids]
+            content_query = proto_per_region.mean(dim=2)  # [B, topk, D]
+        else:
+            # === Standard single-prototype mode ===
+            content_ids = torch.gather(max_labels, 1, topk_proposals)
+            embed_dim = content_query_embeds.shape[-1]
             content_query = torch.gather(
                 content_query_embeds.unsqueeze(0).repeat(bs, 1, 1), 1,
-                content_ids.unsqueeze(-1).repeat(1, 1, embed_dim)) 
+                content_ids.unsqueeze(-1).repeat(1, 1, embed_dim)
+            )
 
         target = target_unact.detach() + content_query
 

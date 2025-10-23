@@ -174,31 +174,20 @@ class DINO(nn.Module):
         
         # Handle multi-prototype embeddings: support both 2D [C, D] and 3D [C, K, D] formats
         if content_query_embedding.ndim == 3:
-            # Multi-prototype mode: [C, K, D] where C=num_classes, K=num_prototypes
-            num_classes_from_embed, num_prototypes, feat_dim = content_query_embedding.shape
-            print(f"[Multi-Prototype Mode] Loaded {num_classes_from_embed} classes × {num_prototypes} prototypes × {feat_dim}D")
+            # Multi-prototype mode: [C, K, D] where C=num_classes, K=num_prompts (e.g., 8 prompts)
+            num_classes_from_embed, num_prompts, feat_dim = content_query_embedding.shape
+            print(f"[Multi-Prompt Mode] Loaded {num_classes_from_embed} classes × {num_prompts} prompts × {feat_dim}D")
             
-            # Store original multi-prototype embeddings
-            self.content_query_embedding_raw = content_query_embedding  # Keep [C, K, D]
-            
-            # For compatibility with existing code, create aggregated version
+            # Note: TPA will handle the prompts directly from text_classifier, not from here
+            # For compatibility with existing code, create aggregated version using simple mean
             # This is only used for dimension compatibility and Fed Loss sampling
             content_query_embedding_agg = self._aggregate_prototypes(content_query_embedding, method='mean')
-            
-            print(f"[TPA Mode] Loaded {num_prototypes} prototypes per class [C={num_classes_from_embed}, K={num_prototypes}, D={feat_dim}]")
-            print(f"[TPA Mode] TextClassifier will use TPA with {num_prototypes} prototypes independently")
-            print(f"[TPA Mode] Soft-attention aggregation enabled for query initialization")
-            
-            self.num_prototypes = num_prototypes
-            self.use_multi_prototype_queries = False  # Not expanding queries, using aggregation
+            # Note: num_prototypes is determined by TPA configuration, not stored here
             # Use aggregated version for compatibility
             content_query_embedding = content_query_embedding_agg
         else:
             # Standard mode: [C, D]
             feat_dim = content_query_embedding.shape[1]
-            self.num_prototypes = 1
-            self.use_multi_prototype_queries = False
-            self.content_query_embedding_raw = None
         
         self.content_query_embedding = F.normalize(content_query_embedding, p=2, dim=1)
 
@@ -391,30 +380,28 @@ class DINO(nn.Module):
                 F.interpolate(img_masks[None], size=feat.shape[-2:]).to(torch.bool).squeeze(0)
             )
             multi_level_position_embeddings.append(self.position_embedding(multi_level_masks[-1]))
-
-        # Handle multi-prototype vs single-prototype modes
-        if hasattr(self, 'content_query_embedding_raw') and self.content_query_embedding_raw is not None:
-            # Multi-prototype mode: use raw embeddings and apply content_layer to each prototype
-            raw_content_query_embeds = self.content_query_embedding_raw[content_inds] if content_inds is not None else self.content_query_embedding_raw
-            # Apply content_layer to each prototype: [C, K, D] -> [C, K, embed_dim]
-            C, K, D = raw_content_query_embeds.shape
-            raw_content_query_embeds = raw_content_query_embeds.view(-1, D)  # [C*K, D]
-            raw_content_query_embeds = self.content_layer(raw_content_query_embeds)  # [C*K, embed_dim]
-            raw_content_query_embeds = raw_content_query_embeds.view(C, K, -1)  # [C, K, embed_dim]
-            raw_content_query_embeds = F.normalize(raw_content_query_embeds, p=2, dim=-1)
-            
-            # For compatibility, also create aggregated version
-            content_query_embeds = raw_content_query_embeds.mean(dim=1)  # [C, embed_dim]
+        
+        # === Build content_query_embeds using TPA prototypes (replacing .npy embeddings) ===
+        if hasattr(self.decoder.class_embed[0], 'use_tpa') and self.decoder.class_embed[0].use_tpa:
+            text_classifier = self.decoder.class_embed[0]
+            text_feats = text_classifier._maybe_move_text_feats(training=self.training)
+            if content_inds is not None:
+                text_feats = text_feats[content_inds]
+            # [C,K,D_text]
+            proto_ckd = text_classifier.tpa(text_feats)
+            # Project to decoder dim
+            proto_ckd = self.content_layer(proto_ckd.view(-1, proto_ckd.size(-1))).view(
+                proto_ckd.size(0), proto_ckd.size(1), -1
+            )
+            proto_ckd = F.normalize(proto_ckd, p=2, dim=-1)
+            raw_content_query_embeds = proto_ckd  # [C,K,embed_dim]
+            print(f"[TPA Mode] Using TPA to aggregate {self.num_prompts} prompts into prototypes with shape {proto_ckd.shape}")
         else:
-            # Single-prototype mode: use aggregated embeddings
-            if self.training:
-                content_query_embeds = self.content_query_embedding[content_inds] if content_inds is not None else self.content_query_embedding
-            else:
-                content_query_embeds = self.eval_content_query_embedding
-            content_query_embeds = self.content_layer(content_query_embeds)
-            content_query_embeds = F.normalize(content_query_embeds, p=2, dim=1)
-            raw_content_query_embeds = content_query_embeds
- 
+            # Fallback to aggregated version
+            content_query_embedding = self.content_layer(self.content_query_embedding)
+            content_query_embedding = F.normalize(content_query_embedding, p=2, dim=1)
+            raw_content_query_embeds = content_query_embedding.unsqueeze(1)
+
         # denoising preprocessing
         # prepare label query embedding
         if self.training:

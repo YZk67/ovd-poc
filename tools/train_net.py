@@ -72,6 +72,9 @@ class Trainer(SimpleTrainer):
 
         # gradient clip hyper-params
         self.clip_grad_params = clip_grad_params
+        
+        # Flag to print TPA gradient info only once
+        self.tpa_grad_printed = False
 
     def run_step(self):
         """
@@ -117,6 +120,21 @@ class Trainer(SimpleTrainer):
             if self.clip_grad_params is not None:
                 self.clip_grads(self.model.parameters())
             self.optimizer.step()
+
+        # === 只打印一次 TPA 梯度信息 ===
+        if not self.tpa_grad_printed:
+            logger.info(f"use_soft_attention: {self.model.transformer.use_soft_attention}")
+            logger.info(f"soft_attention_tau: {self.model.transformer.soft_attention_tau}")
+            
+            # 检查 TPA 参数的梯度
+            if hasattr(self.model.decoder.class_embed[0], 'tpa'):
+                logger.info("TPA parameters gradient status:")
+                for n, p in self.model.decoder.class_embed[0].tpa.named_parameters():
+                    logger.info(f"  {n}: grad={'Yes' if p.grad is not None else 'No'}")
+            else:
+                logger.info("TPA not found in class_embed[0]")
+            
+            self.tpa_grad_printed = True  # ✅ 确保只打印一次
 
         self._write_metrics(loss_dict, data_time)
 
