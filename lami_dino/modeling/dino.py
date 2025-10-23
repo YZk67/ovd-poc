@@ -382,8 +382,8 @@ class DINO(nn.Module):
             multi_level_position_embeddings.append(self.position_embedding(multi_level_masks[-1]))
         
         # === Build content_query_embeds using TPA prototypes (replacing .npy embeddings) ===
-        if hasattr(self.decoder.class_embed[0], 'use_tpa') and self.decoder.class_embed[0].use_tpa:
-            text_classifier = self.decoder.class_embed[0]
+        if hasattr(self.transformer.decoder.class_embed[0], 'use_tpa') and self.transformer.decoder.class_embed[0].use_tpa:
+            text_classifier = self.transformer.decoder.class_embed[0]
             text_feats = text_classifier._maybe_move_text_feats(training=self.training)
             if content_inds is not None:
                 text_feats = text_feats[content_inds]
