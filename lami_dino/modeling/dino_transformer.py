@@ -16,9 +16,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from detectron2.utils.logger import setup_logger
+import logging
 
-logger = setup_logger()
+logger = logging.getLogger("detectron2")
 
 from detrex.layers import (
     FFN,
