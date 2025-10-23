@@ -440,8 +440,7 @@ class DINOTransformer(nn.Module):
 
         # Check if we have multi-prototype embeddings and should use soft-attention
         if getattr(self, 'use_soft_attention', False) and content_query_embeds.ndim == 3:
-            logger.info(f"[Soft-Attention] Using soft-attention aggregation with {content_query_embeds.shape[1]} prototypes per class")
-            
+            # logger.info(f"[Soft-Attention] Using soft-attention aggregation with {content_query_embeds.shape[1]} prototypes per class")
             # === Vectorized multi-prototype soft-attention aggregation ===
             tau = getattr(self, 'soft_attention_tau', 0.07)
             # Gather selected visual features and class ids
