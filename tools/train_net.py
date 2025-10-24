@@ -123,13 +123,15 @@ class Trainer(SimpleTrainer):
 
         # === 只打印一次 TPA 梯度信息 ===
         if not self.tpa_grad_printed:
-            logger.info(f"use_soft_attention: {self.model.transformer.use_soft_attention}")
-            logger.info(f"soft_attention_tau: {self.model.transformer.soft_attention_tau}")
+            # Handle DistributedDataParallel wrapper
+            model = self.model.module if hasattr(self.model, 'module') else self.model
+            logger.info(f"use_soft_attention: {model.transformer.use_soft_attention}")
+            logger.info(f"soft_attention_tau: {model.transformer.soft_attention_tau}")
             
             # 检查 TPA 参数的梯度
-            if hasattr(self.model.transformer.decoder.class_embed[0], 'tpa'):
+            if hasattr(model.transformer.decoder.class_embed[0], 'tpa'):
                 logger.info("TPA parameters gradient status:")
-                for n, p in self.model.transformer.decoder.class_embed[0].tpa.named_parameters():
+                for n, p in model.transformer.decoder.class_embed[0].tpa.named_parameters():
                     logger.info(f"  {n}: grad={'Yes' if p.grad is not None else 'No'}")
             else:
                 logger.info("TPA not found in class_embed[0]")
