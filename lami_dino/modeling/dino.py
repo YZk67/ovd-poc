@@ -388,7 +388,7 @@ class DINO(nn.Module):
             if content_inds is not None:
                 text_feats = text_feats[content_inds]
             # [C,K,D_text]
-            proto_ckd = text_classifier.tpa(text_feats)
+            proto_ckd = text_classifier.tpa(text_feats, with_loss=False)
             # Project to decoder dim
             proto_ckd = self.content_layer(proto_ckd.view(-1, proto_ckd.size(-1))).view(
                 proto_ckd.size(0), proto_ckd.size(1), -1
@@ -435,6 +435,7 @@ class DINO(nn.Module):
             inter_references,
             enc_state,
             enc_reference,  # [0..1]
+            apr_loss,
         ) = self.transformer(
             multi_level_feats,
             multi_level_masks,
@@ -490,6 +491,8 @@ class DINO(nn.Module):
 
         if self.training:
             loss_dict = self.criterion(output, targets, dn_meta)
+            if apr_loss is not None:
+                loss_dict["loss_apr"] = apr_loss
             weight_dict = self.criterion.weight_dict
             for k in loss_dict.keys():
                 if k in weight_dict:

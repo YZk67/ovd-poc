@@ -170,15 +170,17 @@ class TextClassifier(nn.Module):
             text_feats = self._maybe_move_text_feats(training=True)
             if content_inds is not None:
                 text_feats = text_feats[content_inds]
-            prototypes = self.tpa(text_feats)
+            prototypes, apr_loss = self.tpa(text_feats, with_loss=True)
+            self.apr_loss = apr_loss
         else:
             text_feats = self._maybe_move_text_feats(training=False)
             cache_valid = self._cached_eval is not None and self._cached_eval.device == x.device
             if not cache_valid:
-                full_prototypes = self.tpa(text_feats)
+                full_prototypes, apr_loss = self.tpa(text_feats, with_loss=False)
                 self._cached_eval = full_prototypes.detach()
             else:
                 full_prototypes = self._cached_eval
+            self.apr_loss = apr_loss
             prototypes = full_prototypes[content_inds] if content_inds is not None else full_prototypes
 
         prototypes = prototypes.to(dtype=x.dtype)

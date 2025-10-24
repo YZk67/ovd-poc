@@ -414,7 +414,11 @@ class DINOTransformer(nn.Module):
         # output_memory: bs, num_tokens, c
         # output_proposals: bs, num_tokens, 4. unsigmoided.
 
-        enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](output_memory, content_inds=content_inds)
+        # enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](output_memory, content_inds=content_inds)
+        text_classifier = self.decoder.class_embed[self.decoder.num_layers]
+        enc_outputs_class = text_classifier(output_memory, content_inds=content_inds)
+        apr_loss = getattr(text_classifier, "apr_loss", None)
+
         enc_outputs_coord_unact = (
             self.decoder.bbox_embed[self.decoder.num_layers](output_memory) + output_proposals
         )  # unsigmoided.
@@ -497,4 +501,5 @@ class DINOTransformer(nn.Module):
             inter_references_out,
             target_unact,
             topk_coords_unact.sigmoid(),
+            apr_loss
         )

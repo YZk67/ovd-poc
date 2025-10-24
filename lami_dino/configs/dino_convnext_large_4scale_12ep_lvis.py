@@ -114,7 +114,7 @@ model.classifier.eval_text_embed_path = "dataset/metadata/lvis_claude_prompts_co
 model.classifier.tpa_num_prototypes = 5  # 8 prompts -> 5 prototypes (better utilization)
 model.classifier.tpa_hidden_dim = 256
 model.classifier.tpa_dropout = 0.1  # Add dropout for regularization
-model.classifier.tpa_tau = 0.10  # Slightly larger for better utilization of 8 Claude prompts
+model.classifier.tpa_tau = 0.07  # Optimal temperature for attention aggregation (τ ≈ 0.05–0.1 recommended) 0.1 is original
 
 # Soft-attention aggregation parameters for multi-prototype query initialization
 model.use_soft_attention = True  # Enable soft-attention aggregation in query initialization
