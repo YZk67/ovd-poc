@@ -292,86 +292,95 @@ class DINO(nn.Module):
             raise ValueError(f"Unknown aggregation method: {method}")
 
     def filter_content_info(self, batched_inputs):
-        device = torch.device(self.device)
-        freq_weight = (
-            self.freq_weight
-            if self.freq_weight is not None
-            else torch.ones(self.num_classes, device=device)
-        )
+        """
+        Make FedLoss class subset 'content_inds' consistent across GPUs:
+        1) all_gather GT classes from all ranks
+        2) sample on rank 0 (include GTs + negatives)
+        3) broadcast 'content_inds' to all ranks
+        4) remap per-image gt_classes to [0..len(content_inds)-1] using the same mapping
+        """
+        device = self.device
+        # 频率权重（保持与原逻辑一致）
+        freq_weight = self.freq_weight if self.freq_weight is not None else torch.ones(self.num_classes, device=device)
 
-        inner_gt = []
+        # 本 rank 的 GT 类
+        local_gt = []
         for target in batched_inputs:
-            inner_gt.append(target["instances"].gt_classes.to(device))
-        if inner_gt:
-            local_gt = torch.cat(inner_gt)
+            local_gt.append(target["instances"].gt_classes.to(device))
+        if len(local_gt) > 0:
+            local_gt = torch.unique(torch.cat(local_gt))
         else:
             local_gt = torch.empty(0, dtype=torch.long, device=device)
 
+        # 跨卡收集所有 GT 类（去重）
         if is_dist_avail_and_initialized():
             world_size = dist.get_world_size()
-            local_size = torch.tensor([local_gt.numel()], device=device, dtype=torch.long)
-            size_list = [torch.zeros_like(local_size) for _ in range(world_size)]
-            dist.all_gather(size_list, local_size)
-            max_size = max(int(s.item()) for s in size_list)
-            padded = torch.zeros(max_size, dtype=local_gt.dtype, device=device)
-            if local_gt.numel() > 0:
-                padded[: local_gt.numel()] = local_gt
-            gathered = [
-                torch.zeros(max_size, dtype=local_gt.dtype, device=device)
-                for _ in range(world_size)
-            ]
+            # 先收集长度，再收集内容（避免不同长度 all_gather 失败）
+            local_len = torch.tensor([local_gt.numel()], device=device, dtype=torch.long)
+            lens = [torch.zeros_like(local_len) for _ in range(world_size)]
+            dist.all_gather(lens, local_len)
+            max_len = int(torch.stack(lens).max().item())
+            pad = max_len - local_gt.numel()
+            padded = torch.cat([local_gt, torch.full((pad,), -1, device=device, dtype=torch.long)]) if pad > 0 else local_gt
+            gathered = [torch.empty_like(padded) for _ in range(world_size)]
             dist.all_gather(gathered, padded)
-            global_gt = torch.cat(
-                [g[: size_list[idx].item()] for idx, g in enumerate(gathered)], dim=0
-            )
+            all_gt = torch.unique(torch.cat(gathered))
+            all_gt = all_gt[all_gt >= 0]  # 去掉 padding 的 -1
         else:
-            global_gt = local_gt
+            all_gt = local_gt
 
-        if is_dist_avail_and_initialized():
-            rank = dist.get_rank()
-        else:
-            rank = 0
+        # 仅在 rank 0 进行采样；其它 rank 准备占位
+        need_sample = (not is_dist_avail_and_initialized()) or (dist.get_rank() == 0)
 
-        if rank == 0:
-            gt_for_sampling = global_gt.cpu()
-            weight_cpu = freq_weight.detach().cpu()
+        if need_sample:
             if self.cluster_fed_loss:
-                sampled = get_cluster_fed_loss_inds(
-                    gt_for_sampling,
+                content_inds = get_cluster_fed_loss_inds(
+                    all_gt,
                     num_sample_cats=self.fed_loss_num_cat,
                     C=self.num_classes,
-                    weight=weight_cpu,
+                    weight=freq_weight,
                     cluster_label=self.cluster_label,
                 )
             else:
-                sampled = get_fed_loss_inds(
-                    gt_for_sampling,
+                content_inds = get_fed_loss_inds(
+                    all_gt,
                     num_sample_cats=self.fed_loss_num_cat,
                     C=self.num_classes,
-                    weight=weight_cpu,
+                    weight=freq_weight,
                 )
-            sampled = sampled.to(dtype=torch.long, device=device)
-            sampled_len = torch.tensor([sampled.numel()], dtype=torch.long, device=device)
+            # 保证类型与设备
+            content_inds = content_inds.to(device=device, dtype=torch.long)
         else:
-            sampled = torch.empty(0, dtype=torch.long, device=device)
-            sampled_len = torch.zeros(1, dtype=torch.long, device=device)
+            # 用固定长度占位，等会儿接收广播
+            content_inds = torch.zeros(self.fed_loss_num_cat, device=device, dtype=torch.long)
 
+        # 广播到所有 GPU（若未分布式则跳过）
         if is_dist_avail_and_initialized():
-            dist.broadcast(sampled_len, src=0)
-            if sampled.numel() != sampled_len.item():
-                sampled = torch.empty(sampled_len.item(), dtype=torch.long, device=device)
-            dist.broadcast(sampled, src=0)
+            dist.broadcast(content_inds, src=0)
 
-        content_inds = sampled
+        # === 之后保持你原有的映射逻辑：将 gt_classes 映射到 [0..M-1] ===
+        convert_map = torch.ones(self.num_classes, dtype=torch.int64, device=device) * -1
+        # content_inds[i] -> i
+        convert_map[content_inds] = torch.arange(content_inds.numel(), device=device, dtype=torch.int64)
 
-        convert_map = torch.ones(self.num_classes, dtype=torch.int64) * -1
-        for idx, content_id in enumerate(content_inds):
-            convert_map[content_id.item()] = idx
         for idx, target in enumerate(batched_inputs):
-            cats = target['instances'].gt_classes
-            batched_inputs[idx]['instances'].gt_classes = convert_map[batched_inputs[idx]['instances'].gt_classes]
+            cats = target["instances"].gt_classes.to(device)
+            batched_inputs[idx]["instances"].gt_classes = convert_map[cats]
+        
+        # DEBUG（可选）：多卡一致性哈希（仅前200 iter打印）
+        if is_dist_avail_and_initialized():
+            import hashlib
+            global_step = getattr(self, "_debug_step", 0)
+            if global_step < 200:
+                h_local = hashlib.md5(content_inds.detach().cpu().numpy().tobytes()).hexdigest()[:8]
+                hashes = [None for _ in range(dist.get_world_size())]
+                dist.all_gather_object(hashes, h_local)
+                if dist.get_rank() == 0:
+                    print(f"[DDP-OK] step={global_step:06d} content_inds hashes: {hashes}")
+                self._debug_step = global_step + 1
 
         return content_inds, batched_inputs
+
  
     def forward(self, batched_inputs):
         """Forward function of `DINO` which excepts a list of dict as inputs.

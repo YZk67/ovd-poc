@@ -147,6 +147,10 @@ class Trainer(SimpleTrainer):
                 logger.info("TPA not found in class_embed[0]")
             
             self.tpa_grad_printed = True  # ✅ 确保只打印一次
+        
+        if hasattr(self.model, "transformer") and hasattr(self.model.transformer, "text_proto_bank"):
+            monitor_dict = self.model.transformer.text_proto_bank.aggregator.get_monitor_dict()
+            loss_dict.update(monitor_dict)
 
         self._write_metrics(loss_dict, data_time)
 
