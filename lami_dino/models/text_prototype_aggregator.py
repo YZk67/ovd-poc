@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
+import logging
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -21,9 +23,13 @@ class TextPrototypeAggregator(nn.Module):
         hidden_dim: int = 256,
         dropout: float = 0.1,
         tau: float = 0.1,
+        *,
+        log_interval: int = 200,
     ) -> None:
         super().__init__()
         assert num_prototypes > 0 and hidden_dim > 0
+        self.lambda_orth = 0.05
+        self.lambda_div = 0.01
 
         self.num_prototypes = num_prototypes
         self.tau = max(float(tau), 1e-6)
@@ -35,6 +41,13 @@ class TextPrototypeAggregator(nn.Module):
 
         self._reset_parameters()
         self.register_buffer("_eye_buffer", torch.eye(num_prototypes), persistent=False)
+        self._logger = logging.getLogger("lami_dino.tpa")
+        self.log_interval = log_interval
+        self._step = 0
+        self.last_loss_terms: Dict[str, float] = {}
+        self._last_attention: Optional[torch.Tensor] = None
+        self._last_prototypes: Optional[torch.Tensor] = None
+        self.last_monitor_terms: Dict[str, float] = {}
 
     def _reset_parameters(self):
         nn.init.xavier_uniform_(self.key_proj.weight)
@@ -63,12 +76,18 @@ class TextPrototypeAggregator(nn.Module):
 
         prototypes = torch.einsum("ckn,cnd->ckd", attn, values)  # [C,K,D]
         prototypes = self.dropout(prototypes)
+        self._last_attention = attn.detach()
+        self._last_prototypes = prototypes.detach()
 
         # === Step 2: Optional APR loss ===
         apr_loss = None
         if with_loss:
             apr_loss = self.compute_apr_loss(prototypes, attn)
+            apr_value = apr_loss.detach()
+        else:
+            apr_value = self._update_metrics_no_grad(prototypes.detach(), attn.detach())
 
+        self._maybe_log(apr_value)
         return prototypes, apr_loss
 
     def compute_apr_loss(self, prototypes: torch.Tensor, attn: torch.Tensor) -> torch.Tensor:
@@ -76,35 +95,104 @@ class TextPrototypeAggregator(nn.Module):
         Compute Adaptive Prototype Regularization (APR) loss
         Includes orthogonal and diversity regularization.
         """
-        C, K, D = prototypes.shape
-        loss_orth, loss_div = 0.0, 0.0
-
-        # === 1️⃣ Orthogonal Loss ===
-        P_norm = F.normalize(prototypes, dim=-1)
-        gram = torch.einsum("ckd,cmd->ckm", P_norm, P_norm)  # [C,K,K]
-        I = self._eye_buffer[:K, :K].to(prototypes.device)
-        loss_orth = ((gram - I) ** 2).mean()
-
-        # === 2️⃣ Diversity (Normalized Entropy) Loss ===
-        p = attn.clamp(min=1e-8, max=1.0)  # More stable clamping
-        log_p = torch.log(p)
-        entropy = -(p * log_p).sum(dim=-1) / math.log(p.size(-1))  # normalized [0,1]
-        loss_div = entropy.mean()
-
-        # === 3️⃣ Combine ===
-        lambda_orth, lambda_div = 0.05, 0.01  # static version
-
-        # TODO (Stage 3): curriculum-style adaptive weighting
-        # lambda_orth = 0.05 * (1 - torch.exp(-0.001 * global_step))
-        # lambda_div  = 0.01 * (1 - torch.exp(-0.001 * global_step))
-
-        apr_loss = lambda_orth * loss_orth + lambda_div * loss_div
-
-        # Optional: lightweight debug print (only occasionally)
-        # if torch.rand(1) < 0.001:
-        #     print(f"[APR] Orth={loss_orth.item():.4f} Div={loss_div.item():.4f}")
-
+        loss_orth = self._orthogonality_term(prototypes)
+        loss_div = self._diversity_term(attn)
+        apr_loss = self.lambda_orth * loss_orth + self.lambda_div * loss_div
+        self._store_loss_terms(loss_orth.detach(), loss_div.detach(), apr_loss.detach())
         return apr_loss
+
+    def _orthogonality_term(self, prototypes: torch.Tensor) -> torch.Tensor:
+        P_norm = F.normalize(prototypes, dim=-1)
+        gram = torch.einsum("ckd,cmd->ckm", P_norm, P_norm)
+        K = gram.size(-1)
+        I = self._eye_buffer[:K, :K]
+        if I.device != prototypes.device:
+            I = I.to(prototypes.device)
+        return ((gram - I) ** 2).mean()
+
+    def _diversity_term(self, attn: torch.Tensor) -> torch.Tensor:
+        p = attn.clamp(min=1e-6, max=1.0)
+        entropy = -(p * torch.log(p)).sum(dim=-1) / math.log(p.size(-1))
+        return entropy.mean()
+
+    def _store_loss_terms(self, loss_orth: torch.Tensor, loss_div: torch.Tensor, apr_loss: torch.Tensor) -> None:
+        self.last_loss_terms = {
+            "loss_orth": float(loss_orth.item()),
+            "loss_div": float(loss_div.item()),
+            "loss_apr": float(apr_loss.item()),
+        }
+
+    def _update_metrics_no_grad(self, prototypes: torch.Tensor, attn: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            loss_orth = self._orthogonality_term(prototypes)
+            loss_div = self._diversity_term(attn)
+            apr_loss = self.lambda_orth * loss_orth + self.lambda_div * loss_div
+        self._store_loss_terms(loss_orth, loss_div, apr_loss)
+        return apr_loss.detach()
+
+    def _maybe_log(self, apr_value: torch.Tensor) -> None:
+        if self._logger is None:
+            return
+        if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+            return
+        loss_orth = self.last_loss_terms.get("loss_orth")
+        loss_div = self.last_loss_terms.get("loss_div")
+        apr_scalar = self.last_loss_terms.get("loss_apr")
+        if loss_orth is None or loss_div is None:
+            return
+        if isinstance(apr_value, torch.Tensor):
+            apr_scalar = float(apr_value.detach().item())
+        if self.training:
+            self._step += 1
+            if self._step % self.log_interval != 0:
+                return
+            display_step = self._step
+        else:
+            display_step = self._step
+        msg = f"[TPA] step={display_step} orth={loss_orth:.4f} usage={loss_div:.4f}"
+        if apr_scalar is not None:
+            msg += f" apr={apr_scalar:.4f}"
+        monitor = monitor_prototype_metrics(self._last_prototypes, self._last_attention, display_step, prefix="[TPA]")
+        if monitor:
+            self.last_monitor_terms.update(monitor)
+            msg += f" | orth_norm={monitor['orthogonality']:.4f} usage_entropy={monitor['usage_entropy']:.4f}"
+        self._logger.info(msg)
+
+
+@torch.no_grad()
+def compute_prototype_orthogonality(prototypes: Optional[torch.Tensor]) -> float:
+    if prototypes is None:
+        return float("nan")
+    P = F.normalize(prototypes, dim=-1)
+    gram = torch.einsum("ckd,cmd->ckm", P, P)
+    I = torch.eye(P.size(1), device=P.device)
+    return ((gram - I) ** 2).mean().item()
+
+
+@torch.no_grad()
+def compute_usage_entropy(attn: Optional[torch.Tensor]) -> float:
+    if attn is None:
+        return float("nan")
+    usage = attn.mean(dim=-1)
+    p = usage / (usage.sum(dim=-1, keepdim=True) + 1e-8)
+    entropy = -(p * (p + 1e-8).log()).sum(dim=-1) / math.log(p.size(-1))
+    return entropy.mean().item()
+
+
+def monitor_prototype_metrics(
+    prototypes: Optional[torch.Tensor],
+    attn: Optional[torch.Tensor],
+    step: int = 0,
+    log_interval: int = 200,
+    prefix: str = "[Monitor]",
+) -> Dict[str, float]:
+    orth_score = compute_prototype_orthogonality(prototypes)
+    usage_entropy = compute_usage_entropy(attn)
+    if step % log_interval == 0:
+        print(
+            f"{prefix} step={step:06d} | orth={orth_score:.4f} | usage_entropy={usage_entropy:.4f}"
+        )
+    return {"orthogonality": orth_score, "usage_entropy": usage_entropy}
 
 
 class TextPrototypeBank(nn.Module):

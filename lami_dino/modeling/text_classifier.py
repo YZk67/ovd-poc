@@ -32,6 +32,7 @@ class TextClassifier(nn.Module):
         tpa_hidden_dim: int = 256,
         tpa_dropout: float = 0.1,
         tpa_tau: float = 0.1,
+        tpa_log_interval: int = 200,
     ) -> None:
         super().__init__()
 
@@ -75,6 +76,7 @@ class TextClassifier(nn.Module):
                 hidden_dim=tpa_hidden_dim,
                 dropout=tpa_dropout,
                 tau=tpa_tau,
+                log_interval=tpa_log_interval,
             )
             self.num_prototypes = tpa_num_prototypes
             self._cached_eval = None
