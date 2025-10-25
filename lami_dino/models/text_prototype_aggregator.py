@@ -162,6 +162,7 @@ class TextPrototypeAggregator(nn.Module):
         if monitor:
             self.last_monitor_terms.update(monitor)
             msg += f" | orth_norm={monitor['orthogonality']:.4f} usage_entropy={monitor['usage_entropy']:.4f}"
+        logging.getLogger("detectron2").info(msg)
         self._logger.info(msg)
 
 
