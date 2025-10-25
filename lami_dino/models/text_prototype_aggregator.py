@@ -47,6 +47,8 @@ class TextPrototypeAggregator(nn.Module):
         self.last_loss_terms: Dict[str, float] = {}
         self._last_attention: Optional[torch.Tensor] = None
         self._last_prototypes: Optional[torch.Tensor] = None
+        self.last_attention: Optional[torch.Tensor] = None
+        self.last_prototypes: Optional[torch.Tensor] = None
         self.last_monitor_terms: Dict[str, float] = {}
 
     def _reset_parameters(self):
@@ -76,8 +78,12 @@ class TextPrototypeAggregator(nn.Module):
 
         prototypes = torch.einsum("ckn,cnd->ckd", attn, values)  # [C,K,D]
         prototypes = self.dropout(prototypes)
-        self._last_attention = attn.detach()
-        self._last_prototypes = prototypes.detach()
+        detached_attn = attn.detach()
+        detached_proto = prototypes.detach()
+        self._last_attention = detached_attn
+        self._last_prototypes = detached_proto
+        self.last_attention = detached_attn
+        self.last_prototypes = detached_proto
 
         # === Step 2: Optional APR loss ===
         apr_loss = None
