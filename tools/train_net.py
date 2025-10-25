@@ -16,8 +16,13 @@ import logging
 import os
 import sys
 import time
+import warnings
 import numpy as np
 import torch
+
+# Suppress warnings for cleaner training output
+warnings.filterwarnings("ignore", category=FutureWarning, module="timm")
+warnings.filterwarnings("ignore", message="torch.meshgrid.*indexing.*")
 from torch.nn.parallel import DataParallel, DistributedDataParallel
 
 from detectron2.checkpoint import DetectionCheckpointer
