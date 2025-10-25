@@ -20,6 +20,7 @@ import json
 from typing import List
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
@@ -291,26 +292,77 @@ class DINO(nn.Module):
             raise ValueError(f"Unknown aggregation method: {method}")
 
     def filter_content_info(self, batched_inputs):
-        freq_weight = self.freq_weight if self.freq_weight is not None else torch.ones(self.num_classes, device=self.device)
+        device = torch.device(self.device)
+        freq_weight = (
+            self.freq_weight
+            if self.freq_weight is not None
+            else torch.ones(self.num_classes, device=device)
+        )
+
         inner_gt = []
         for target in batched_inputs:
-            target = target['instances'].gt_classes
-            inner_gt.append(target)
-        inner_gt = torch.cat(inner_gt)
-
-        if self.cluster_fed_loss:
-            content_inds = get_cluster_fed_loss_inds(
-                inner_gt,
-                num_sample_cats=self.fed_loss_num_cat,
-                C=self.num_classes,
-                weight=freq_weight,
-                cluster_label=self.cluster_label)
+            inner_gt.append(target["instances"].gt_classes.to(device))
+        if inner_gt:
+            local_gt = torch.cat(inner_gt)
         else:
-            content_inds = get_fed_loss_inds(
-                inner_gt,
-                num_sample_cats=self.fed_loss_num_cat,
-                C=self.num_classes,
-                weight=freq_weight)
+            local_gt = torch.empty(0, dtype=torch.long, device=device)
+
+        if is_dist_avail_and_initialized():
+            world_size = dist.get_world_size()
+            local_size = torch.tensor([local_gt.numel()], device=device, dtype=torch.long)
+            size_list = [torch.zeros_like(local_size) for _ in range(world_size)]
+            dist.all_gather(size_list, local_size)
+            max_size = max(int(s.item()) for s in size_list)
+            padded = torch.zeros(max_size, dtype=local_gt.dtype, device=device)
+            if local_gt.numel() > 0:
+                padded[: local_gt.numel()] = local_gt
+            gathered = [
+                torch.zeros(max_size, dtype=local_gt.dtype, device=device)
+                for _ in range(world_size)
+            ]
+            dist.all_gather(gathered, padded)
+            global_gt = torch.cat(
+                [g[: size_list[idx].item()] for idx, g in enumerate(gathered)], dim=0
+            )
+        else:
+            global_gt = local_gt
+
+        if is_dist_avail_and_initialized():
+            rank = dist.get_rank()
+        else:
+            rank = 0
+
+        if rank == 0:
+            gt_for_sampling = global_gt.cpu()
+            weight_cpu = freq_weight.detach().cpu()
+            if self.cluster_fed_loss:
+                sampled = get_cluster_fed_loss_inds(
+                    gt_for_sampling,
+                    num_sample_cats=self.fed_loss_num_cat,
+                    C=self.num_classes,
+                    weight=weight_cpu,
+                    cluster_label=self.cluster_label,
+                )
+            else:
+                sampled = get_fed_loss_inds(
+                    gt_for_sampling,
+                    num_sample_cats=self.fed_loss_num_cat,
+                    C=self.num_classes,
+                    weight=weight_cpu,
+                )
+            sampled = sampled.to(dtype=torch.long, device=device)
+            sampled_len = torch.tensor([sampled.numel()], dtype=torch.long, device=device)
+        else:
+            sampled = torch.empty(0, dtype=torch.long, device=device)
+            sampled_len = torch.zeros(1, dtype=torch.long, device=device)
+
+        if is_dist_avail_and_initialized():
+            dist.broadcast(sampled_len, src=0)
+            if sampled.numel() != sampled_len.item():
+                sampled = torch.empty(sampled_len.item(), dtype=torch.long, device=device)
+            dist.broadcast(sampled, src=0)
+
+        content_inds = sampled
 
         convert_map = torch.ones(self.num_classes, dtype=torch.int64) * -1
         for idx, content_id in enumerate(content_inds):
@@ -388,7 +440,7 @@ class DINO(nn.Module):
             if content_inds is not None:
                 text_feats = text_feats[content_inds]
             # [C,K,D_text]
-            proto_ckd = text_classifier.tpa(text_feats, with_loss=False)
+            proto_ckd, _ = text_classifier.tpa(text_feats, with_loss=False)
             # Project to decoder dim
             proto_ckd = self.content_layer(proto_ckd.view(-1, proto_ckd.size(-1))).view(
                 proto_ckd.size(0), proto_ckd.size(1), -1

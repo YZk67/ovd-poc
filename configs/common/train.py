@@ -11,7 +11,7 @@ train = dict(
     amp=dict(enabled=False),
     # options for DistributedDataParallel
     ddp=dict(
-        broadcast_buffers=False,
+        broadcast_buffers=True,
         find_unused_parameters=True,
         fp16_compression=False,
     ),

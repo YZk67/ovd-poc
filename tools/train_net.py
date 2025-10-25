@@ -34,6 +34,11 @@ from detectron2.engine.defaults import create_ddp_model
 from detectron2.evaluation import inference_on_dataset, print_csv_format
 from detectron2.utils import comm
 
+# ==== Added by ChatGPT ====
+import torch.distributed as dist
+from torch import nn
+# ==== End ====
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 
 logger = logging.getLogger("detrex")
@@ -156,6 +161,65 @@ def do_test(cfg, model):
         return ret
 
 
+# ==== Added by ChatGPT ====
+def _maybe_convert_syncbn(model, enable=True):
+    """
+    Convert all BatchNorm to SyncBatchNorm before DDP wrapping.
+    """
+    if not enable:
+        return model
+    try:
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            print("[Init] Converting BatchNorm -> SyncBatchNorm ...")
+            model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    except Exception as e:
+        print(f"[Warning] SyncBatchNorm conversion failed: {e}")
+    return model
+
+
+def _broadcast_tpa_buffers(model):
+    """
+    Broadcast critical TPA buffers/params so multi-GPU start from identical states.
+    Safe to call even on 1-GPU.
+    """
+    try:
+        if not (dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1):
+            return
+        rank = dist.get_rank()
+
+        # Try to locate the last classification head where TPA usually lives:
+        cls_head = None
+        if hasattr(model, "transformer") and hasattr(model.transformer, "decoder"):
+            dec = model.transformer.decoder
+            if hasattr(dec, "class_embed") and len(dec.class_embed) > 0:
+                cls_head = dec.class_embed[-1]
+        elif hasattr(model, "decoder") and hasattr(model.decoder, "class_embed"):
+            dec = model.decoder
+            cls_head = dec.class_embed[-1] if len(dec.class_embed) > 0 else None
+
+        if cls_head is None:
+            return
+
+        # broadcast text feature buffers if present
+        for name in ["train_text_feats", "eval_text_feats"]:
+            if hasattr(cls_head, name):
+                buf = getattr(cls_head, name)
+                if isinstance(buf, torch.Tensor):
+                    if rank == 0:
+                        print(f"[Rank {rank}] Broadcasting buffer: {name} (shape={tuple(buf.shape)})")
+                    dist.broadcast(buf.data, src=0)
+
+        # broadcast TPA prototype queries if present
+        if hasattr(cls_head, "tpa") and hasattr(cls_head.tpa, "prototype_queries"):
+            pq = cls_head.tpa.prototype_queries
+            if rank == 0:
+                print(f"[Rank {rank}] Broadcasting TPA prototype_queries (shape={tuple(pq.shape)})")
+            dist.broadcast(pq.data, src=0)
+
+    except Exception as e:
+        print(f"[Warning] broadcast_tpa_buffers failed: {e}")
+# ==== End ====
+
 def do_train(args, cfg):
     """
     Args:
@@ -179,6 +243,16 @@ def do_train(args, cfg):
     logger = logging.getLogger("detectron2")
     logger.info("Model:\n{}".format(model))
     model.to(cfg.train.device)
+
+    # ==== Added by ChatGPT ====
+    # Convert BN -> SyncBN (only when multi-GPU is initialized)
+    syncbn_flag = getattr(cfg.train, "sync_batchnorm", True)
+    model = _maybe_convert_syncbn(model, enable=syncbn_flag)
+
+    # Proactively broadcast TPA buffers/params before DDP,
+    # especially helpful when cfg.train.ddp.broadcast_buffers=False.
+    _broadcast_tpa_buffers(model)
+    # ==== End ====
 
     cfg.optimizer.params.model = model
     optim = instantiate(cfg.optimizer)
@@ -250,6 +324,14 @@ def main(args):
     if args.eval_only:
         model = instantiate(cfg.model)
         model.to(cfg.train.device)
+
+        # ==== Added by ChatGPT ====
+        # Keep eval path consistent: convert SyncBN & broadcast buffers pre-DDP as well.
+        syncbn_flag = getattr(cfg.train, "sync_batchnorm", True)
+        model = _maybe_convert_syncbn(model, enable=syncbn_flag)
+        _broadcast_tpa_buffers(model)
+        # ==== End ====
+
         model = create_ddp_model(model)
         DetectionCheckpointer(model).load(cfg.train.init_checkpoint)
         print(do_test(cfg, model))

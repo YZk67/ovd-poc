@@ -46,21 +46,23 @@ train.output_dir = f"/root/autodl-tmp/lami_convnext_large_12ep_lvis_{timestamp}"
 # - Batch size 64: 100,170 ÷ 64 = 1,565 iter/epoch → 18,780 total (12 epochs)
 # - Standardized values: 7,100 (bs16), 3,550 (bs32), 1,775 (bs64)
 # - LR scheduler: use lr_multiplier_12ep_warmup for batch size 32
-train.max_iter = 100170  # Single GPU A100 4 epochs 12 epochs with batch size 32: 100170/32*12 -- 85200
+train.max_iter = 28400 #85200  # Single GPU A100 4 epochs 12 epochs with batch size 32: 100170/32*12 -- 85200
 
 # run evaluation every 3130 iters
-train.eval_period = 25042  # Evaluate after each epoch 7100//2
+train.eval_period = 7100  # Evaluate after each epoch 7100//2
 
 # log training infomation every 20 iters
 train.log_period = 50
 
 # save checkpoint every 3130 iters
-train.checkpointer.period = 25042  # 1 epoch worth of iterations
+train.checkpointer.period = 7100  # 1 epoch worth of iterations
 
 # gradient clipping for training
 train.clip_grad.enabled = True
 train.clip_grad.params.max_norm = 0.1
 train.clip_grad.params.norm_type = 2
+
+train.sync_batchnorm = True
 
 # set training devices
 train.device = "cuda"
@@ -92,7 +94,7 @@ dataloader.train.num_workers = 4  # More stable for 8-GPU training
 # each gpu is 16/4 = 4
 # Note: Using Option 3 (averaged embeddings), batch_size can remain at 4
 # If using Option 2 (6015 queries), reduce to batch_size=1
-dataloader.train.total_batch_size = 4  # Can use 4 with Option 3
+dataloader.train.total_batch_size = 16  # Can use 4 with Option 3
 
 # dump the testing results into output_dir for visualization
 dataloader.evaluator.output_dir = train.output_dir
