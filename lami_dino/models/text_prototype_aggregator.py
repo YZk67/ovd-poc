@@ -237,3 +237,60 @@ def monitor_prototype_metrics(prototypes, logits, step=0, prefix="[TPA]"):
     if step % 200 == 0 and _is_main_process():
         print(f"{prefix} step={step:06d} | orth_off={off_mse:.4f} | diag_mse={diag_mse:.4f} | usage_entropy={usage_entropy:.4f}")
     return {"orth_off_mse": off_mse, "diag_mse": diag_mse, "usage_entropy": usage_entropy}
+
+
+class TextPrototypeBank(nn.Module):
+    """
+    Wrapper for managing and caching text prototypes
+    """
+
+    def __init__(
+        self,
+        embedding_path: str,
+        aggregator: Optional[TextPrototypeAggregator] = None,
+        *,
+        num_prototypes: int = 6,
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
+        super().__init__()
+
+        raw = np.load(embedding_path)
+        if raw.ndim == 2:
+            raw = raw[:, None, :]
+        assert raw.ndim == 3, f"Expected [C,N,D], got {raw.shape}"
+
+        text_feats = torch.from_numpy(raw).to(dtype=dtype)
+        self.register_buffer("text_feats", text_feats, persistent=False)
+
+        self.num_classes, self.num_phrases, self.feat_dim = text_feats.shape
+        self.num_prototypes = num_prototypes
+
+        if aggregator is None:
+            aggregator = TextPrototypeAggregator(
+                dim=self.feat_dim,
+                num_prototypes=num_prototypes,
+            )
+        self.aggregator = aggregator
+        self._cached_step = -1
+        self._cached_prototypes = None
+        self._cached_apr_loss = None
+
+    def forward(self, step: int = -1, *, force_recompute: bool = False):
+        text_feats = self.text_feats.to(next(self.aggregator.parameters()).device)
+
+        if self.training or force_recompute:
+            prototypes, apr_loss = self.aggregator(text_feats)
+            return prototypes, apr_loss
+
+        if (
+            self._cached_prototypes is None
+            or force_recompute
+            or step != self._cached_step
+        ):
+            with torch.no_grad():
+                prototypes, apr_loss = self.aggregator(text_feats)
+            self._cached_prototypes = prototypes
+            self._cached_apr_loss = apr_loss
+            self._cached_step = step
+
+        return self._cached_prototypes, self._cached_apr_loss
