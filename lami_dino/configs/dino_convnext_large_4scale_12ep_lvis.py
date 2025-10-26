@@ -33,7 +33,7 @@ train.seed = 42  # Fixed seed for fair comparison
 train.init_checkpoint = "./pretrained_models/lami_convnext_large_12ep_lvis/model_final.pth"
 # Add timestamp to output directory
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-train.output_dir = f"/root/autodl-tmp/lami_convnext_large_12ep_lvis_{timestamp}"
+train.output_dir = f"/root/lami_convnext_large_12ep_lvis_{timestamp}"
 
 # max training iterations
 # - Original COCO dataset: 113600 images
