@@ -46,7 +46,7 @@ train.output_dir = f"/root/lami_convnext_large_12ep_lvis_{timestamp}"
 # - Batch size 64: 100,170 ÷ 64 = 1,565 iter/epoch → 18,780 total (12 epochs)
 # - Standardized values: 7,100 (bs16), 3,550 (bs32), 1,775 (bs64)
 # - LR scheduler: use lr_multiplier_12ep_warmup for batch size 32
-train.max_iter = 28400 #85200  # Single GPU A100 4 epochs 12 epochs with batch size 32: 100170/32*12 -- 85200
+train.max_iter = 85200 #85200  # Single GPU A100 4 epochs 12 epochs with batch size 32: 100170/32*12 -- 85200
 
 # run evaluation every 3130 iters
 train.eval_period = 7100  # Evaluate after each epoch 7100//2
@@ -81,7 +81,10 @@ model.eval_query_path = "dataset/metadata/lvis_claude_prompts_convnextl.npy"
 # model.select_box_nums_for_evaluation = 300
 
 # modify optimizer config
-optimizer.lr = 1e-4 # (1GPU); 1e-4 (8 GPUs) - 使用原来成功的学习率
+# 假设你单卡用 1e-4 (1GPU); 1e-4 (8 GPUs) - 使用原来成功的学习率
+base_lr = 1e-4
+world_size = 4  # GPU 数
+optimizer.lr = base_lr * world_size  # 4e-4
 optimizer.betas = (0.9, 0.999)
 optimizer.weight_decay = 1e-4
 optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 1
@@ -115,7 +118,7 @@ model.classifier.text_embed_path = "dataset/metadata/lvis_claude_prompts_convnex
 model.classifier.eval_text_embed_path = "dataset/metadata/lvis_claude_prompts_convnextl.npy"
 model.classifier.tpa_num_prototypes = 5  # 8 prompts -> 5 prototypes (better utilization)
 model.classifier.tpa_hidden_dim = 256
-model.classifier.tpa_dropout = 0.1  # Add dropout for regularization
+model.classifier.tpa_dropout = 0.05  # Add dropout for regularization
 model.classifier.tpa_tau = 0.07  # Optimal temperature for attention aggregation (τ ≈ 0.05–0.1 recommended) 0.1 is original
 model.classifier.tpa_log_interval = 200
 

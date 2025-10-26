@@ -82,6 +82,7 @@ class TextClassifier(nn.Module):
             self._cached_eval = None
             self.zs_weight = None
             self.eval_zs_weight = None
+            self.tpa.log_owner = True
         else:
             if zs_weight_path == "rand":
                 zs_weight = torch.randn((zs_weight_dim, num_classes))
