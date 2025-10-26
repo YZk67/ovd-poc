@@ -371,7 +371,7 @@ class DINO(nn.Module):
         if is_dist_avail_and_initialized():
             import hashlib
             global_step = getattr(self, "_debug_step", 0)
-            if global_step < 200:
+            if global_step < 200 and global_step % 10 == 0:
                 h_local = hashlib.md5(content_inds.detach().cpu().numpy().tobytes()).hexdigest()[:8]
                 hashes = [None for _ in range(dist.get_world_size())]
                 dist.all_gather_object(hashes, h_local)

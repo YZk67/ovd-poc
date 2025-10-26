@@ -66,6 +66,10 @@ class TextPrototypeAggregator(nn.Module):
         self._last_prototypes: Optional[torch.Tensor] = None
         self.last_monitor_terms: Dict[str, float] = {}
 
+        # TODO: add dynamic lambda
+        # lam_orth = self.lambda_orth_base * (1 + 0.5 * self.last_monitor_terms.get("orth_off_mse",0))
+        # lam_div  = self.lambda_div_base  * (1 + 0.5 * (1 - self.last_monitor_terms.get("usage_entropy",0.5)))
+
         self._reset_parameters()
 
     def _reset_parameters(self):
