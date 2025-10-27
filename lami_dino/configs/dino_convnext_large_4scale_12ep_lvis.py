@@ -133,8 +133,20 @@ train.amp.enabled = True
 
 # Add multiprocessing stability settings to prevent BrokenPipeError
 import torch.multiprocessing as mp
+import os
+
+# Set multiprocessing start method to spawn for better stability with multiple GPUs
 try:
     mp.set_start_method('spawn', force=True)
 except RuntimeError:
     # If already set, continue
     pass
+
+# Additional environment variables for stability
+os.environ['PYTHONUNBUFFERED'] = '1'
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['NUMEXPR_NUM_THREADS'] = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
+os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'OFF'

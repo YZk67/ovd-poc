@@ -166,21 +166,31 @@ class Trainer(SimpleTrainer):
 def do_test(cfg, model):
     if "evaluator" in cfg.dataloader:
         try:
+            # Temporarily reduce num_workers for evaluation to prevent BrokenPipeError
+            original_num_workers = cfg.dataloader.test.num_workers
+            cfg.dataloader.test.num_workers = 0  # Use single process for evaluation
+            
             ret = inference_on_dataset(
                 model, instantiate(cfg.dataloader.test), instantiate(cfg.dataloader.evaluator), cfg.DDEBUG
             )
             print_csv_format(ret)
+            
+            # Restore original num_workers
+            cfg.dataloader.test.num_workers = original_num_workers
             return ret
         except BrokenPipeError as e:
             logger = logging.getLogger("detectron2")
             logger.warning(f"BrokenPipeError during evaluation: {e}")
             logger.warning("Skipping evaluation due to multiprocessing issue - training will continue")
-            # Return empty results instead of raising exception to continue training
+            # Restore original num_workers
+            cfg.dataloader.test.num_workers = original_num_workers
             return {}
         except Exception as e:
             logger = logging.getLogger("detectron2")
             logger.warning(f"Error during evaluation: {e}")
             logger.warning("Skipping evaluation - training will continue")
+            # Restore original num_workers
+            cfg.dataloader.test.num_workers = original_num_workers
             return {}
 
 

@@ -65,7 +65,7 @@ dataloader.test = L(build_detection_test_loader)(
         mask_on=False,
         img_format="RGB",
     ),
-    num_workers=2,  # Reduced to prevent BrokenPipeError
+    num_workers=1,  # Further reduced to prevent BrokenPipeError during evaluation
 )
 
 dataloader.evaluator = L(LVISEvaluator)(
