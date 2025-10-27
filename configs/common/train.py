@@ -11,8 +11,8 @@ train = dict(
     amp=dict(enabled=False),
     # options for DistributedDataParallel
     ddp=dict(
-        broadcast_buffers=True,
-        find_unused_parameters=True,
+        broadcast_buffers=True,  # Keep True for SyncBatchNorm and custom buffers
+        find_unused_parameters=False,  # Set to False for better performance and stability
         fp16_compression=False,
     ),
     # options for Gradient Clipping during training

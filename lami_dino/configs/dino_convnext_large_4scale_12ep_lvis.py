@@ -90,7 +90,8 @@ optimizer.weight_decay = 1e-4
 optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 1
 
 # modify dataloader config
-dataloader.train.num_workers = 4  # More stable for 8-GPU training
+# Start with conservative setting, can be increased if stable
+dataloader.train.num_workers = 4  # 1 worker per GPU for 4GPU training
 
 # please notice that this is total batch size.
 # surpose you're using 4 gpus for training and the batch size for
@@ -129,3 +130,11 @@ model.soft_attention_tau = 0.08  # Temperature parameter for soft-attention (τ 
 
 # Enable Automatic Mixed Precision (AMP) for faster training
 train.amp.enabled = True
+
+# Add multiprocessing stability settings to prevent BrokenPipeError
+import torch.multiprocessing as mp
+try:
+    mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    # If already set, continue
+    pass

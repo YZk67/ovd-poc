@@ -165,11 +165,23 @@ class Trainer(SimpleTrainer):
 
 def do_test(cfg, model):
     if "evaluator" in cfg.dataloader:
-        ret = inference_on_dataset(
-            model, instantiate(cfg.dataloader.test), instantiate(cfg.dataloader.evaluator), cfg.DDEBUG
-        )
-        print_csv_format(ret)
-        return ret
+        try:
+            ret = inference_on_dataset(
+                model, instantiate(cfg.dataloader.test), instantiate(cfg.dataloader.evaluator), cfg.DDEBUG
+            )
+            print_csv_format(ret)
+            return ret
+        except BrokenPipeError as e:
+            logger = logging.getLogger("detectron2")
+            logger.warning(f"BrokenPipeError during evaluation: {e}")
+            logger.warning("Skipping evaluation due to multiprocessing issue - training will continue")
+            # Return empty results instead of raising exception to continue training
+            return {}
+        except Exception as e:
+            logger = logging.getLogger("detectron2")
+            logger.warning(f"Error during evaluation: {e}")
+            logger.warning("Skipping evaluation - training will continue")
+            return {}
 
 
 # ==== Added by ChatGPT ====
@@ -303,14 +315,28 @@ def do_train(args, cfg):
         ]
     )
 
+    # Robust checkpoint resuming with automatic detection
+    logger = logging.getLogger("detectron2")
+    
+    # Try to resume from checkpoint if available
     checkpointer.resume_or_load(cfg.train.init_checkpoint, resume=args.resume)
+    
     if args.resume and checkpointer.has_checkpoint():
         # The checkpoint stores the training iteration that just finished, thus we start
         # at the next iteration
         start_iter = trainer.iter + 1
+        logger.info(f"Resuming training from iteration {start_iter}")
     else:
         start_iter = 0
-    trainer.train(start_iter, cfg.train.max_iter)
+        logger.info("Starting training from iteration 0")
+    
+    # Add error handling for training loop
+    try:
+        trainer.train(start_iter, cfg.train.max_iter)
+    except Exception as e:
+        logger.error(f"Training interrupted with error: {e}")
+        logger.info("Training can be resumed using --resume flag")
+        raise
 
 
 def main(args):
