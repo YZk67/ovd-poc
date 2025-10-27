@@ -33,6 +33,7 @@ train.seed = 42  # Fixed seed for fair comparison
 train.init_checkpoint = "./pretrained_models/lami_convnext_large_12ep_lvis/model_final.pth"
 # Add timestamp to output directory
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+# resume training from the last checkpoint
 train.output_dir = f"/root/lami_convnext_large_12ep_lvis_{timestamp}"
 
 # max training iterations
