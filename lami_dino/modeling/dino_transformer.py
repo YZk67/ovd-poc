@@ -13,12 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Dict, Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import logging
-
-logger = logging.getLogger("detectron2")
 
 from detrex.layers import (
     FFN,
@@ -30,6 +29,7 @@ from detrex.layers import (
     get_sine_pos_embed,
 )
 from detrex.utils import inverse_sigmoid
+from lami_dino.models.rpsa import RPSAModule, build_token_class_mask_from_logits
 
 
 class DINOTransformerEncoder(TransformerLayerSequence):
@@ -244,6 +244,10 @@ class DINOTransformer(nn.Module):
         num_feature_levels=4,
         two_stage_num_proposals=900,
         # learnt_init_query=False,
+        # === RPSA kwargs (config-driven) ===
+        use_rpsa: bool = True,
+        rpsa_module: Optional[nn.Module] = None,
+        rpsa_kwargs: Optional[Dict] = None,
     ):
         super(DINOTransformer, self).__init__()
         self.encoder = encoder
@@ -261,6 +265,18 @@ class DINOTransformer(nn.Module):
         self.enc_output_norm = nn.LayerNorm(self.embed_dim)
 
         self.init_weights()
+
+        # === RPSA initialization (minimal intrusive) ===
+        self.use_rpsa = use_rpsa
+        self.rpsa_last_loss = None
+        self.rpsa_last_stats = {}
+        self.rpsa = None
+        if self.use_rpsa:
+            if rpsa_module is not None:
+                self.rpsa = rpsa_module
+            else:
+                cfg = rpsa_kwargs or {}
+                self.rpsa = RPSAModule(**cfg)
 
     def init_weights(self):
         for p in self.parameters():
@@ -419,60 +435,125 @@ class DINOTransformer(nn.Module):
         enc_outputs_class = text_classifier(output_memory, content_inds=content_inds)
         apr_loss = getattr(text_classifier, "apr_loss", None)
 
+        # === RPSA: compute alignment loss (non-breaking: stash on classifier/transformer) ===
+        if getattr(self, "use_rpsa", False) and self.training and self.rpsa is not None:
+            try:
+                # 1) token->class 软掩码（从 encoder 分类 logits 构造）
+                token_cls_mask = build_token_class_mask_from_logits(enc_outputs_class, topL=5)  # [B,N,C]
+
+                # 2) 文本原型，保证形状为 [C,Kp,D]
+                #    这里沿用你当前变量 content_query_embeds（TPA/投影后的原型）
+                if content_query_embeds.dim() == 2:  # [C,D] -> [C,1,D]
+                    text_protos_for_rpsa = content_query_embeds.unsqueeze(1)
+                else:
+                    text_protos_for_rpsa = content_query_embeds  # [C,Kp,D]
+
+                # 3) 计算 RPSA
+                loss_rpsa_raw, rpsa_stats, _ = self.rpsa(
+                    region_feats=output_memory,             # [B,N,D]
+                    text_protos=text_protos_for_rpsa,       # [C,Kp,D]
+                    token_cls_mask=token_cls_mask,          # [B,N,C]
+                )
+                loss_rpsa = loss_rpsa_raw
+
+                # 4) 暂存，保持与你 APR 的用法一致（不改变返回签名）
+                self.rpsa_last_loss = loss_rpsa.detach()
+                self.rpsa_last_stats = rpsa_stats
+                setattr(text_classifier, "rpsa_loss", loss_rpsa)
+                setattr(text_classifier, "rpsa_stats", rpsa_stats)
+
+            except Exception as e:
+                logger.warning(f"[RPSA] skipped due to: {e}")
+
+
         enc_outputs_coord_unact = (
             self.decoder.bbox_embed[self.decoder.num_layers](output_memory) + output_proposals
         )  # unsigmoided.
 
         max_scores, max_labels = torch.max(enc_outputs_class, dim=-1)
-
         topk = self.two_stage_num_proposals
-        topk_proposals = torch.topk(max_scores, topk, dim=1)[1]
-
-        # extract region proposal boxes
-        topk_coords_unact = torch.gather(
-            enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4)
-        )  # unsigmoided.
-        reference_points = topk_coords_unact.detach().sigmoid()
-        if query_embed[1] is not None:
-            reference_points = torch.cat([query_embed[1].sigmoid(), reference_points], 1)
-        init_reference_out = reference_points
-
-        # extract region features
-        target_unact = torch.gather(
-            output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, output_memory.shape[-1])
-        )
-
+        
         # Check if we have multi-prototype embeddings and should use soft-attention
-        if getattr(self, 'use_soft_attention', False) and content_query_embeds.ndim == 3:
-            # logger.info(f"[Soft-Attention] Using soft-attention aggregation with {content_query_embeds.shape[1]} prototypes per class")
-            # === Vectorized multi-prototype soft-attention aggregation ===
-            tau = getattr(self, 'soft_attention_tau', 0.07)
-            # Gather selected visual features and class ids
-            content_ids = torch.gather(max_labels, 1, topk_proposals)  # [B, topk]
-            target_unact = torch.gather(output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, output_memory.shape[-1]))  # [B, topk, D]
+        if hasattr(self, 'use_soft_attention') and self.use_soft_attention and content_query_embeds.ndim == 3:
+            # Multi-prototype mode with soft-attention aggregation
+            # content_query_embeds: [C, K, embed_dim] where K is num_prototypes
+            num_classes, num_prototypes, embed_dim = content_query_embeds.shape
+            
+            # Normalize embeddings and region features
+            embeddings_norm = F.normalize(content_query_embeds, p=2, dim=-1)  # [C, K, embed_dim]
+            region_feats_norm = F.normalize(output_memory.detach(), p=2, dim=-1)  # [B, N, embed_dim]
+            
+            # Compute similarity: [B, N, embed_dim] @ [C, K, embed_dim]^T -> [B, C, N, K]
+            sim = torch.einsum("bnd,ckd->bcnk", region_feats_norm, embeddings_norm)
+            
+            # Soft-attention weights: α_i,c,k = softmax(cos(f_i, t_c,k) / τ)
+            tau = getattr(self, 'soft_attention_tau', 0.1)
+            alpha = F.softmax(sim / tau, dim=-1)  # [B, C, N, K]
+            
+            # Weighted aggregation: s_i,c = sum_k α_i,c,k * cos(f_i, t_c,k)
+            sim_aggregated = (alpha * sim).sum(dim=-1)  # [B, C, N]
+            
+            # Get max scores and labels from soft-attention aggregated similarities
+            max_scores_soft, max_labels_soft = torch.max(sim_aggregated, dim=1)  # [B, N]
+            
+            # Use soft-attention based selection for top-k proposals
+            topk_proposals = torch.topk(max_scores_soft, topk, dim=1)[1]
+            content_ids = torch.gather(max_labels_soft, 1, topk_proposals)
+            
+            # extract region proposal boxes
+            topk_coords_unact = torch.gather(
+                enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4)
+            )  # unsigmoided.
+            reference_points = topk_coords_unact.detach().sigmoid()
+            if query_embed[1] is not None:
+                reference_points = torch.cat([query_embed[1].sigmoid(), reference_points], 1)
+            init_reference_out = reference_points
 
-            # Prototypes per region: [B, topk, K, D]
-            proto_per_region = content_query_embeds[content_ids]
-            # Cosine similarities: [B, topk, K]
-            sim = torch.einsum('bqd,bqkd->bqk',
-                            F.normalize(target_unact, dim=-1),
-                            F.normalize(proto_per_region, dim=-1)) / tau
-            attn = F.softmax(sim, dim=-1)  # [B, topk, K]
-            content_query = torch.einsum('bqk,bqkd->bqd', attn, proto_per_region)  # [B, topk, D]
-        elif content_query_embeds.ndim == 3:
-            # === Mean aggregation fallback over K prototypes ===
-            content_ids = torch.gather(max_labels, 1, topk_proposals)
-            # [B, topk, K, D]
-            proto_per_region = content_query_embeds[content_ids]
-            content_query = proto_per_region.mean(dim=2)  # [B, topk, D]
+            # extract region features
+            target_unact = torch.gather(
+                output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, output_memory.shape[-1])
+            )
+            
+            # For each selected region, compute its soft-attention aggregated embedding
+            # Gather the attention weights for selected regions: [B, topk, C, K]
+            selected_alpha = torch.gather(alpha, 2, topk_proposals.unsqueeze(1).unsqueeze(-1).repeat(1, num_classes, 1, num_prototypes))
+            
+            # For each selected region, compute weighted aggregation based on its class
+            content_query_list = []
+            for b in range(bs):
+                batch_queries = []
+                for k in range(topk):
+                    class_id = content_ids[b, k]
+                    # Get attention weights for this region and class: [K]
+                    region_alpha = selected_alpha[b, class_id, k, :]
+                    # Weighted aggregation: sum_k α_k * t_c,k
+                    weighted_embed = torch.einsum("k,kd->d", region_alpha, content_query_embeds[class_id])
+                    batch_queries.append(weighted_embed)
+                content_query_list.append(torch.stack(batch_queries))
+            content_query = torch.stack(content_query_list)  # [B, topk, embed_dim]
         else:
-            # === Standard single-prototype mode ===
+            # Standard single-prototype mode
+            topk_proposals = torch.topk(max_scores, topk, dim=1)[1]
+            
+            # extract region proposal boxes
+            topk_coords_unact = torch.gather(
+                enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4)
+            )  # unsigmoided.
+            reference_points = topk_coords_unact.detach().sigmoid()
+            if query_embed[1] is not None:
+                reference_points = torch.cat([query_embed[1].sigmoid(), reference_points], 1)
+            init_reference_out = reference_points
+
+            # extract region features
+            target_unact = torch.gather(
+                output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, output_memory.shape[-1])
+            )
+            
             content_ids = torch.gather(max_labels, 1, topk_proposals)
-            embed_dim = content_query_embeds.shape[-1]
+            embed_dim = content_query_embeds.shape[-1]  # Get actual feature dimension
             content_query = torch.gather(
                 content_query_embeds.unsqueeze(0).repeat(bs, 1, 1), 1,
-                content_ids.unsqueeze(-1).repeat(1, 1, embed_dim)
-            )
+                content_ids.unsqueeze(-1).repeat(1, 1, embed_dim)) 
 
         target = target_unact.detach() + content_query
 
@@ -501,5 +582,7 @@ class DINOTransformer(nn.Module):
             inter_references_out,
             target_unact,
             topk_coords_unact.sigmoid(),
-            apr_loss
+            apr_loss,
+            self.rpsa_last_loss,
+            self.rpsa_last_stats,
         )

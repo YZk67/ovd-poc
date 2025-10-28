@@ -17,6 +17,19 @@ from lami_dino.modeling import (
     DINOCriterion,
     TextClassifier,
 )
+from lami_dino.models import RPSAModule
+
+rpsa_module = L(RPSAModule)(
+    K=8,
+    sigma=1.0,
+    em_iters=1,
+    tau_align=0.07,
+    alpha_pi=1.0,
+    bg_thresh=0.1,
+    subsample_tokens=0,
+    stop_grad_text=False,
+    stop_grad_vision=False,
+)
 
 model = L(DINO)(
     backbone=L(ConvNeXt)(
@@ -70,6 +83,8 @@ model = L(DINO)(
         ),
         num_feature_levels=4,
         two_stage_num_proposals="${..num_queries}",
+        use_rpsa=True,
+        rpsa_module=rpsa_module,
     ),
     embed_dim=256,
     num_classes=80,
@@ -93,6 +108,7 @@ model = L(DINO)(
             "loss_bbox_dn": 5.0,
             "loss_giou_dn": 2.0,
             "loss_apr": 1.0,  # APR loss weight
+            "loss_rpsa": 0.2,  # RPSA loss weight
         },
         loss_class_type="focal_loss",
         alpha=0.25,

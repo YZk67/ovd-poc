@@ -369,8 +369,8 @@ def _evaluate_predictions_on_lvis(
 
     logger.info(f"Evaluating with max detections per image = {max_dets_per_image}")
     lvis_results = LVISResults(lvis_gt, lvis_results, max_dets=max_dets_per_image)
-#    lvis_eval = LVISEval(lvis_gt, lvis_results, iou_type)
-    lvis_eval = LVISEval(lvis_gt, lvis_results, iou_type, img_ids=lvis_results.img_ids_in_result) # install https://github.com/eternaldolphin/lvis-debug for a quick lvis debug
+    lvis_eval = LVISEval(lvis_gt, lvis_results, iou_type)
+    # lvis_eval = LVISEval(lvis_gt, lvis_results, iou_type, img_ids=lvis_results.img_ids_in_result) # install https://github.com/eternaldolphin/lvis-debug for a quick lvis debug
     lvis_eval.run()
     lvis_eval.print_results()
 

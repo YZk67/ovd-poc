@@ -27,10 +27,10 @@ train = get_config("common/train.py").train
 # Set random seed for reproducibility
 train.seed = 42  # Fixed seed for fair comparison
 
-
 # modify training config
 # train.init_checkpoint = "clip_convnext_large_trans.pth"
 train.init_checkpoint = "./pretrained_models/lami_convnext_large_12ep_lvis/model_final.pth"
+
 # Add timestamp to output directory
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 # resume training from the last checkpoint
@@ -74,13 +74,6 @@ model.num_classes = 1203
 model.query_path = "dataset/metadata/lvis_claude_prompts_convnextl.npy"
 model.eval_query_path = "dataset/metadata/lvis_claude_prompts_convnextl.npy"
 
-# model.use_fed_loss = True
-# model.cluster_fed_loss = True
-# model.cluster_label_path = 'dataset/cluster/lvis_cluster_128.npy'
-# model.cat_freq_path = "dataset/lvis/lvis_v1_train_norare_cat_info.json"
-# model.fed_loss_num_cat=100
-# model.select_box_nums_for_evaluation = 300
-
 # modify optimizer config
 # 假设你单卡用 1e-4 (1GPU); 1e-4 使用原来成功的学习率
 base_lr = 1e-4
@@ -105,11 +98,11 @@ dataloader.train.total_batch_size = 16  # Can use 4 with Option 3
 dataloader.evaluator.output_dir = train.output_dir
 dataloader.test.dataset.names = "lvis_v1_val"
 
-# ====== Phase 1：测试 Claude Prompts 单独效果 ======
+# ====== 测试 Claude Prompts ======
 # Fed Loss是LVIS必须的基础设施，所有实验都需要使用
 model.use_fed_loss = True  # ✅ 必须开启，处理长尾分布
 model.cluster_fed_loss = False
-model.cluster_label_path = 'dataset/cluster/lvis_cluster_128.npy'
+# model.cluster_label_path = 'dataset/cluster/lvis_cluster_128.npy'
 model.cat_freq_path = "dataset/lvis/lvis_v1_train_norare_cat_info.json"
 model.fed_loss_num_cat = 100  # 每次采样100个类别计算loss
 model.select_box_nums_for_evaluation = 300
@@ -124,10 +117,17 @@ model.classifier.tpa_dropout = 0.05  # Add dropout for regularization
 model.classifier.tpa_tau = 0.07  # Optimal temperature for attention aggregation (τ ≈ 0.05–0.1 recommended) 0.1 is original
 model.classifier.tpa_log_interval = 200
 
-
-# Soft-attention aggregation parameters for multi-prototype query initialization
+# Query initialization: Soft-attention aggregation parameters for multi-prototype query initialization
 model.use_soft_attention = True  # Enable soft-attention aggregation in query initialization
 model.soft_attention_tau = 0.08  # Temperature parameter for soft-attention (τ ≈ 0.05–0.1 recommended)
+
+# RPSA parameters
+model.transformer.use_rpsa = True
+model.criterion.weight_dict["loss_rpsa"] = 0.2
+model.transformer.rpsa_module.K = 8
+model.transformer.rpsa_module.tau_align = 0.07
+model.transformer.rpsa_module.sigma = 1.0
+model.transformer.rpsa_module.bg_thresh = 0.1
 
 # Enable Automatic Mixed Precision (AMP) for faster training
 train.amp.enabled = True

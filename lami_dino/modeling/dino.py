@@ -552,8 +552,26 @@ class DINO(nn.Module):
 
         if self.training:
             loss_dict = self.criterion(output, targets, dn_meta)
+            # === 1️⃣ 添加 APR 损失（保持原逻辑） ===
             if apr_loss is not None:
                 loss_dict["loss_apr"] = apr_loss
+
+            # === 2️⃣ 添加 RPSA 损失（Region–Prototype Semantic Alignment） ===
+            # RPSA 模块的损失在 transformer 内部计算，并暂存在 class_embed[0].rpsa_loss
+            try:
+                dec0 = self.transformer.decoder.class_embed[0]
+                if hasattr(dec0, "rpsa_loss") and dec0.rpsa_loss is not None:
+                    loss_dict["loss_rpsa"] = dec0.rpsa_loss
+                    stats = getattr(dec0, "rpsa_stats", None)
+                    if isinstance(stats, dict):
+                        if "rpsa_center_orth_mse" in stats:
+                            loss_dict["rpsa_center_orth_mse"] = stats["rpsa_center_orth_mse"]
+                        if "rpsa_pi_entropy" in stats:
+                            loss_dict["rpsa_pi_entropy"] = stats["rpsa_pi_entropy"]
+            except Exception as e:
+                print(f"[WARN] RPSA loss aggregation skipped: {e}")
+
+            # === 3️⃣ FedLoss、主损失加权保持一致 ===
             weight_dict = self.criterion.weight_dict
             for k in loss_dict.keys():
                 if k in weight_dict:
