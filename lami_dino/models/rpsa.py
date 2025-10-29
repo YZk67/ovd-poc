@@ -13,8 +13,6 @@
 #   text_protos:  [C, Kp, D]           (TPA prototypes, already projected to D)
 #   token_cls_mask: [B, N, C]          (soft or hard masks; GT or pseudo)
 #
-# Author: LLM-OVD assistant
-# License: MIT
 
 from __future__ import annotations
 import math
@@ -168,11 +166,11 @@ def weighted_infoNCE(mu: torch.Tensor,
 
     # positive weights
     pi_clamped = pi.clamp_min(0.0)
+    # background mask uses the pre-normalized magnitude so tiny clusters remain filtered out
+    pi_max_raw = pi_clamped.max(dim=-1).values
+    bg_mask = (pi_max_raw < bg_thresh)                              # [B,K]
     pi_tilde = (pi_clamped ** alpha_pi)
     pi_tilde = pi_tilde / (pi_tilde.sum(dim=-1, keepdim=True).clamp_min(1e-6))  # [B,K,C]
-
-    # background mask
-    bg_mask = (pi_tilde.max(dim=-1).values < bg_thresh)             # [B,K]
 
     # logits
     pos = torch.logsumexp(S / tau, dim=-1)                          # [B,K,C] over Kp
@@ -192,10 +190,6 @@ def weighted_infoNCE(mu: torch.Tensor,
     }
     return loss, stats
 
-
-# -------------------------------
-# Main module
-# -------------------------------
 
 class RPSAModule(nn.Module):
     def __init__(self,
@@ -253,9 +247,14 @@ class RPSAModule(nn.Module):
         t = text_protos.detach()   if self.stop_grad_text   else text_protos
 
         # 1) soft clustering
+        # assign_r (软分配矩阵): [B,N,K], 表示每个token属于每个cluster的概率; 
+        #          行归一化后为1, 表示软分配; 用途: 计算pi权重，建立聚类与类别的关联
+        # centers_mu (聚类中心): [B,K,D], 每个聚类的代表性特征向量, 表示每个cluster的中心; 用途: 作为视觉中心参与InfoNCE对比学
         assign_r, centers_mu = soft_kmeans_assign(v, K=self.K, sigma=self.sigma, iters=self.em_iters)
 
         # 2) pi weights (cluster->class)
+        # pi (cluster->class 权重): [B,K,C], 表示每个cluster属于每个类别的概率; 
+        #          行归一化后不一定为1, 表示软权重; 用途: 加权InfoNCE损失, 强调重要类别的贡献
         pi = compute_pi_weights(assign_r, token_cls_mask_s)  # [B,K,C]
 
         # 3) weighted InfoNCE alignment
