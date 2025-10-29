@@ -557,12 +557,12 @@ class DINO(nn.Module):
                 loss_dict["loss_apr"] = apr_loss
 
             # === 2️⃣ 添加 RPSA 损失（Region–Prototype Semantic Alignment） ===
-            # RPSA 模块的损失在 transformer 内部计算，并暂存在 class_embed[0].rpsa_loss
+            # RPSA 模块的损失在 transformer 内部计算，并暂存在 encoder分类器中
             try:
-                dec0 = self.transformer.decoder.class_embed[0]
-                if hasattr(dec0, "rpsa_loss") and dec0.rpsa_loss is not None:
-                    loss_dict["loss_rpsa"] = dec0.rpsa_loss
-                    stats = getattr(dec0, "rpsa_stats", None)
+                dec_encoder = self.transformer.decoder.class_embed[self.transformer.decoder.num_layers]
+                if hasattr(dec_encoder, "rpsa_loss") and dec_encoder.rpsa_loss is not None:
+                    loss_dict["loss_rpsa"] = dec_encoder.rpsa_loss
+                    stats = getattr(dec_encoder, "rpsa_stats", None)
                     if isinstance(stats, dict):
                         if "rpsa_center_orth_mse" in stats:
                             loss_dict["rpsa_center_orth_mse"] = stats["rpsa_center_orth_mse"]

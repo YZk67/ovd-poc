@@ -110,7 +110,7 @@ class Trainer(SimpleTrainer):
                 losses = loss_dict
                 loss_dict = {"total_loss": loss_dict}
             else:
-                losses = sum(loss_dict.values())
+                losses = sum(v for k, v in loss_dict.items() if k.startswith("loss"))
 
         """
         If you need to accumulate gradients or do something similar, you can

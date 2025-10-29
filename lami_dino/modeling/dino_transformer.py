@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from typing import Dict, Optional
+import logging
 
 import torch
 import torch.nn as nn
@@ -30,6 +31,8 @@ from detrex.layers import (
 )
 from detrex.utils import inverse_sigmoid
 from lami_dino.models.rpsa import RPSAModule, build_token_class_mask_from_logits
+
+logger = logging.getLogger(__name__)
 
 
 class DINOTransformerEncoder(TransformerLayerSequence):
@@ -439,14 +442,17 @@ class DINOTransformer(nn.Module):
         if getattr(self, "use_rpsa", False) and self.training and self.rpsa is not None:
             try:
                 # 1) token->class 软掩码（从 encoder 分类 logits 构造）
-                token_cls_mask = build_token_class_mask_from_logits(enc_outputs_class, topL=5)  # [B,N,C]
+                token_cls_mask = build_token_class_mask_from_logits(enc_outputs_class, topL=5).detach()  # [B,N,C]
 
                 # 2) 文本原型，保证形状为 [C,Kp,D]
                 #    这里沿用你当前变量 content_query_embeds（TPA/投影后的原型）
                 if content_query_embeds.dim() == 2:  # [C,D] -> [C,1,D]
                     text_protos_for_rpsa = content_query_embeds.unsqueeze(1)
+                elif content_query_embeds.dim() == 3:  # [C,Kp,D]
+                    text_protos_for_rpsa = content_query_embeds
                 else:
-                    text_protos_for_rpsa = content_query_embeds  # [C,Kp,D]
+                    logger.warning(f"[RPSA] Unexpected content_query_embeds shape: {content_query_embeds.shape}")
+                    raise ValueError(f"content_query_embeds must be [C,D] or [C,Kp,D], got {content_query_embeds.shape}")
 
                 # 3) 计算 RPSA
                 loss_rpsa_raw, rpsa_stats, _ = self.rpsa(
@@ -459,11 +465,16 @@ class DINOTransformer(nn.Module):
                 # 4) 暂存，保持与你 APR 的用法一致（不改变返回签名）
                 self.rpsa_last_loss = loss_rpsa.detach()
                 self.rpsa_last_stats = rpsa_stats
+                # RPSA计算使用encoder分类器(class_embed[num_layers])，
+                # 损失存储也使用同一个分类器
                 setattr(text_classifier, "rpsa_loss", loss_rpsa)
                 setattr(text_classifier, "rpsa_stats", rpsa_stats)
 
-            except Exception as e:
+            except (ValueError, RuntimeError) as e:
                 logger.warning(f"[RPSA] skipped due to: {e}")
+            except Exception as e:
+                logger.error(f"[RPSA] Unexpected error: {e}")
+                raise
 
 
         enc_outputs_coord_unact = (
@@ -583,6 +594,4 @@ class DINOTransformer(nn.Module):
             target_unact,
             topk_coords_unact.sigmoid(),
             apr_loss,
-            self.rpsa_last_loss,
-            self.rpsa_last_stats,
         )
