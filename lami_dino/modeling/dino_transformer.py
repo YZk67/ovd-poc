@@ -277,9 +277,13 @@ class DINOTransformer(nn.Module):
         if self.use_rpsa:
             if rpsa_module is not None:
                 self.rpsa = rpsa_module
+                logger.info(f"[RPSA] Initialized with provided module: {type(self.rpsa)}")
             else:
                 cfg = rpsa_kwargs or {}
                 self.rpsa = RPSAModule(**cfg)
+                logger.info(f"[RPSA] Initialized with kwargs: {cfg}")
+        else:
+            logger.info("[RPSA] use_rpsa=False, RPSA module not initialized")
 
     def init_weights(self):
         for p in self.parameters():
@@ -439,8 +443,12 @@ class DINOTransformer(nn.Module):
         apr_loss = getattr(text_classifier, "apr_loss", None)
 
         # === RPSA: compute alignment loss (non-breaking: stash on classifier/transformer) ===
-        if getattr(self, "use_rpsa", False) and self.training and self.rpsa is not None:
+        use_rpsa_flag = getattr(self, "use_rpsa", False)
+        is_training = self.training
+        rpsa_module_exists = self.rpsa is not None
+        if use_rpsa_flag and is_training and rpsa_module_exists:
             try:
+                logger.debug(f"[RPSA] Computing RPSA loss: use_rpsa={use_rpsa_flag}, training={is_training}, rpsa={rpsa_module_exists}")
                 # 1) token->class 软掩码（从 encoder 分类 logits 构造）
                 token_cls_mask = build_token_class_mask_from_logits(enc_outputs_class, topL=5).detach()  # [B,N,C]
 
@@ -469,12 +477,25 @@ class DINOTransformer(nn.Module):
                 # 损失存储也使用同一个分类器
                 setattr(text_classifier, "rpsa_loss", loss_rpsa)
                 setattr(text_classifier, "rpsa_stats", rpsa_stats)
+                logger.info(f"[RPSA] Loss computed successfully: {loss_rpsa.item():.6f}, stored on text_classifier")
 
             except (ValueError, RuntimeError) as e:
                 logger.warning(f"[RPSA] skipped due to: {e}")
+                import traceback
+                logger.debug(f"[RPSA] Traceback: {traceback.format_exc()}")
             except Exception as e:
                 logger.error(f"[RPSA] Unexpected error: {e}")
+                import traceback
+                logger.error(f"[RPSA] Traceback: {traceback.format_exc()}")
                 raise
+        else:
+            # 使用info级别，这样即使debug关闭也能看到
+            if not use_rpsa_flag:
+                logger.info(f"[RPSA] Skipped: use_rpsa=False")
+            elif not is_training:
+                logger.info(f"[RPSA] Skipped: not in training mode")
+            elif not rpsa_module_exists:
+                logger.warning(f"[RPSA] Skipped: rpsa module is None! Check initialization.")
 
 
         enc_outputs_coord_unact = (
