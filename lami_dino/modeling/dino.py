@@ -567,8 +567,6 @@ class DINO(nn.Module):
                     rpsa_loss_value = dec_encoder.rpsa_loss
                     if rpsa_loss_value is not None:
                         loss_dict["loss_rpsa"] = rpsa_loss_value
-                        logger_rpsa.info(f"[RPSA] ✅ Added to loss_dict: {rpsa_loss_value.item():.6f}")
-                        print(f"[RPSA] ✅ Loss added: {rpsa_loss_value.item():.6f}")  # 确保输出
                         stats = getattr(dec_encoder, "rpsa_stats", None)
                         if isinstance(stats, dict):
                             if "rpsa_center_orth_mse" in stats:
@@ -577,16 +575,12 @@ class DINO(nn.Module):
                                 loss_dict["rpsa_pi_entropy"] = stats["rpsa_pi_entropy"]
                     else:
                         logger_rpsa.warning("[RPSA] ⚠️ rpsa_loss is None - RPSA may not be computing loss")
-                        print("[RPSA] ⚠️ rpsa_loss is None")  # 确保输出
                 else:
                     logger_rpsa.warning(f"[RPSA] ⚠️ dec_encoder has no rpsa_loss attribute")
-                    logger_rpsa.info(f"[RPSA] Available attributes: {[attr for attr in dir(dec_encoder) if not attr.startswith('_')][:10]}...")
-                    print(f"[RPSA] ⚠️ No rpsa_loss attribute. Available: {[attr for attr in dir(dec_encoder) if not attr.startswith('_')][:10]}")  # 确保输出
             except Exception as e:
-                import traceback
                 logger_rpsa.warning(f"[RPSA] ❌ Loss aggregation skipped: {e}")
+                import traceback
                 logger_rpsa.debug(f"[RPSA] Traceback: {traceback.format_exc()}")
-                print(f"[RPSA] ❌ Error: {e}")  # 确保输出
 
             # === 3️⃣ FedLoss、主损失加权保持一致 ===
             weight_dict = self.criterion.weight_dict
