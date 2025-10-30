@@ -31,6 +31,9 @@ from detrex.utils import (inverse_sigmoid, is_dist_avail_and_initialized,
 
 from detectron2.modeling import detector_postprocess
 from detectron2.structures import Boxes, ImageList, Instances
+from detectron2.utils.logger import setup_logger
+
+logger_rpsa = setup_logger()  # 用于RPSA日志输出
 
 
 class DINO(nn.Module):
@@ -564,9 +567,8 @@ class DINO(nn.Module):
                     rpsa_loss_value = dec_encoder.rpsa_loss
                     if rpsa_loss_value is not None:
                         loss_dict["loss_rpsa"] = rpsa_loss_value
-                        import logging
-                        logger = logging.getLogger(__name__)
-                        logger.info(f"[RPSA] Added to loss_dict: {rpsa_loss_value.item():.6f}")
+                        logger_rpsa.info(f"[RPSA] ✅ Added to loss_dict: {rpsa_loss_value.item():.6f}")
+                        print(f"[RPSA] ✅ Loss added: {rpsa_loss_value.item():.6f}")  # 确保输出
                         stats = getattr(dec_encoder, "rpsa_stats", None)
                         if isinstance(stats, dict):
                             if "rpsa_center_orth_mse" in stats:
@@ -574,19 +576,17 @@ class DINO(nn.Module):
                             if "rpsa_pi_entropy" in stats:
                                 loss_dict["rpsa_pi_entropy"] = stats["rpsa_pi_entropy"]
                     else:
-                        import logging
-                        logger = logging.getLogger(__name__)
-                        logger.warning("[RPSA] rpsa_loss is None - RPSA may not be computing loss")
+                        logger_rpsa.warning("[RPSA] ⚠️ rpsa_loss is None - RPSA may not be computing loss")
+                        print("[RPSA] ⚠️ rpsa_loss is None")  # 确保输出
                 else:
-                    import logging
-                    logger = logging.getLogger(__name__)
-                    logger.warning(f"[RPSA] dec_encoder has no rpsa_loss attribute")
-                    logger.info(f"[RPSA] Available attributes: {[attr for attr in dir(dec_encoder) if not attr.startswith('_')][:10]}...")
+                    logger_rpsa.warning(f"[RPSA] ⚠️ dec_encoder has no rpsa_loss attribute")
+                    logger_rpsa.info(f"[RPSA] Available attributes: {[attr for attr in dir(dec_encoder) if not attr.startswith('_')][:10]}...")
+                    print(f"[RPSA] ⚠️ No rpsa_loss attribute. Available: {[attr for attr in dir(dec_encoder) if not attr.startswith('_')][:10]}")  # 确保输出
             except Exception as e:
-                import logging
                 import traceback
-                logging.getLogger(__name__).warning(f"[WARN] RPSA loss aggregation skipped: {e}")
-                logging.getLogger(__name__).debug(f"[RPSA] Traceback: {traceback.format_exc()}")
+                logger_rpsa.warning(f"[RPSA] ❌ Loss aggregation skipped: {e}")
+                logger_rpsa.debug(f"[RPSA] Traceback: {traceback.format_exc()}")
+                print(f"[RPSA] ❌ Error: {e}")  # 确保输出
 
             # === 3️⃣ FedLoss、主损失加权保持一致 ===
             weight_dict = self.criterion.weight_dict

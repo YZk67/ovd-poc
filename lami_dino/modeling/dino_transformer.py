@@ -31,8 +31,9 @@ from detrex.layers import (
 )
 from detrex.utils import inverse_sigmoid
 from lami_dino.models.rpsa import RPSAModule, build_token_class_mask_from_logits
+from detectron2.utils.logger import setup_logger
 
-logger = logging.getLogger(__name__)
+logger = setup_logger()  # 使用detectron2的logger，确保日志级别正确
 
 
 class DINOTransformerEncoder(TransformerLayerSequence):
@@ -277,13 +278,16 @@ class DINOTransformer(nn.Module):
         if self.use_rpsa:
             if rpsa_module is not None:
                 self.rpsa = rpsa_module
-                logger.info(f"[RPSA] Initialized with provided module: {type(self.rpsa)}")
+                logger.info(f"[RPSA] ✅ Initialized with provided module: {type(self.rpsa)}")
+                print(f"[RPSA] ✅ Initialized: {type(self.rpsa)}")  # 确保输出
             else:
                 cfg = rpsa_kwargs or {}
                 self.rpsa = RPSAModule(**cfg)
-                logger.info(f"[RPSA] Initialized with kwargs: {cfg}")
+                logger.info(f"[RPSA] ✅ Initialized with kwargs: {cfg}")
+                print(f"[RPSA] ✅ Initialized with kwargs: {cfg}")  # 确保输出
         else:
-            logger.info("[RPSA] use_rpsa=False, RPSA module not initialized")
+            logger.info("[RPSA] ⚠️ use_rpsa=False, RPSA module not initialized")
+            print("[RPSA] ⚠️ use_rpsa=False, not initialized")  # 确保输出
 
     def init_weights(self):
         for p in self.parameters():
@@ -448,7 +452,7 @@ class DINOTransformer(nn.Module):
         rpsa_module_exists = self.rpsa is not None
         if use_rpsa_flag and is_training and rpsa_module_exists:
             try:
-                logger.debug(f"[RPSA] Computing RPSA loss: use_rpsa={use_rpsa_flag}, training={is_training}, rpsa={rpsa_module_exists}")
+                logger.info(f"[RPSA] Computing RPSA loss: use_rpsa={use_rpsa_flag}, training={is_training}, rpsa={rpsa_module_exists}")
                 # 1) token->class 软掩码（从 encoder 分类 logits 构造）
                 token_cls_mask = build_token_class_mask_from_logits(enc_outputs_class, topL=5).detach()  # [B,N,C]
 
@@ -477,25 +481,31 @@ class DINOTransformer(nn.Module):
                 # 损失存储也使用同一个分类器
                 setattr(text_classifier, "rpsa_loss", loss_rpsa)
                 setattr(text_classifier, "rpsa_stats", rpsa_stats)
-                logger.info(f"[RPSA] Loss computed successfully: {loss_rpsa.item():.6f}, stored on text_classifier")
+                logger.info(f"[RPSA] ✅ Loss computed successfully: {loss_rpsa.item():.6f}, stored on text_classifier")
+                print(f"[RPSA] ✅ Loss computed: {loss_rpsa.item():.6f}")  # 确保输出
 
             except (ValueError, RuntimeError) as e:
-                logger.warning(f"[RPSA] skipped due to: {e}")
+                logger.warning(f"[RPSA] ⚠️ skipped due to: {e}")
+                print(f"[RPSA] ⚠️ Skipped: {e}")  # 确保输出
                 import traceback
                 logger.debug(f"[RPSA] Traceback: {traceback.format_exc()}")
             except Exception as e:
-                logger.error(f"[RPSA] Unexpected error: {e}")
+                logger.error(f"[RPSA] ❌ Unexpected error: {e}")
+                print(f"[RPSA] ❌ Error: {e}")  # 确保输出
                 import traceback
                 logger.error(f"[RPSA] Traceback: {traceback.format_exc()}")
                 raise
         else:
             # 使用info级别，这样即使debug关闭也能看到
             if not use_rpsa_flag:
-                logger.info(f"[RPSA] Skipped: use_rpsa=False")
+                logger.info(f"[RPSA] ⚠️ Skipped: use_rpsa=False")
+                print("[RPSA] ⚠️ Skipped: use_rpsa=False")  # 确保输出
             elif not is_training:
-                logger.info(f"[RPSA] Skipped: not in training mode")
+                logger.info(f"[RPSA] ⚠️ Skipped: not in training mode")
+                print("[RPSA] ⚠️ Skipped: not in training mode")  # 确保输出
             elif not rpsa_module_exists:
-                logger.warning(f"[RPSA] Skipped: rpsa module is None! Check initialization.")
+                logger.warning(f"[RPSA] ❌ Skipped: rpsa module is None! Check initialization.")
+                print("[RPSA] ❌ Skipped: rpsa module is None!")  # 确保输出
 
 
         enc_outputs_coord_unact = (
