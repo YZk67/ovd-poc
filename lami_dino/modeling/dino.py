@@ -573,6 +573,10 @@ class DINO(nn.Module):
                                 loss_dict["rpsa_center_orth_mse"] = stats["rpsa_center_orth_mse"]
                             if "rpsa_pi_entropy" in stats:
                                 loss_dict["rpsa_pi_entropy"] = stats["rpsa_pi_entropy"]
+                            if "rpsa_bg_ratio" in stats:
+                                loss_dict["rpsa_bg_ratio"] = stats["rpsa_bg_ratio"]
+                            if "rpsa_valid_clusters" in stats:
+                                loss_dict["rpsa_valid_clusters"] = stats["rpsa_valid_clusters"]
                     # else:
                     #     logger_rpsa.warning("[RPSA] ⚠️ rpsa_loss is None - RPSA may not be computing loss")
                 # else:
