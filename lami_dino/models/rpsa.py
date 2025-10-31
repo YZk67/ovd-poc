@@ -208,6 +208,8 @@ class RPSAModule(nn.Module):
                  alpha_pi: float = 1.0,
                  bg_thresh: float = 0.1,
                  subsample_tokens: int = 0,
+                 subsample_method: str = "random",
+                 subsample_fg_ratio: float = 0.5,
                  stop_grad_text: bool = False,
                  stop_grad_vision: bool = False):
         """
@@ -218,7 +220,9 @@ class RPSAModule(nn.Module):
             tau_align: InfoNCE temperature
             alpha_pi: exponent on pi weights (sharpen/soften)
             bg_thresh: background threshold on max pi per cluster
-            subsample_tokens: if >0, randomly subsample N' tokens per image for RPSA (speed)
+            subsample_tokens: if >0, subsample tokens per image for RPSA (speed)
+            subsample_method: strategy for subsampling ('random', 'confidence', 'hybrid')
+            subsample_fg_ratio: foreground quota when using 'hybrid' strategy
             stop_grad_text: if True, stop gradient to text prototypes branch
             stop_grad_vision: if True, stop gradient to region features branch
         """
@@ -230,6 +234,8 @@ class RPSAModule(nn.Module):
         self.alpha_pi = float(alpha_pi)
         self.bg_thresh = float(bg_thresh)
         self.subsample_tokens = int(subsample_tokens)
+        self.subsample_method = str(subsample_method)
+        self.subsample_fg_ratio = float(subsample_fg_ratio)
         self.stop_grad_text = bool(stop_grad_text)
         self.stop_grad_vision = bool(stop_grad_vision)
 
@@ -243,9 +249,60 @@ class RPSAModule(nn.Module):
 
         # Optional subsampling for speed
         if (self.subsample_tokens > 0) and (N > self.subsample_tokens):
-            idx = torch.randperm(N, device=region_feats.device)[:self.subsample_tokens]
-            region_feats_s = region_feats[:, idx, :]
-            token_cls_mask_s = token_cls_mask[:, idx, :]
+            target = min(self.subsample_tokens, N)
+            method = self.subsample_method.lower()
+            device = region_feats.device
+            if method == "random":
+                if B == 1:
+                    idx = torch.randperm(N, device=device)[:target].unsqueeze(0)
+                else:
+                    idx = torch.stack(
+                        [torch.randperm(N, device=device)[:target] for _ in range(B)],
+                        dim=0,
+                    )
+            elif method == "confidence":
+                scores = token_cls_mask.max(dim=-1).values  # [B,N]
+                idx = scores.topk(target, dim=1).indices
+            elif method == "hybrid":
+                scores = token_cls_mask.max(dim=-1).values  # [B,N]
+                fg_target = max(1, int(round(target * self.subsample_fg_ratio)))
+                fg_target = min(fg_target, target)
+                bg_target = target - fg_target
+                positions = torch.arange(N, device=device)
+                batch_indices = []
+                for b in range(B):
+                    fg_idx = scores[b].topk(fg_target, dim=0).indices
+                    if bg_target > 0:
+                        mask = torch.ones(N, dtype=torch.bool, device=device)
+                        mask[fg_idx] = False
+                        candidates = positions[mask]
+                        if candidates.numel() == 0:
+                            bg_idx = fg_idx[:0]
+                        else:
+                            if candidates.numel() <= bg_target:
+                                bg_idx = candidates
+                            else:
+                                perm = torch.randperm(candidates.numel(), device=device)
+                                bg_idx = candidates[perm[:bg_target]]
+                    else:
+                        bg_idx = fg_idx[:0]
+                    idx_b = torch.cat([fg_idx, bg_idx])
+                    if idx_b.numel() < target:
+                        repeat_needed = target - idx_b.numel()
+                        pad = fg_idx.repeat((repeat_needed // fg_idx.numel()) + 1)[:repeat_needed]
+                        idx_b = torch.cat([idx_b, pad])
+                    batch_indices.append(idx_b)
+                idx = torch.stack(batch_indices, dim=0)
+            else:
+                raise ValueError(f"[RPSA] Unknown subsample_method: {self.subsample_method}")
+
+            idx = idx.to(dtype=torch.long)
+            region_feats_s = torch.gather(
+                region_feats, 1, idx.unsqueeze(-1).expand(-1, -1, region_feats.shape[-1])
+            )
+            token_cls_mask_s = torch.gather(
+                token_cls_mask, 1, idx.unsqueeze(-1).expand(-1, -1, token_cls_mask.shape[-1])
+            )
         else:
             region_feats_s = region_feats
             token_cls_mask_s = token_cls_mask

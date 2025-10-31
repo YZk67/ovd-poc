@@ -123,11 +123,14 @@ model.soft_attention_tau = 0.08  # Temperature parameter for soft-attention (τ 
 
 # RPSA parameters
 model.transformer.use_rpsa = True
-model.criterion.weight_dict["loss_rpsa"] = 0.2
+model.criterion.weight_dict["loss_rpsa"] = 0.05
 model.transformer.rpsa_module.K = 8
 model.transformer.rpsa_module.tau_align = 0.07
 model.transformer.rpsa_module.sigma = 1.0
-model.transformer.rpsa_module.bg_thresh = 0.1
+model.transformer.rpsa_module.bg_thresh = 0.01
+model.transformer.rpsa_module.subsample_tokens = 4096  # random subsample tokens to stabilize cost
+model.transformer.rpsa_module.subsample_method = "random"
+model.transformer.rpsa_module.stop_grad_vision = True  # detach encoder features until alignment stabilizes
 
 # Enable Automatic Mixed Precision (AMP) for faster training
 train.amp.enabled = True
