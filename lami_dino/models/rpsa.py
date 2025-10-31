@@ -196,7 +196,7 @@ def weighted_infoNCE(mu: torch.Tensor,
 
 class RPSAModule(nn.Module):
     def __init__(self,
-                 K: int = 8,
+                 K: int = 8, # number of visual clusters per image
                  sigma: float = 1.0,
                  em_iters: int = 1,
                  tau_align: float = 0.07,

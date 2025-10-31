@@ -481,7 +481,7 @@ class DINOTransformer(nn.Module):
 
             except (ValueError, RuntimeError) as e:
                 logger.warning(f"[RPSA] Skipped due to: {e}")
-                logger.debug(f"[RPSA] Shape details - output_memory: {output_memory.shape}, enc_outputs_class: {enc_outputs_class.shape}, content_query_embeds: {content_query_embeds.shape}")
+                logger.warning(f"[RPSA] Shape details - output_memory: {output_memory.shape}, enc_outputs_class: {enc_outputs_class.shape}, content_query_embeds: {content_query_embeds.shape}")
             except Exception as e:
                 logger.error(f"[RPSA] ❌ Unexpected error: {e}")
                 logger.error(f"[RPSA] Shape details - output_memory: {output_memory.shape}, enc_outputs_class: {enc_outputs_class.shape}, content_query_embeds: {content_query_embeds.shape}")
