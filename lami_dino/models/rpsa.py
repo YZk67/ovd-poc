@@ -41,11 +41,13 @@ def pairwise_sqdist(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     b: [B, K, D]
     return: [B, N, K]
     """
-    logger.warning(f"[RPSA] pairwise_sqdist: a.shape={a.shape}, b.shape={b.shape}")
-    # Use torch.cdist which handles broadcasting correctly
-    # cdist returns Euclidean distance, so we need to square it to get squared distance
-    dist = torch.cdist(a, b)  # [B, N, K]
-    return dist ** 2  # squared distance is always non-negative
+    # ||a-b||^2 = ||a||^2 + ||b||^2 - 2 a.b
+    a2 = (a * a).sum(-1, keepdim=True)          # [B,N,1]
+    b2 = (b * b).sum(-1)                        # [B,K]
+    ab = torch.einsum('bnd,bkd->bnk', a, b)     # [B,N,K]
+    # a2 is [B,N,1], b2 is [B,K], need to broadcast to [B,N,K]
+    b2_expanded = b2.unsqueeze(1)               # [B,1,K]
+    return (a2 + b2_expanded - 2 * ab).clamp_min(0.0)
 
 
 # -------------------------------
@@ -60,18 +62,15 @@ def _init_centers_fps(region_feats: torch.Tensor, K: int) -> torch.Tensor:
     return: centers0 [B, K, D] (no grad)
     """
     B, N, D = region_feats.shape
-    logger.warning(f"[RPSA] _init_centers_fps: region_feats.shape={region_feats.shape}, K={K}")
     x = region_feats  # no copy
     # Start from the token with largest L2 norm, then farthest sequentially.
     norms = (x * x).sum(-1)                     # [B,N]
     first = norms.argmax(dim=1)                 # [B]
     centers = torch.empty(B, K, D, device=x.device, dtype=x.dtype)
     centers[:, 0] = x[torch.arange(B), first]
-    logger.warning(f"[RPSA] _init_centers_fps: centers.shape={centers.shape}, centers[:, 0].shape={centers[:, 0].shape}")
 
     # Precompute distances to first center
     centers_0 = centers[:, 0:1, :]  # [B, 1, D]
-    logger.warning(f"[RPSA] _init_centers_fps: centers_0.shape={centers_0.shape}, calling pairwise_sqdist with x.shape={x.shape}")
     dist = pairwise_sqdist(x, centers_0).squeeze(-1)  # [B,N]
     for k in range(1, K):
         idx = dist.argmax(dim=1)                               # [B]
