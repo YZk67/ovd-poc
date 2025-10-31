@@ -497,54 +497,50 @@ class DINOTransformer(nn.Module):
 
         max_scores, max_labels = torch.max(enc_outputs_class, dim=-1)
         topk = self.two_stage_num_proposals
-        
+        topk_proposals = torch.topk(max_scores, topk, dim=1)[1]
+
+        # extract region proposal boxes
+        topk_coords_unact = torch.gather(
+            enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4)
+        )  # unsigmoided.
+        reference_points = topk_coords_unact.detach().sigmoid()
+        if query_embed[1] is not None:
+            reference_points = torch.cat([query_embed[1].sigmoid(), reference_points], 1)
+        init_reference_out = reference_points
+
+        # extract region features
+        target_unact = torch.gather(
+            output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, output_memory.shape[-1])
+        )
+
         # Check if we have multi-prototype embeddings and should use soft-attention
-        if hasattr(self, 'use_soft_attention') and self.use_soft_attention and content_query_embeds.ndim == 3:
-            # Soft-attention over prototypes only on the selected top-k proposals
-            topk_proposals = torch.topk(max_scores, topk, dim=1)[1]
-
-            topk_coords_unact = torch.gather(
-                enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4)
-            )
-            reference_points = topk_coords_unact.detach().sigmoid()
-            if query_embed[1] is not None:
-                reference_points = torch.cat([query_embed[1].sigmoid(), reference_points], 1)
-            init_reference_out = reference_points
-
-            target_unact = torch.gather(
-                output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, output_memory.shape[-1])
-            )
+        if getattr(self, 'use_soft_attention', False) and content_query_embeds.ndim == 3:
+            # === Vectorized multi-prototype soft-attention aggregation ===
+            tau = getattr(self, 'soft_attention_tau', 0.07)
+            # Gather selected visual features and class ids
             content_ids = torch.gather(max_labels, 1, topk_proposals)  # [B, topk]
 
-            # Gather prototypes for each selected region: [B, topk, K, D]
+            # Prototypes per region: [B, topk, K, D]
             proto_per_region = content_query_embeds[content_ids]
-            tau = getattr(self, 'soft_attention_tau', 0.08)
-            target_norm = F.normalize(target_unact, dim=-1)
-            proto_norm = F.normalize(proto_per_region, dim=-1)
-            sim = torch.einsum('bqd,bqkd->bqk', target_norm, proto_norm) / tau  # [B, topk, K]
-            attn = F.softmax(sim, dim=-1)
-            content_query = torch.einsum('bqk,bqkd->bqd', attn, proto_per_region)
+            # Cosine similarities: [B, topk, K]
+            sim = torch.einsum('bqd,bqkd->bqk',
+                            F.normalize(target_unact, dim=-1),
+                            F.normalize(proto_per_region, dim=-1)) / tau
+            attn = F.softmax(sim, dim=-1)  # [B, topk, K]
+            content_query = torch.einsum('bqk,bqkd->bqd', attn, proto_per_region)  # [B, topk, D]
+        elif content_query_embeds.ndim == 3:
+            # === Mean aggregation fallback over K prototypes ===
+            content_ids = torch.gather(max_labels, 1, topk_proposals)
+            # [B, topk, K, D]
+            proto_per_region = content_query_embeds[content_ids]
+            content_query = proto_per_region.mean(dim=2)  # [B, topk, D]
         else:
-            topk_proposals = torch.topk(max_scores, topk, dim=1)[1]
-
-            topk_coords_unact = torch.gather(
-                enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4)
-            )
-            reference_points = topk_coords_unact.detach().sigmoid()
-            if query_embed[1] is not None:
-                reference_points = torch.cat([query_embed[1].sigmoid(), reference_points], 1)
-            init_reference_out = reference_points
-
-            target_unact = torch.gather(
-                output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, output_memory.shape[-1])
-            )
-
+            # === Standard single-prototype mode ===
             content_ids = torch.gather(max_labels, 1, topk_proposals)
             embed_dim = content_query_embeds.shape[-1]
             content_query = torch.gather(
-                content_query_embeds.unsqueeze(0).repeat(bs, 1, 1),
-                1,
-                content_ids.unsqueeze(-1).repeat(1, 1, embed_dim),
+                content_query_embeds.unsqueeze(0).repeat(bs, 1, 1), 1,
+                content_ids.unsqueeze(-1).repeat(1, 1, embed_dim)
             )
 
         target = target_unact.detach() + content_query
