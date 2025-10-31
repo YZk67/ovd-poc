@@ -573,10 +573,10 @@ class DINO(nn.Module):
                                 loss_dict["rpsa_center_orth_mse"] = stats["rpsa_center_orth_mse"]
                             if "rpsa_pi_entropy" in stats:
                                 loss_dict["rpsa_pi_entropy"] = stats["rpsa_pi_entropy"]
-                    else:
-                        logger_rpsa.warning("[RPSA] ⚠️ rpsa_loss is None - RPSA may not be computing loss")
-                else:
-                    logger_rpsa.warning(f"[RPSA] ⚠️ dec_encoder has no rpsa_loss attribute")
+                    # else:
+                    #     logger_rpsa.warning("[RPSA] ⚠️ rpsa_loss is None - RPSA may not be computing loss")
+                # else:
+                #     logger_rpsa.warning(f"[RPSA] ⚠️ dec_encoder has no rpsa_loss attribute")
             except Exception as e:
                 logger_rpsa.warning(f"[RPSA] ❌ Loss aggregation skipped: {e}")
                 import traceback
