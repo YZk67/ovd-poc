@@ -21,6 +21,9 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from detectron2.utils.logger import setup_logger
+
+logger = setup_logger()
 
 
 # -------------------------------
@@ -250,18 +253,30 @@ class RPSAModule(nn.Module):
         # assign_r (软分配矩阵): [B,N,K], 表示每个token属于每个cluster的概率; 
         #          行归一化后为1, 表示软分配; 用途: 计算pi权重，建立聚类与类别的关联
         # centers_mu (聚类中心): [B,K,D], 每个聚类的代表性特征向量, 表示每个cluster的中心; 用途: 作为视觉中心参与InfoNCE对比学
-        assign_r, centers_mu = soft_kmeans_assign(v, K=self.K, sigma=self.sigma, iters=self.em_iters)
+        try:
+            assign_r, centers_mu = soft_kmeans_assign(v, K=self.K, sigma=self.sigma, iters=self.em_iters)
+        except RuntimeError as e:
+            logger.error(f"[RPSA] Error in soft_kmeans_assign: {e}, K={self.K}, v.shape={v.shape}")
+            raise
 
         # 2) pi weights (cluster->class)
         # pi (cluster->class 权重): [B,K,C], 表示每个cluster属于每个类别的概率; 
         #          行归一化后不一定为1, 表示软权重; 用途: 加权InfoNCE损失, 强调重要类别的贡献
-        pi = compute_pi_weights(assign_r, token_cls_mask_s)  # [B,K,C]
+        try:
+            pi = compute_pi_weights(assign_r, token_cls_mask_s)  # [B,K,C]
+        except RuntimeError as e:
+            logger.error(f"[RPSA] Error in compute_pi_weights: {e}, assign_r.shape={assign_r.shape}, token_cls_mask_s.shape={token_cls_mask_s.shape}")
+            raise
 
         # 3) weighted InfoNCE alignment
-        loss, stats = weighted_infoNCE(centers_mu, t, pi,
-                                       tau=self.tau_align,
-                                       alpha_pi=self.alpha_pi,
-                                       bg_thresh=self.bg_thresh)
+        try:
+            loss, stats = weighted_infoNCE(centers_mu, t, pi,
+                                           tau=self.tau_align,
+                                           alpha_pi=self.alpha_pi,
+                                           bg_thresh=self.bg_thresh)
+        except RuntimeError as e:
+            logger.error(f"[RPSA] Error in weighted_infoNCE: {e}, centers_mu.shape={centers_mu.shape}, t.shape={t.shape}, pi.shape={pi.shape}")
+            raise
 
         # Additional diagnostics
         with torch.no_grad():

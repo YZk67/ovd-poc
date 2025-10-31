@@ -283,6 +283,7 @@ class DINOTransformer(nn.Module):
                 cfg = rpsa_kwargs or {}
                 self.rpsa = RPSAModule(**cfg)
                 logger.info(f"[RPSA] ✅ Initialized with kwargs: {cfg}")
+                logger.info(f"[RPSA] Module config - K={self.rpsa.K}, sigma={self.rpsa.sigma}, tau={self.rpsa.tau_align}, bg_thresh={self.rpsa.bg_thresh}")
         else:
             logger.info("[RPSA] ⚠️ use_rpsa=False, RPSA module not initialized")
 
@@ -479,9 +480,11 @@ class DINOTransformer(nn.Module):
                 setattr(text_classifier, "rpsa_stats", rpsa_stats)
 
             except (ValueError, RuntimeError) as e:
-                logger.debug(f"[RPSA] Skipped due to: {e}")
+                logger.warning(f"[RPSA] Skipped due to: {e}")
+                logger.debug(f"[RPSA] Shape details - output_memory: {output_memory.shape}, enc_outputs_class: {enc_outputs_class.shape}, content_query_embeds: {content_query_embeds.shape}")
             except Exception as e:
                 logger.error(f"[RPSA] ❌ Unexpected error: {e}")
+                logger.error(f"[RPSA] Shape details - output_memory: {output_memory.shape}, enc_outputs_class: {enc_outputs_class.shape}, content_query_embeds: {content_query_embeds.shape}")
                 import traceback
                 logger.error(f"[RPSA] Traceback: {traceback.format_exc()}")
                 raise
