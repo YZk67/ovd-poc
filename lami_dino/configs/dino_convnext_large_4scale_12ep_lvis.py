@@ -122,7 +122,7 @@ model.use_soft_attention = True  # Enable soft-attention aggregation in query in
 model.soft_attention_tau = 0.08  # Temperature parameter for soft-attention (τ ≈ 0.05–0.1 recommended)
 
 # RPSA parameters
-model.transformer.use_rpsa = False
+model.transformer.use_rpsa = True
 model.criterion.weight_dict["loss_rpsa"] = 0.05
 model.transformer.rpsa_module.K = 8
 model.transformer.rpsa_module.tau_align = 0.07
