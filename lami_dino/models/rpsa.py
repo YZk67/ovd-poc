@@ -42,16 +42,11 @@ def pairwise_sqdist(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return: [B, N, K]
     """
     # ||a-b||^2 = ||a||^2 + ||b||^2 - 2 a.b
-    logger.error(f"[RPSA] pairwise_sqdist: a.shape={a.shape}, b.shape={b.shape}")
     a2 = (a * a).sum(-1, keepdim=True)          # [B,N,1]
-    logger.error(f"[RPSA] pairwise_sqdist: a2.shape={a2.shape}")
     b2 = (b * b).sum(-1)                        # [B,K]
-    logger.error(f"[RPSA] pairwise_sqdist: b2.shape={b2.shape}")
     ab = torch.einsum('bnd,bkd->bnk', a, b)     # [B,N,K]
-    logger.error(f"[RPSA] pairwise_sqdist: ab.shape={ab.shape}")
     # a2 is [B,N,1], b2 is [B,K], need to broadcast to [B,N,K]
     b2_expanded = b2.unsqueeze(1)               # [B,1,K]
-    logger.error(f"[RPSA] pairwise_sqdist: b2_expanded.shape={b2_expanded.shape}")
     return (a2 + b2_expanded - 2 * ab).clamp_min(0.0)
 
 
@@ -119,7 +114,8 @@ def soft_kmeans_assign(region_feats: torch.Tensor,
         r = torch.softmax(logits, dim=-1)                       # [B,N,K]
 
         # M-step: centers
-        mass = r.sum(dim=1, keepdim=True).clamp_min(eps)        # [B,1,K]
+        # mass per cluster: [B,K,1] to broadcast along D, avoid mismatching D(256) vs K(8)
+        mass = r.sum(dim=1).unsqueeze(-1).clamp_min(eps)        # [B,K,1]
         mu = torch.einsum('bnd,bnk->bkd', x, r) / mass          # [B,K,D]
         centers = mu.detach()                                   # use fresh centers for next E
     return r, mu
