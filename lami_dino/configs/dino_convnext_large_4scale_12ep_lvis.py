@@ -130,7 +130,8 @@ model.transformer.rpsa_module.sigma = 1.0
 model.transformer.rpsa_module.bg_thresh = 0.01
 model.transformer.rpsa_module.subsample_tokens = 2048  # random subsample tokens to stabilize cost
 model.transformer.rpsa_module.subsample_method = "random"
-model.transformer.rpsa_module.stop_grad_vision = True  # detach encoder features until alignment stabilizes
+model.transformer.rpsa_module.stop_grad_vision = True   # warm-up: freeze encoder gradients first
+model.transformer.rpsa_module.stop_grad_text = True     # warm-up: also freeze prototype branch initially
 
 # Enable Automatic Mixed Precision (AMP) for faster training
 train.amp.enabled = True
