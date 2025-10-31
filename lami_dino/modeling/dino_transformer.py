@@ -446,6 +446,7 @@ class DINOTransformer(nn.Module):
 
         # === RPSA: compute alignment loss (non-breaking: stash on classifier/transformer) ===
         use_rpsa_flag = getattr(self, "use_rpsa", False)
+        logger.info(f"[RPSA] use_rpsa_flag: {use_rpsa_flag}")
         is_training = self.training
         rpsa_module_exists = self.rpsa is not None
         if use_rpsa_flag and is_training and rpsa_module_exists:
