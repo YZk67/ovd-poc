@@ -129,7 +129,7 @@ model.transformer.rpsa_module.tau_align = 0.07
 model.transformer.rpsa_module.sigma = 1.0
 model.transformer.rpsa_module.bg_thresh = 0.05
 model.transformer.rpsa_module.subsample_tokens = 2048  # random subsample tokens to stabilize cost
-model.transformer.rpsa_module.subsample_method = "random"
+model.transformer.rpsa_module.subsample_method = "confidence"
 model.transformer.rpsa_module.stop_grad_vision = True   # warm-up: freeze encoder gradients first
 model.transformer.rpsa_module.stop_grad_text = False     # warm-up: also freeze prototype branch initially
 
