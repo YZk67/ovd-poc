@@ -275,6 +275,14 @@ class DINOTransformer(nn.Module):
         self.rpsa_last_loss = None
         self.rpsa_last_stats = {}
         self.rpsa = None
+        # configurable defaults for gating / scheduling
+        self.rpsa_token_topk = 0
+        self.rpsa_token_topk_ratio = 0.0
+        self.rpsa_confidence_threshold = 0.0
+        self.rpsa_warmup_start = 0
+        self.rpsa_warmup_iters = 0
+        self.rpsa_warmup_init_scale = 0.0
+        self.rpsa_warmup_power = 1.0
         if self.use_rpsa:
             if rpsa_module is not None:
                 self.rpsa = rpsa_module
@@ -452,9 +460,34 @@ class DINOTransformer(nn.Module):
         if use_rpsa_flag and is_training and rpsa_module_exists:
             try:
                 # 1) token->class 软掩码（从 encoder 分类 logits 构造）
-                token_cls_mask = build_token_class_mask_from_logits(enc_outputs_class, topL=5).detach()  # [B,N,C]
+                token_cls_mask_full = build_token_class_mask_from_logits(enc_outputs_class, topL=5).detach()  # [B,N,C]
 
-                # 2) 文本原型，保证形状为 [C,Kp,D]
+                # 2) 可选 token gating（Top-M / 阈值）以减少噪声
+                region_feats_for_rpsa = output_memory
+                token_cls_mask_for_rpsa = token_cls_mask_full
+                gate_topk = getattr(self, "rpsa_token_topk", 0)
+                gate_ratio = getattr(self, "rpsa_token_topk_ratio", 0.0)
+                gate_threshold = getattr(self, "rpsa_confidence_threshold", 0.0)
+                tokens_available = output_memory.shape[1]
+                if gate_ratio > 0.0:
+                    gate_topk = max(gate_topk, int(tokens_available * gate_ratio))
+                if gate_topk > 0 and gate_topk < tokens_available:
+                    with torch.no_grad():
+                        cls_conf = torch.softmax(enc_outputs_class, dim=-1).max(dim=-1).values  # [B,N]
+                        topk_vals, topk_idx = cls_conf.topk(gate_topk, dim=1)
+                        if gate_threshold > 0.0:
+                            low_mask = topk_vals < gate_threshold
+                            if low_mask.any():
+                                fallback_idx = cls_conf.topk(1, dim=1).indices.expand(-1, gate_topk)
+                                topk_idx = torch.where(low_mask, fallback_idx, topk_idx)
+                    gather_feat_idx = topk_idx.unsqueeze(-1).expand(-1, -1, output_memory.size(-1))
+                    region_feats_for_rpsa = torch.gather(output_memory, 1, gather_feat_idx)
+                    gather_mask_idx = topk_idx.unsqueeze(-1).expand(-1, -1, token_cls_mask_full.size(-1))
+                    token_cls_mask_for_rpsa = torch.gather(token_cls_mask_full, 1, gather_mask_idx)
+                else:
+                    token_cls_mask_for_rpsa = token_cls_mask_full
+
+                # 3) 文本原型，保证形状为 [C,Kp,D]
                 #    这里沿用你当前变量 content_query_embeds（TPA/投影后的原型）
                 if content_query_embeds.dim() == 2:  # [C,D] -> [C,1,D]
                     text_protos_for_rpsa = content_query_embeds.unsqueeze(1)
@@ -466,13 +499,19 @@ class DINOTransformer(nn.Module):
 
                 # 3) 计算 RPSA
                 loss_rpsa_raw, rpsa_stats, _ = self.rpsa(
-                    region_feats=output_memory,             # [B,N,D]
-                    text_protos=text_protos_for_rpsa,       # [C,Kp,D]
-                    token_cls_mask=token_cls_mask,          # [B,N,C]
+                    region_feats=region_feats_for_rpsa,      # [B,M,D]
+                    text_protos=text_protos_for_rpsa,        # [C,Kp,D]
+                    token_cls_mask=token_cls_mask_for_rpsa,  # [B,M,C]
                 )
                 loss_rpsa = loss_rpsa_raw
 
                 # 4) 暂存，保持与你 APR 的用法一致（不改变返回签名）
+                if isinstance(rpsa_stats, dict):
+                    rpsa_stats = dict(rpsa_stats)
+                    rpsa_stats.setdefault(
+                        "rpsa_tokens",
+                        region_feats_for_rpsa.new_tensor(float(region_feats_for_rpsa.shape[1]))
+                    )
                 self.rpsa_last_loss = loss_rpsa.detach()
                 self.rpsa_last_stats = rpsa_stats
                 # RPSA计算使用encoder分类器(class_embed[num_layers])，

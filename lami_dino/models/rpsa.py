@@ -151,7 +151,8 @@ def weighted_infoNCE(mu: torch.Tensor,
                      pi: torch.Tensor,
                      tau: float = 0.07,
                      alpha_pi: float = 1.0,
-                     bg_thresh: float = 0.1) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+                     bg_thresh: float = 0.1,
+                     adaptive_bg: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
     Weighted InfoNCE alignment between visual centers and text prototypes.
     mu:          [B, K, D]   (normalized or not, will normalize inside)
@@ -176,7 +177,16 @@ def weighted_infoNCE(mu: torch.Tensor,
     pi_clamped = pi.clamp_min(0.0)
     # background mask uses the pre-normalized magnitude so tiny clusters remain filtered out
     pi_max_raw = pi_clamped.max(dim=-1).values
-    bg_mask = (pi_max_raw < bg_thresh)                              # [B,K]
+    if adaptive_bg is not None:
+        # adaptive_bg: [B,1] or [B,K], compute mask per sample
+        thresh = adaptive_bg
+        if thresh.dim() == 2 and thresh.size(1) == 1:
+            thresh = thresh.expand_as(pi_max_raw)
+        elif thresh.dim() == 1:
+            thresh = thresh.view(-1, 1).expand_as(pi_max_raw)
+        bg_mask = pi_max_raw < thresh
+    else:
+        bg_mask = (pi_max_raw < bg_thresh)
     pi_tilde = (pi_clamped ** alpha_pi)
     pi_tilde = pi_tilde / (pi_tilde.sum(dim=-1, keepdim=True).clamp_min(1e-6))  # [B,K,C]
 
@@ -188,13 +198,14 @@ def weighted_infoNCE(mu: torch.Tensor,
     loss_k = -(pi_tilde * (pos - all_)).sum(dim=-1)                 # [B,K]
     loss_k = loss_k.masked_fill(bg_mask, 0.0)                       # ignore BG
 
-    valid = (~bg_mask).float().sum().clamp_min(1.0)
-    loss = loss_k.sum() / valid
+    valid_counts = (~bg_mask).float().sum(dim=1)                    # [B]
+    valid_total = valid_counts.sum().clamp_min(1.0)
+    loss = loss_k.sum() / valid_total
 
     stats = {
         "rpsa_pos_mean": pos.mean().detach(),
         "rpsa_bg_ratio": (bg_mask.float().mean().detach()),
-        "rpsa_valid_clusters": valid.detach(),
+        "rpsa_valid_clusters": valid_counts.mean().detach(),
     }
     return loss, stats
 
@@ -210,6 +221,8 @@ class RPSAModule(nn.Module):
                  subsample_tokens: int = 0,
                  subsample_method: str = "random",
                  subsample_fg_ratio: float = 0.5,
+                 bg_percentile: float = 0.0,
+                 detach_pi: bool = True,
                  stop_grad_text: bool = False,
                  stop_grad_vision: bool = False):
         """
@@ -223,6 +236,8 @@ class RPSAModule(nn.Module):
             subsample_tokens: if >0, subsample tokens per image for RPSA (speed)
             subsample_method: strategy for subsampling ('random', 'confidence', 'hybrid')
             subsample_fg_ratio: foreground quota when using 'hybrid' strategy
+            bg_percentile: optional percentile (0-1) for adaptive bg threshold; applied before bg_thresh
+            detach_pi: if True, stop gradients through pi weights (routing)
             stop_grad_text: if True, stop gradient to text prototypes branch
             stop_grad_vision: if True, stop gradient to region features branch
         """
@@ -236,6 +251,10 @@ class RPSAModule(nn.Module):
         self.subsample_tokens = int(subsample_tokens)
         self.subsample_method = str(subsample_method)
         self.subsample_fg_ratio = float(subsample_fg_ratio)
+        self.bg_percentile = float(bg_percentile)
+        if not 0.0 <= self.bg_percentile <= 1.0:
+            raise ValueError("bg_percentile must be within [0,1]")
+        self.detach_pi = bool(detach_pi)
         self.stop_grad_text = bool(stop_grad_text)
         self.stop_grad_vision = bool(stop_grad_vision)
         if self.subsample_tokens < 0:
@@ -332,10 +351,25 @@ class RPSAModule(nn.Module):
 
         # 3) weighted InfoNCE alignment
         try:
-            loss, stats = weighted_infoNCE(centers_mu, t, pi,
-                                           tau=self.tau_align,
-                                           alpha_pi=self.alpha_pi,
-                                           bg_thresh=self.bg_thresh)
+            pi_used = pi.detach() if self.detach_pi else pi
+            adaptive_thresh = None
+            if self.bg_percentile > 0.0:
+                pi_max = pi.max(dim=-1).values  # [B,K]
+                adaptive_thresh = torch.quantile(
+                    pi_max,
+                    q=min(max(self.bg_percentile, 1e-6), 1.0),
+                    dim=1,
+                    keepdim=True,
+                )
+            loss, stats = weighted_infoNCE(
+                centers_mu,
+                t,
+                pi_used,
+                tau=self.tau_align,
+                alpha_pi=self.alpha_pi,
+                bg_thresh=self.bg_thresh,
+                adaptive_bg=adaptive_thresh,
+            )
         except RuntimeError as e:
             logger.error(f"[RPSA] Error in weighted_infoNCE: {e}, centers_mu.shape={centers_mu.shape}, t.shape={t.shape}, pi.shape={pi.shape}")
             raise

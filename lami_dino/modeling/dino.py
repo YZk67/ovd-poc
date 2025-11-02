@@ -32,6 +32,7 @@ from detrex.utils import (inverse_sigmoid, is_dist_avail_and_initialized,
 from detectron2.modeling import detector_postprocess
 from detectron2.structures import Boxes, ImageList, Instances
 from detectron2.utils.logger import setup_logger
+from detectron2.utils.events import get_event_storage
 
 logger_rpsa = setup_logger()  # 用于RPSA日志输出
 
@@ -573,10 +574,37 @@ class DINO(nn.Module):
                                 loss_dict["rpsa_center_orth_mse"] = stats["rpsa_center_orth_mse"]
                             if "rpsa_pi_entropy" in stats:
                                 loss_dict["rpsa_pi_entropy"] = stats["rpsa_pi_entropy"]
-                            if "rpsa_bg_ratio" in stats:
-                                loss_dict["loss_rpsa_bg_ratio"] = stats["rpsa_bg_ratio"]
-                            if "rpsa_valid_clusters" in stats:
-                                loss_dict["loss_rpsa_valid_clusters"] = stats["rpsa_valid_clusters"]
+
+                        storage = None
+                        try:
+                            storage = get_event_storage()
+                            current_iter = storage.iter
+                        except AssertionError:
+                            current_iter = 0
+
+                        warmup_iters = getattr(self.transformer, "rpsa_warmup_iters", 0)
+                        warmup_start = getattr(self.transformer, "rpsa_warmup_start", 0)
+                        warmup_init = getattr(self.transformer, "rpsa_warmup_init_scale", 0.0)
+                        warmup_power = getattr(self.transformer, "rpsa_warmup_power", 1.0)
+                        schedule_scale = 1.0
+                        if warmup_iters > 0:
+                            if current_iter < warmup_start:
+                                schedule_scale = warmup_init
+                            elif current_iter < warmup_start + warmup_iters:
+                                progress = (current_iter - warmup_start) / float(max(warmup_iters, 1))
+                                schedule_scale = warmup_init + (progress ** warmup_power) * (1.0 - warmup_init)
+
+                        loss_dict["loss_rpsa"] = loss_dict["loss_rpsa"] * schedule_scale
+
+                        if storage is not None:
+                            storage.put_scalar("loss_rpsa_scale", float(schedule_scale), smoothing_hint=False)
+                            if isinstance(stats, dict):
+                                if "rpsa_bg_ratio" in stats:
+                                    storage.put_scalar("loss_rpsa_bg_ratio", float(stats["rpsa_bg_ratio"]), smoothing_hint=False)
+                                if "rpsa_valid_clusters" in stats:
+                                    storage.put_scalar("loss_rpsa_valid_clusters", float(stats["rpsa_valid_clusters"]), smoothing_hint=False)
+                                if "rpsa_tokens" in stats:
+                                    storage.put_scalar("loss_rpsa_tokens", float(stats["rpsa_tokens"]), smoothing_hint=False)
                     # else:
                     #     logger_rpsa.warning("[RPSA] ⚠️ rpsa_loss is None - RPSA may not be computing loss")
                 # else:
