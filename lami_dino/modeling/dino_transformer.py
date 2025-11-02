@@ -252,6 +252,14 @@ class DINOTransformer(nn.Module):
         use_rpsa: bool = True,
         rpsa_module: Optional[nn.Module] = None,
         rpsa_kwargs: Optional[Dict] = None,
+        *,
+        rpsa_token_topk: int = 0,
+        rpsa_token_topk_ratio: float = 0.0,
+        rpsa_confidence_threshold: float = 0.0,
+        rpsa_warmup_start: int = 0,
+        rpsa_warmup_iters: int = 0,
+        rpsa_warmup_init_scale: float = 0.0,
+        rpsa_warmup_power: float = 1.0,
     ):
         super(DINOTransformer, self).__init__()
         self.encoder = encoder
@@ -276,13 +284,13 @@ class DINOTransformer(nn.Module):
         self.rpsa_last_stats = {}
         self.rpsa = None
         # configurable defaults for gating / scheduling
-        self.rpsa_token_topk = 0
-        self.rpsa_token_topk_ratio = 0.0
-        self.rpsa_confidence_threshold = 0.0
-        self.rpsa_warmup_start = 0
-        self.rpsa_warmup_iters = 0
-        self.rpsa_warmup_init_scale = 0.0
-        self.rpsa_warmup_power = 1.0
+        self.rpsa_token_topk = int(max(0, rpsa_token_topk))
+        self.rpsa_token_topk_ratio = float(max(0.0, rpsa_token_topk_ratio))
+        self.rpsa_confidence_threshold = float(max(0.0, rpsa_confidence_threshold))
+        self.rpsa_warmup_start = int(max(0, rpsa_warmup_start))
+        self.rpsa_warmup_iters = int(max(0, rpsa_warmup_iters))
+        self.rpsa_warmup_init_scale = float(max(0.0, rpsa_warmup_init_scale))
+        self.rpsa_warmup_power = float(max(1e-6, rpsa_warmup_power))
         if self.use_rpsa:
             if rpsa_module is not None:
                 self.rpsa = rpsa_module
