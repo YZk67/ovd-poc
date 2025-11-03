@@ -123,19 +123,19 @@ model.soft_attention_tau = 0.08  # Temperature parameter for soft-attention (τ 
 
 # RPSA parameters
 model.transformer.use_rpsa = True
-model.criterion.weight_dict["loss_rpsa"] = 0.05
+model.criterion.weight_dict["loss_rpsa"] = 0.08
 model.transformer.rpsa_module.K = 6
 model.transformer.rpsa_module.tau_align = 0.07
 model.transformer.rpsa_module.sigma = 1.0
-model.transformer.rpsa_module.bg_thresh = 0.05
+model.transformer.rpsa_module.bg_thresh = 0.0
 model.transformer.rpsa_module.subsample_tokens = 2048  # random subsample tokens to stabilize cost
-model.transformer.rpsa_module.subsample_method = "random"
+model.transformer.rpsa_module.subsample_method = "confidence"
 model.transformer.rpsa_module.detach_pi = True
 model.transformer.rpsa_module.stop_grad_vision = False
 model.transformer.rpsa_module.stop_grad_text = False     # warm-up: also freeze prototype branch initially
-model.transformer.rpsa_module.bg_percentile = 0.75
+model.transformer.rpsa_module.bg_percentile = 0.65
 
-model.transformer.rpsa_token_topk = 512
+model.transformer.rpsa_token_topk = 768
 model.transformer.rpsa_confidence_threshold = 0.3
 model.transformer.rpsa_warmup_start = 0
 model.transformer.rpsa_warmup_iters = 3000
