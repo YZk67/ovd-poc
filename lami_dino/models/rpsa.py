@@ -151,7 +151,7 @@ def weighted_infoNCE(mu: torch.Tensor,
                      pi: torch.Tensor,
                      tau: float = 0.07,
                      alpha_pi: float = 1.0,
-                     bg_thresh: float = 0.1,
+                     bg_thresh: Optional[float] = 0.1,
                      adaptive_bg: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
     Weighted InfoNCE alignment between visual centers and text prototypes.
@@ -185,8 +185,11 @@ def weighted_infoNCE(mu: torch.Tensor,
         elif thresh.dim() == 1:
             thresh = thresh.view(-1, 1).expand_as(pi_max_raw)
         bg_mask = pi_max_raw < thresh
-    else:
+    elif bg_thresh is not None:
         bg_mask = (pi_max_raw < bg_thresh)
+    else:
+        # Both bg_thresh and adaptive_bg are None: treat all clusters as valid (no background filtering)
+        bg_mask = torch.zeros(B, K, dtype=torch.bool, device=pi_max_raw.device)
     pi_tilde = (pi_clamped ** alpha_pi)
     pi_tilde = pi_tilde / (pi_tilde.sum(dim=-1, keepdim=True).clamp_min(1e-6))  # [B,K,C]
 
@@ -217,7 +220,7 @@ class RPSAModule(nn.Module):
                  em_iters: int = 1,
                  tau_align: float = 0.07,
                  alpha_pi: float = 1.0,
-                 bg_thresh: float = 0.1,
+                 bg_thresh: Optional[float] = 0.1,
                  subsample_tokens: int = 0,
                  subsample_method: str = "random",
                  subsample_fg_ratio: float = 0.5,
@@ -232,7 +235,7 @@ class RPSAModule(nn.Module):
             em_iters: soft k-means EM iterations
             tau_align: InfoNCE temperature
             alpha_pi: exponent on pi weights (sharpen/soften)
-            bg_thresh: background threshold on max pi per cluster
+            bg_thresh: background threshold on max pi per cluster. If None, rely solely on bg_percentile.
             subsample_tokens: if >0, subsample tokens per image for RPSA (speed)
             subsample_method: strategy for subsampling ('random', 'confidence', 'hybrid')
             subsample_fg_ratio: foreground quota when using 'hybrid' strategy
@@ -247,7 +250,7 @@ class RPSAModule(nn.Module):
         self.em_iters = int(em_iters)
         self.tau_align = float(tau_align)
         self.alpha_pi = float(alpha_pi)
-        self.bg_thresh = float(bg_thresh)
+        self.bg_thresh = float(bg_thresh) if bg_thresh is not None else None
         self.subsample_tokens = int(subsample_tokens)
         self.subsample_method = str(subsample_method)
         self.subsample_fg_ratio = float(subsample_fg_ratio)
