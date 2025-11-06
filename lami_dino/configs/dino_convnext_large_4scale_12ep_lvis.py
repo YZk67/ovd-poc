@@ -121,7 +121,9 @@ model.classifier.tpa_log_interval = 200
 model.use_soft_attention = True  # Enable soft-attention aggregation in query initialization
 model.soft_attention_tau = 0.08  # Temperature parameter for soft-attention (τ ≈ 0.05–0.1 recommended)
 
-# RPSA parameters
+
+# ========================= RPSA V1 =========================
+# RPSA parameters V1
 # model.transformer.use_rpsa = True
 # model.criterion.weight_dict["loss_rpsa"] = 0.08
 # model.transformer.rpsa_module.K = 6
@@ -142,47 +144,58 @@ model.soft_attention_tau = 0.08  # Temperature parameter for soft-attention (τ 
 # model.transformer.rpsa_warmup_init_scale = 0.0
 # model.transformer.rpsa_warmup_power = 1.0
 
-# ========================= RPSA =========================
+# ========================= RPSA V2 =========================
+# # --- 基本启用 ---
+# model.transformer.use_rpsa = True
+# # --- 损失权重（降低约 40%）---
+# model.criterion.weight_dict["loss_rpsa"] = 0.03
+# # --- 聚类设置 ---
+# model.transformer.rpsa_module.K = 6
+# # --- 对齐温度：soft 化 InfoNCE ---
+# model.transformer.rpsa_module.tau_align = 0.12  # 由 0.07 ↑
+# model.transformer.rpsa_module.sigma = 1.0
+# # --- 背景筛选策略：只保留分位数控制 ---
+# model.transformer.rpsa_module.bg_thresh = None        # 禁用固定阈
+# model.transformer.rpsa_module.bg_percentile = 0.55    # 从 0.65 ↓，保留更多前景
+# # --- 采样策略 ---
+# model.transformer.rpsa_module.subsample_tokens = 2048
+# model.transformer.rpsa_module.subsample_method = "confidence"
+# # --- 聚类权重锐化（路由更聚焦）---
+# model.transformer.rpsa_module.alpha_pi = 1.5          # 新增，控制 soft cluster 纯度
+# # --- 梯度流向 ---
+# model.transformer.rpsa_module.detach_pi = False       # 允许 π 反传，修正错误聚类
+# model.transformer.rpsa_module.stop_grad_vision = False
+# model.transformer.rpsa_module.stop_grad_text = False  # 后续再考虑 warm-up text
+# # --- token gating ---
+# model.transformer.rpsa_token_topk = 768
+# model.transformer.rpsa_confidence_threshold = 0.3
+# # --- warm-up 策略（关键）---
+# model.transformer.rpsa_warmup_start = 0
+# model.transformer.rpsa_warmup_iters = 1500             # 由 3000 ↓，加快生效
+# model.transformer.rpsa_warmup_init_scale = 0.0
+# model.transformer.rpsa_warmup_power = 1.0
 
-# --- 基本启用 ---
+
+# ========================= RPSA V3 =========================
 model.transformer.use_rpsa = True
-
-# --- 损失权重（降低约 40%）---
-model.criterion.weight_dict["loss_rpsa"] = 0.03
-
-# --- 聚类设置 ---
-model.transformer.rpsa_module.K = 6
-
-# --- 对齐温度：soft 化 InfoNCE ---
-model.transformer.rpsa_module.tau_align = 0.12  # 由 0.07 ↑
+model.criterion.weight_dict["loss_rpsa"] = 0.05      # 稍弱
+model.transformer.rpsa_module.K = 8
+model.transformer.rpsa_module.tau_align = 0.06
 model.transformer.rpsa_module.sigma = 1.0
-
-# --- 背景筛选策略：只保留分位数控制 ---
-model.transformer.rpsa_module.bg_thresh = None        # 禁用固定阈
-model.transformer.rpsa_module.bg_percentile = 0.55    # 从 0.65 ↓，保留更多前景
-
-# --- 采样策略 ---
+model.transformer.rpsa_module.bg_thresh = 0.05
+model.transformer.rpsa_module.bg_percentile = 0.60
 model.transformer.rpsa_module.subsample_tokens = 2048
 model.transformer.rpsa_module.subsample_method = "confidence"
-
-# --- 聚类权重锐化（路由更聚焦）---
-model.transformer.rpsa_module.alpha_pi = 1.5          # 新增，控制 soft cluster 纯度
-
-# --- 梯度流向 ---
-model.transformer.rpsa_module.detach_pi = False       # 允许 π 反传，修正错误聚类
+model.transformer.rpsa_module.detach_pi = False      # 允许部分梯度
 model.transformer.rpsa_module.stop_grad_vision = False
-model.transformer.rpsa_module.stop_grad_text = False  # 后续再考虑 warm-up text
-
-# --- token gating ---
-model.transformer.rpsa_token_topk = 768
+model.transformer.rpsa_module.stop_grad_text = False
+model.transformer.rpsa_token_topk = 1024
 model.transformer.rpsa_confidence_threshold = 0.3
-
-# --- warm-up 策略（关键）---
-model.transformer.rpsa_warmup_start = 0
-model.transformer.rpsa_warmup_iters = 1500             # 由 3000 ↓，加快生效
+# --- warm-up by iteration ---
+model.transformer.rpsa_warmup_start = 20000
+model.transformer.rpsa_warmup_iters = 8000
 model.transformer.rpsa_warmup_init_scale = 0.0
 model.transformer.rpsa_warmup_power = 1.0
-# ========================= RPSA =========================
 
 
 # Enable Automatic Mixed Precision (AMP) for faster training

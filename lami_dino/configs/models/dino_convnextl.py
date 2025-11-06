@@ -85,6 +85,11 @@ model = L(DINO)(
         two_stage_num_proposals="${..num_queries}",
         use_rpsa=True,
         rpsa_module=rpsa_module,
+        # RPSA warmup parameters (can be overridden in config file)
+        rpsa_warmup_start=0,
+        rpsa_warmup_iters=0,
+        rpsa_warmup_init_scale=0.0,
+        rpsa_warmup_power=1.0,
     ),
     embed_dim=256,
     num_classes=80,
