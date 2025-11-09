@@ -28,6 +28,7 @@ from .coco import load_sem_seg, register_coco_instances
 from .coco_panoptic import register_coco_panoptic, register_coco_panoptic_separated
 from .lvis import get_lvis_instances_meta, register_lvis_instances
 from .pascal_voc import register_pascal_voc
+import json
 
 # ==== Predefined datasets and splits for COCO ==========
 
@@ -46,6 +47,53 @@ _PREDEFINED_SPLITS_COCO["coco"] = {
     "coco_2017_test-dev": ("coco/test2017", "coco/annotations/image_info_test-dev2017.json"),
     "coco_2017_val_100": ("coco/val2017", "coco/annotations/instances_val2017_100.json"),
 }
+
+# ==== OVD-COCO (65) BEGIN =========================================
+# 1) 你的 65 类顺序（务必与 .npy 行顺序一致！）
+COCO65 = [
+    "person","bicycle","car","motorcycle","airplane","bus","train","truck","boat",
+    "traffic light","fire hydrant","stop sign","parking meter","bench",
+    "bird","cat","dog","horse","sheep","cow",
+    "elephant","bear","zebra","giraffe",
+    "backpack","umbrella","handbag","tie","suitcase",
+    "frisbee","skis","snowboard","sports ball","kite","baseball bat",
+    "baseball glove","skateboard","surfboard","tennis racket","bottle",
+    "wine glass","cup","fork","knife","spoon","bowl",
+    "banana","apple","sandwich","orange","broccoli","carrot",
+    "hot dog","pizza","donut","cake","chair","couch","potted plant","bed",
+    "dining table","toilet","tv","laptop","mouse"
+]
+
+# 2) 把 ovd_coco 的两个 split 加到 COCO 注册表中（共用 coco meta，稍后强制覆盖）
+_PREDEFINED_SPLITS_COCO["coco"].update({
+    "ovcoco_2017_train_all": ("coco/train2017", "coco/annotations/ovd_ins_train2017_all.json"),
+    "ovcoco_2017_val_all":   ("coco/val2017",   "coco/annotations/ovd_ins_val2017_all.json"),
+})
+
+def _ovcoco_build_id_map(json_path):
+    """
+    从 json 的 categories 读出 原始category_id -> 连续id 的映射，
+    连续id 的顺序严格等于 COCO65（与你的 .npy 对齐）。
+    """
+    with open(json_path, "r") as f:
+        data = json.load(f)
+    cat_id_to_name = {c["id"]: c["name"] for c in data.get("categories", [])}
+    name_to_contig = {n: i for i, n in enumerate(COCO65)}
+    id_map = {}
+    missing = []
+    for k, v in cat_id_to_name.items():
+        if v not in name_to_contig:
+            missing.append((k, v))
+        else:
+            id_map[k] = name_to_contig[v]
+    if missing:
+        raise ValueError(
+            "[OVD-COCO] 你的标注含有 COCO65 之外或名称不匹配的类别：\n" +
+            "\n".join([f"  id={k}, name='{v}'" for k, v in missing]) +
+            "\n请确保类别名与 COCO65 完全一致（大小写/空格/连字符）。"
+        )
+    return id_map
+# ==== OVD-COCO (65) END ===========================================
 
 # _PREDEFINED_SPLITS_COCO["obj365v2"] = {
 #     "obj365v2_train": ("object365/train/", "object365/annotations/obj365v2_train_filtered.json"),
@@ -129,6 +177,20 @@ def register_all_coco(root):
                 os.path.join(root, json_file) if "://" not in json_file else json_file,
                 os.path.join(root, image_root),
             )
+            # ==== OVD-COCO (65) OVERRIDES ==========================
+            if key.startswith("ovcoco_2017_"):
+                meta = MetadataCatalog.get(key)
+                meta.thing_classes = COCO65  # 强制 65 类顺序
+                meta.evaluator_type = "coco"
+                jf = meta.json_file
+                try:
+                    id_map = _ovcoco_build_id_map(jf)
+                    # 保存 原始id->连续id 映射；多数管线/mapper会读取它进行重映射
+                    meta.thing_dataset_id_to_contiguous_id = id_map
+                except Exception as e:
+                    # 让错误尽早暴露
+                    raise
+            # =======================================================
 
     for (
         prefix,

@@ -273,6 +273,16 @@ def do_train(args, cfg):
                 ddp (dict)
     """
     model = instantiate(cfg.model)
+    # 在 instantiate(cfg.model) 之后
+    try:
+        head = model.transformer.decoder.class_embed[-1]
+        if hasattr(head, "train_text_feats"):
+            print("train_text_feats:", tuple(head.train_text_feats.shape))
+        if hasattr(head, "eval_text_feats"):
+            print("eval_text_feats:", tuple(head.eval_text_feats.shape))
+    except Exception as _:
+        pass
+
     logger = logging.getLogger("detectron2")
     logger.info("Model:\n{}".format(model))
     model.to(cfg.train.device)
