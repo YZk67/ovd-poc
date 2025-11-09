@@ -87,37 +87,28 @@ class Trainer(SimpleTrainer):
         self.tpa_grad_printed = False
 
     def run_step(self):
-        """
-        Implement the standard training logic described above.
-        """
         assert self.model.training, "[Trainer] model was changed to eval mode!"
         assert torch.cuda.is_available(), "[Trainer] CUDA is required for AMP training!"
         from torch.cuda.amp import autocast
 
+        # 1) 取数据并计时
         start = time.perf_counter()
-        """
-        If you want to do something with the data, you can wrap the dataloader.
-        """
         data = next(self._data_loader_iter)
         data_time = time.perf_counter() - start
 
-        """
-        If you want to do something with the losses, you can wrap the model.
-        """
-        loss_dict = self.model(data)
+        # 2) 清梯度
+        self.optimizer.zero_grad()
+
+        # 3) 前向 + 汇总 loss（放进 autocast）
         with autocast(enabled=self.amp):
+            loss_dict = self.model(data)
             if isinstance(loss_dict, torch.Tensor):
                 losses = loss_dict
                 loss_dict = {"total_loss": loss_dict}
             else:
                 losses = sum(loss_dict.values())
 
-        """
-        If you need to accumulate gradients or do something similar, you can
-        wrap the optimizer with your custom `zero_grad()` method.
-        """
-        self.optimizer.zero_grad()
-
+        # 4) 反向 +（可选）梯度裁剪 + 更新
         if self.amp:
             self.grad_scaler.scale(losses).backward()
             if self.clip_grad_params is not None:
@@ -131,28 +122,37 @@ class Trainer(SimpleTrainer):
                 self.clip_grads(self.model.parameters())
             self.optimizer.step()
 
-        # === 只打印一次 TPA 梯度信息 ===
+        # 5) 只打印一次 TPA 梯度信息（健壮判断）
         if not self.tpa_grad_printed:
-            # Get the underlying model (unwrap DDP if needed)
-            model = self.model.module if hasattr(self.model, 'module') else self.model
-            logger.info(f"use_soft_attention: {model.transformer.use_soft_attention}")
-            logger.info(f"soft_attention_tau: {model.transformer.soft_attention_tau}")
-            
-            # 检查 TPA 参数的梯度
-            if hasattr(model.transformer.decoder.class_embed[0], 'tpa'):
-                logger.info("TPA parameters gradient status:")
-                for n, p in model.transformer.decoder.class_embed[0].tpa.named_parameters():
-                    logger.info(f"  {n}: grad={'Yes' if p.grad is not None else 'No'}")
-            else:
-                logger.info("TPA not found in class_embed[0]")
-            
-            self.tpa_grad_printed = True  # ✅ 确保只打印一次
-        
-        if hasattr(self.model, "transformer") and hasattr(self.model.transformer, "text_proto_bank"):
-            monitor_dict = self.model.transformer.text_proto_bank.aggregator.get_monitor_dict()
-            loss_dict.update(monitor_dict)
+            model = self.model.module if hasattr(self.model, "module") else self.model
+            if hasattr(model, "transformer"):
+                if hasattr(model.transformer, "use_soft_attention"):
+                    logger.info(f"use_soft_attention: {getattr(model.transformer, 'use_soft_attention', None)}")
+                if hasattr(model.transformer, "soft_attention_tau"):
+                    logger.info(f"soft_attention_tau: {getattr(model.transformer, 'soft_attention_tau', None)}")
+                try:
+                    head0 = getattr(model.transformer.decoder, "class_embed", [None])[0]
+                    if head0 is not None and hasattr(head0, "tpa"):
+                        logger.info("TPA parameters gradient status:")
+                        for n, p in head0.tpa.named_parameters():
+                            logger.info(f"  {n}: grad={'Yes' if p.grad is not None else 'No'}")
+                    else:
+                        logger.info("TPA not found in class_embed[0]")
+                except Exception:
+                    logger.info("TPA grad probe skipped.")
+            self.tpa_grad_printed = True
 
+        # 6) 额外监控项写入
+        if hasattr(self.model, "transformer") and hasattr(self.model.transformer, "text_proto_bank"):
+            try:
+                monitor_dict = self.model.transformer.text_proto_bank.aggregator.get_monitor_dict()
+                loss_dict.update(monitor_dict)
+            except Exception:
+                pass
+
+        # 7) 写指标
         self._write_metrics(loss_dict, data_time)
+
 
     def clip_grads(self, params):
         params = list(filter(lambda p: p.requires_grad and p.grad is not None, params))
@@ -163,35 +163,98 @@ class Trainer(SimpleTrainer):
             )
 
 
+# def do_test(cfg, model):
+#     if "evaluator" in cfg.dataloader:
+#         try:
+#             # Temporarily reduce num_workers for evaluation to prevent BrokenPipeError
+#             original_num_workers = cfg.dataloader.test.num_workers
+#             cfg.dataloader.test.num_workers = 0  # Use single process for evaluation
+            
+#             ret = inference_on_dataset(
+#                 model, instantiate(cfg.dataloader.test), instantiate(cfg.dataloader.evaluator), cfg.DDEBUG
+#             )
+#             print_csv_format(ret)
+            
+#             # Restore original num_workers
+#             cfg.dataloader.test.num_workers = original_num_workers
+#             return ret
+#         except BrokenPipeError as e:
+#             logger = logging.getLogger("detectron2")
+#             logger.warning(f"BrokenPipeError during evaluation: {e}")
+#             logger.warning("Skipping evaluation due to multiprocessing issue - training will continue")
+#             # Restore original num_workers
+#             cfg.dataloader.test.num_workers = original_num_workers
+#             return {}
+#         except Exception as e:
+#             logger = logging.getLogger("detectron2")
+#             logger.warning(f"Error during evaluation: {e}")
+#             logger.warning("Skipping evaluation - training will continue")
+#             # Restore original num_workers
+#             cfg.dataloader.test.num_workers = original_num_workers
+#             return {}
+
 def do_test(cfg, model):
-    if "evaluator" in cfg.dataloader:
-        try:
-            # Temporarily reduce num_workers for evaluation to prevent BrokenPipeError
-            original_num_workers = cfg.dataloader.test.num_workers
-            cfg.dataloader.test.num_workers = 0  # Use single process for evaluation
-            
-            ret = inference_on_dataset(
-                model, instantiate(cfg.dataloader.test), instantiate(cfg.dataloader.evaluator), cfg.DDEBUG
-            )
-            print_csv_format(ret)
-            
-            # Restore original num_workers
-            cfg.dataloader.test.num_workers = original_num_workers
-            return ret
-        except BrokenPipeError as e:
-            logger = logging.getLogger("detectron2")
-            logger.warning(f"BrokenPipeError during evaluation: {e}")
-            logger.warning("Skipping evaluation due to multiprocessing issue - training will continue")
-            # Restore original num_workers
-            cfg.dataloader.test.num_workers = original_num_workers
-            return {}
-        except Exception as e:
-            logger = logging.getLogger("detectron2")
-            logger.warning(f"Error during evaluation: {e}")
-            logger.warning("Skipping evaluation - training will continue")
-            # Restore original num_workers
-            cfg.dataloader.test.num_workers = original_num_workers
-            return {}
+    """
+    支持多个 test dataloader / evaluator，逐个评测并打印。
+    返回一个 dict[name] = metrics。
+    """
+    if "evaluator" not in cfg.dataloader:
+        return {}
+
+    # 统一实例化
+    test_obj = instantiate(cfg.dataloader.test)
+    eval_obj = instantiate(cfg.dataloader.evaluator)
+
+    # 归一化为列表
+    tests = test_obj if isinstance(test_obj, (list, tuple)) else [test_obj]
+    evals = eval_obj if isinstance(eval_obj, (list, tuple)) else [eval_obj]
+
+    # evaluator 个数与 dataloader 不匹配时，重复最后一个
+    if len(evals) < len(tests):
+        evals = list(evals) + [evals[-1]] * (len(tests) - len(evals))
+
+    results = {}
+    logger = logging.getLogger("detectron2")
+
+    # 记录并临时降 worker
+    saved_workers = []
+    try:
+        for i, (td, ev) in enumerate(zip(tests, evals)):
+            # 取名字（如果 LazyConfig 有 name 字段/属性）
+            name = getattr(td, "dataset", None)
+            try:
+                name = getattr(td.dataset, "name", None) or getattr(td, "name", None)
+            except Exception:
+                pass
+            name = name or f"test_{i}"
+
+            # 兼容 num_workers 字段
+            nw = getattr(td, "num_workers", None)
+            saved_workers.append(nw)
+            if nw is not None:
+                setattr(td, "num_workers", 0)
+
+            logger.info(f"Running evaluation on: {name}")
+            try:
+                ret = inference_on_dataset(model, td, ev, cfg.DDEBUG)
+                results[name] = ret
+                print_csv_format(ret)
+            except BrokenPipeError as e:
+                logger.warning(f"BrokenPipeError during evaluation: {e}")
+                logger.warning("Skipping this evaluation due to multiprocessing issue")
+                results[name] = {}
+            except Exception as e:
+                logger.warning(f"Error during evaluation on {name}: {e}")
+                logger.warning("Skipping this evaluation")
+                results[name] = {}
+
+    finally:
+        # 恢复 num_workers
+        for td, nw in zip(tests, saved_workers):
+            if nw is not None:
+                setattr(td, "num_workers", nw)
+
+    return results
 
 
 # ==== Added by ChatGPT ====

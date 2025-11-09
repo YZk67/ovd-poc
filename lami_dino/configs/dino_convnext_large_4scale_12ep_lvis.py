@@ -103,8 +103,8 @@ dataloader.train.total_batch_size = 16  # Can use 4 with Option 3
 
 # dump the testing results into output_dir for visualization
 dataloader.evaluator.output_dir = train.output_dir
-dataloader.test.dataset.names = "ovcoco_2017_val_all"
-dataloader.train.dataset.names = "ovcoco_2017_train_all"
+dataloader.test.dataset.names = ("ovcoco_2017_val_b", "ovcoco_2017_val_t")
+dataloader.train.dataset.names = "ovcoco_2017_train_b"
 
 # ====== Phase 1：测试 Claude Prompts 单独效果 ======
 # Fed Loss是LVIS必须的基础设施，所有实验都需要使用
@@ -157,11 +157,14 @@ from detectron2.config import CfgNode as CN
 if not hasattr(model, "cfg_overrides"):
     model.cfg_overrides = CN()
 model.cfg_overrides.DATASETS = CN()
-model.cfg_overrides.DATASETS.TRAIN = ("ovcoco_2017_train_all",)
-model.cfg_overrides.DATASETS.TEST  = ("ovcoco_2017_val_all",)
+model.cfg_overrides.DATASETS.TRAIN = ("ovcoco_2017_train_b",)
+model.cfg_overrides.DATASETS.TEST  = ("ovcoco_2017_val_b", "ovcoco_2017_val_t")
 
 from detectron2.data import MetadataCatalog
 import numpy as np
-_ov_meta = MetadataCatalog.get("ovcoco_2017_train_all")
-assert len(_ov_meta.thing_classes) == 65, "thing_classes 不是 65！"
+#_ov_meta = MetadataCatalog.get("ovcoco_2017_train_all")
+for _name in ["ovcoco_2017_train_b", "ovcoco_2017_val_b", "ovcoco_2017_val_t"]:
+    _meta = MetadataCatalog.get(_name)
+    assert len(_meta.thing_classes) == 65, f"{_name} thing_classes 不是 65！"
+#assert len(_ov_meta.thing_classes) == 65, "thing_classes 不是 65！"
 assert np.load(model.query_path).shape[0] == 65, ".npy 行数不是 65！"

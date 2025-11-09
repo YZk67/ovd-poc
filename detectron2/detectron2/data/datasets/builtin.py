@@ -66,8 +66,12 @@ COCO65 = [
 
 # 2) 把 ovd_coco 的两个 split 加到 COCO 注册表中（共用 coco meta，稍后强制覆盖）
 _PREDEFINED_SPLITS_COCO["coco"].update({
-    "ovcoco_2017_train_all": ("coco/train2017", "coco/annotations/ovd_ins_train2017_all.json"),
-    "ovcoco_2017_val_all":   ("coco/val2017",   "coco/annotations/ovd_ins_val2017_all.json"),
+
+    # 标准 48/17：b=base(48)，t=novel(17)
+    "ovcoco_2017_train_b":   ("coco/train2017", "coco/annotations/ovd_ins_train2017_b.json"),
+    "ovcoco_2017_train_t":   ("coco/train2017", "coco/annotations/ovd_ins_train2017_t.json"),  # 一般不用训练
+    "ovcoco_2017_val_b":     ("coco/val2017",   "coco/annotations/ovd_ins_val2017_b.json"),
+    "ovcoco_2017_val_t":     ("coco/val2017",   "coco/annotations/ovd_ins_val2017_t.json"),
 })
 
 def _ovcoco_build_id_map(json_path):
