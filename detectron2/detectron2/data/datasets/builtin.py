@@ -200,20 +200,20 @@ def register_all_coco(root):
 
             register_coco_instances(
                 key,
-                use_meta,
+                {},
                 os.path.join(root, json_file) if "://" not in json_file else json_file,
                 os.path.join(root, image_root),
             )
 
             if key.startswith("ovcoco_2017_"):
                 # 仅当尚未设置过时再写 65 类，避免断言
-                #_safe_set_thing_classes(key, COCO65)
+                _safe_set_thing_classes(key, COCO65)
 
                 meta = MetadataCatalog.get(key)
                 meta.evaluator_type = "coco"
                 jf = meta.json_file
                 # 你的 id 映射逻辑不变
-                #id_map = _ovcoco_build_id_map(jf)
+                id_map = _ovcoco_build_id_map(jf)
                 #meta.thing_dataset_id_to_contiguous_id = id_map
 
 
