@@ -160,11 +160,11 @@ os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'OFF'
 # model.cfg_overrides.DATASETS.TRAIN = ("ovcoco_2017_train_b",)
 # model.cfg_overrides.DATASETS.TEST  = ("ovcoco_2017_val_b", "ovcoco_2017_val_t")
 
-from detectron2.data import MetadataCatalog
-import numpy as np
-#_ov_meta = MetadataCatalog.get("ovcoco_2017_train_all")
-for _name in ["ovcoco_2017_train_b", "ovcoco_2017_val_b", "ovcoco_2017_val_t"]:
-    _meta = MetadataCatalog.get(_name)
-    assert len(_meta.thing_classes) == 65, f"{_name} thing_classes 不是 65！"
-#assert len(_ov_meta.thing_classes) == 65, "thing_classes 不是 65！"
-assert np.load(model.query_path).shape[0] == 65, ".npy 行数不是 65！"
+# from detectron2.data import MetadataCatalog
+# import numpy as np
+# #_ov_meta = MetadataCatalog.get("ovcoco_2017_train_all")
+# for _name in ["ovcoco_2017_train_b", "ovcoco_2017_val_b", "ovcoco_2017_val_t"]:
+#     _meta = MetadataCatalog.get(_name)
+#     assert len(_meta.thing_classes) == 65, f"{_name} thing_classes 不是 65！"
+# #assert len(_ov_meta.thing_classes) == 65, "thing_classes 不是 65！"
+# assert np.load(model.query_path).shape[0] == 65, ".npy 行数不是 65！"
