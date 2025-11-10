@@ -100,7 +100,7 @@ class Trainer(SimpleTrainer):
         self.optimizer.zero_grad()
 
         # 3) 前向 + 汇总 loss（放进 autocast）
-        with autocast(enabled=self.amp):
+        with autocast(enabled=self.amp, dtype=torch.bfloat16):
             loss_dict = self.model(data)
             if isinstance(loss_dict, torch.Tensor):
                 losses = loss_dict
