@@ -10,8 +10,8 @@ if "language" in model:
 model.vlm_query_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl.npy"
 model.score_ensemble = True
 model.backbone.score_ensemble = model.score_ensemble
-model.seen_classes = "dataset/ovd_ins_train2017_b.json"
-model.all_classes = "dataset/ovd_ins_train2017_all.json"
+model.seen_classes = "dataset/coco/annotations/ovd_ins_train2017_b.json"
+model.all_classes = "dataset/coco/annotations/ovd_ins_train2017_all.json"
 model.vlm_temperature = 100.0 # keep same with f-vlm
 model.alpha = 0.0
 model.beta = 0.4
