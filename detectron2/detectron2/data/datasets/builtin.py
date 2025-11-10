@@ -170,31 +170,53 @@ _PREDEFINED_SPLITS_COCO_PANOPTIC = {
     ),
 }
 
+def _safe_set_thing_classes(dataset_key, classes):
+    """
+    只在尚未设置过 thing_classes 时设置；
+    若已存在且不同，不再覆盖，避免触发 detectron2 的断言。
+    """
+    meta = MetadataCatalog.get(dataset_key)
+    old = getattr(meta, "thing_classes", None)
+    if old is None:
+        meta.thing_classes = classes
+    elif list(old) != list(classes):
+        # 不强改，给一次性提示即可
+        import logging
+        from detectron2.utils.logger import log_first_n
+        log_first_n(
+            logging.WARN,
+            f"[ovcoco] Keep existing thing_classes for '{dataset_key}' (len={len(old)}), "
+            f"skip replacing with len={len(classes)}.",
+            n=1
+        )
+
+
 
 def register_all_coco(root):
     for dataset_name, splits_per_dataset in _PREDEFINED_SPLITS_COCO.items():
         for key, (image_root, json_file) in splits_per_dataset.items():
             # Assume pre-defined datasets live in `./datasets`.
+            # 对 ovcoco_*：不要用 _get_builtin_metadata("coco")，避免先被写成 80 类
+            use_meta = {} if key.startswith("ovcoco_2017_") else _get_builtin_metadata(dataset_name)
+
             register_coco_instances(
                 key,
-                _get_builtin_metadata(dataset_name),
+                use_meta,
                 os.path.join(root, json_file) if "://" not in json_file else json_file,
                 os.path.join(root, image_root),
             )
-            # ==== OVD-COCO (65) OVERRIDES ==========================
+
             if key.startswith("ovcoco_2017_"):
+                # 仅当尚未设置过时再写 65 类，避免断言
+                _safe_set_thing_classes(key, COCO65)
+
                 meta = MetadataCatalog.get(key)
-                meta.thing_classes = COCO65  # 强制 65 类顺序
                 meta.evaluator_type = "coco"
                 jf = meta.json_file
-                try:
-                    id_map = _ovcoco_build_id_map(jf)
-                    # 保存 原始id->连续id 映射；多数管线/mapper会读取它进行重映射
-                    meta.thing_dataset_id_to_contiguous_id = id_map
-                except Exception as e:
-                    # 让错误尽早暴露
-                    raise
-            # =======================================================
+                # 你的 id 映射逻辑不变
+                id_map = _ovcoco_build_id_map(jf)
+                meta.thing_dataset_id_to_contiguous_id = id_map
+
 
     for (
         prefix,
