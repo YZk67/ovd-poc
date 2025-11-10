@@ -10,8 +10,8 @@ if "language" in model:
 model.vlm_query_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl.npy"
 model.score_ensemble = True
 model.backbone.score_ensemble = model.score_ensemble
-model.seen_classes = "dataset/coco/annotations/ovd_ins_train2017_b.json"
-model.all_classes = "dataset/coco/annotations/ovd_ins_train2017_all.json"
+model.seen_classes = "dataset//metadata/ovd_ins_train2017_b.json"
+model.all_classes = "dataset//metadata/ovd_ins_train2017_all.json"
 model.vlm_temperature = 100.0 # keep same with f-vlm
 model.alpha = 0.0
 model.beta = 0.4
@@ -84,7 +84,7 @@ model.eval_query_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl.npy"
 # modify optimizer config
 # 假设你单卡用 1e-4 (1GPU); 1e-4 使用原来成功的学习率
 base_lr = 1e-4
-world_size = 1.5  # GPU 数
+world_size = 1  # GPU 数
 optimizer.lr = base_lr * world_size
 optimizer.betas = (0.9, 0.999)
 optimizer.weight_decay = 1e-4
