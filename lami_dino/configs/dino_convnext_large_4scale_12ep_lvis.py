@@ -102,8 +102,21 @@ dataloader.train.num_workers = 4  # 1 worker per GPU for 4GPU training
 dataloader.train.total_batch_size = 16  # Can use 4 with Option 3
 
 # dump the testing results into output_dir for visualization
-dataloader.evaluator.output_dir = train.output_dir
-dataloader.test.dataset.names = ("ovcoco_2017_val_b", "ovcoco_2017_val_t")
+#dataloader.evaluator.output_dir = train.output_dir
+dataloader.evaluator = [
+    get_config("common/data/coco_detr.py").dataloader.evaluator.clone(),
+    get_config("common/data/coco_detr.py").dataloader.evaluator.clone(),
+]
+#dataloader.test.dataset.names = ("ovcoco_2017_val_b", "ovcoco_2017_val_t")
+dataloader.test = [
+    get_config("common/data/coco_detr.py").dataloader.test.clone()
+]
+dataloader.test[0].dataset.names = "ovcoco_2017_val_b"
+
+dataloader.test += [
+    get_config("common/data/coco_detr.py").dataloader.test.clone()
+]
+dataloader.test[1].dataset.names = "ovcoco_2017_val_t"
 dataloader.train.dataset.names = "ovcoco_2017_train_b"
 
 # ====== Phase 1：测试 Claude Prompts 单独效果 ======

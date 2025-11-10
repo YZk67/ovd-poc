@@ -207,7 +207,7 @@ def register_all_coco(root):
 
             if key.startswith("ovcoco_2017_"):
                 # 仅当尚未设置过时再写 65 类，避免断言
-                _safe_set_thing_classes(key, COCO65)
+                #_safe_set_thing_classes(key, COCO65)
 
                 meta = MetadataCatalog.get(key)
                 meta.evaluator_type = "coco"
