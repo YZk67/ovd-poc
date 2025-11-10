@@ -30,7 +30,7 @@ train = dict(
     # and only `checkpointer.max_to_keep` number of checkpoint will be kept.
     checkpointer=dict(period=5000, max_to_keep=100),
     # Run evaluation after every `eval_period` number of iterations
-    eval_period=5000,
+    eval_period=500,
     # Output log to console every `log_period` number of iterations.
     log_period=20,
     device="cuda",
