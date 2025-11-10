@@ -51,17 +51,16 @@ _PREDEFINED_SPLITS_COCO["coco"] = {
 # ==== OVD-COCO (65) BEGIN =========================================
 # 1) 你的 65 类顺序（务必与 .npy 行顺序一致！）
 COCO65 = [
-    "person","bicycle","car","motorcycle","airplane","bus","train","truck","boat",
-    "traffic light","fire hydrant","stop sign","parking meter","bench",
+    "person","bicycle","car","motorcycle","airplane","bus","train","truck","boat","bench",
     "bird","cat","dog","horse","sheep","cow",
     "elephant","bear","zebra","giraffe",
     "backpack","umbrella","handbag","tie","suitcase",
-    "frisbee","skis","snowboard","sports ball","kite","baseball bat",
-    "baseball glove","skateboard","surfboard","tennis racket","bottle",
-    "wine glass","cup","fork","knife","spoon","bowl",
-    "banana","apple","sandwich","orange","broccoli","carrot",
-    "hot dog","pizza","donut","cake","chair","couch","potted plant","bed",
-    "dining table","toilet","tv","laptop","mouse"
+    "frisbee","skis","snowboard","kite","skateboard",
+    "surfboard","bottle","cup","fork","knife","spoon","bowl",
+    "banana","apple","sandwich","orange","broccoli","carrot","pizza","donut","cake",
+    "chair","couch","bed","toilet","tv","laptop","mouse","remote","keyboard",
+    "microwave","oven","toaster","sink","refrigerator","book","clock","vase",
+    "scissors","toothbrush"
 ]
 
 # 2) 把 ovd_coco 的两个 split 加到 COCO 注册表中（共用 coco meta，稍后强制覆盖）
