@@ -28,9 +28,9 @@ train = dict(
     # options for PeriodicCheckpointer, which saves a model checkpoint
     # after every `checkpointer.period` iterations,
     # and only `checkpointer.max_to_keep` number of checkpoint will be kept.
-    checkpointer=dict(period=500, max_to_keep=100),
+    checkpointer=dict(period=5000, max_to_keep=100),
     # Run evaluation after every `eval_period` number of iterations
-    eval_period=500,
+    eval_period=5000,
     # Output log to console every `log_period` number of iterations.
     log_period=20,
     device="cuda",
