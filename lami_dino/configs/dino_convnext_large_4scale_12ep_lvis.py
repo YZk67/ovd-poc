@@ -1,6 +1,7 @@
 from detrex.config import get_config
 from .models.dino_convnextl import model
 from datetime import datetime
+from copy import deepcopy
 
 # Remove 'language' key from model config as it's not a parameter for DINO.__init__()
 # The language config is only used for TextClassifier via ${..language.xxx} references
@@ -18,7 +19,7 @@ model.beta = 0.4
 model.novel_scale = 5.0
 
 # get default config
-dataloader = get_config("common/data/coco_detr.py").dataloader
+#dataloader = get_config("common/data/coco_detr.py").dataloader
 optimizer = get_config("common/optim.py").AdamW
 lr_multiplier = get_config("common/coco_schedule.py").lr_multiplier_12ep_warmup
 # lr_multiplier = get_config("common/lvis_schedule.py").lr_multiplier_12ep_64bs  # Use 64bs scheduler for batch size 64
@@ -92,32 +93,59 @@ optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in modul
 
 # modify dataloader config
 # Start with conservative setting, can be increased if stable
-dataloader.train.num_workers = 4  # 1 worker per GPU for 4GPU training
+#dataloader.train.num_workers = 4  # 1 worker per GPU for 4GPU training
 
 # please notice that this is total batch size.
 # surpose you're using 4 gpus for training and the batch size for
 # each gpu is 16/4 = 4
 # Note: Using Option 3 (averaged embeddings), batch_size can remain at 4
 # If using Option 2 (6015 queries), reduce to batch_size=1
-dataloader.train.total_batch_size = 16  # Can use 4 with Option 3
+#dataloader.train.total_batch_size = 16  # Can use 4 with Option 3
 
 # dump the testing results into output_dir for visualization
 #dataloader.evaluator.output_dir = train.output_dir
-dataloader.evaluator = [
-    get_config("common/data/coco_detr.py").dataloader.evaluator.clone(),
-    get_config("common/data/coco_detr.py").dataloader.evaluator.clone(),
-]
-#dataloader.test.dataset.names = ("ovcoco_2017_val_b", "ovcoco_2017_val_t")
-dataloader.test = [
-    get_config("common/data/coco_detr.py").dataloader.test.clone()
-]
-dataloader.test[0].dataset.names = "ovcoco_2017_val_b"
+dataloader = {}
 
-dataloader.test += [
-    get_config("common/data/coco_detr.py").dataloader.test.clone()
-]
-dataloader.test[1].dataset.names = "ovcoco_2017_val_t"
-dataloader.train.dataset.names = "ovcoco_2017_train_b"
+# ---- dataloader: train + two separate tests (no .clone()) ----
+_base_dl = get_config("common/data/coco_detr.py").dataloader
+
+# 训练集：从基模板拷一份，并改成 ov-coco base
+dataloader["train"] = deepcopy(_base_dl.train)
+dataloader["train"].dataset.names = "ovcoco_2017_train_b"
+dataloader["train"].num_workers = 4
+dataloader["train"].total_batch_size = 16  # 4卡×每卡4
+
+# 验证集1：base(48)
+tb = deepcopy(_base_dl.test)
+tb.dataset.names = "ovcoco_2017_val_b"
+tb.num_workers = 0   # 单进程评测更稳（可按需改）
+
+# 验证集2：novel(17)
+tt = deepcopy(_base_dl.test)
+tt.dataset.names = "ovcoco_2017_val_t"
+tt.num_workers = 0
+
+dataloader["test"] = [tb, tt]
+
+# evaluator：给一个就够，你的 do_test() 会在数量不匹配时复用
+dataloader["evaluator"] = get_config("common/data/coco_detr.py").dataloader.evaluator
+
+
+# dataloader.evaluator = [
+#     get_config("common/data/coco_detr.py").dataloader.evaluator.clone(),
+#     get_config("common/data/coco_detr.py").dataloader.evaluator.clone(),
+# ]
+#dataloader.test.dataset.names = ("ovcoco_2017_val_b", "ovcoco_2017_val_t")
+# dataloader.test = [
+#     get_config("common/data/coco_detr.py").dataloader.test.clone()
+# ]
+#dataloader.test[0].dataset.names = "ovcoco_2017_val_b"
+
+# dataloader.test += [
+#     get_config("common/data/coco_detr.py").dataloader.test.clone()
+# ]
+#dataloader.test[1].dataset.names = "ovcoco_2017_val_t"
+#dataloader["train"].dataset.names = "ovcoco_2017_train_b"
 
 # ====== Phase 1：测试 Claude Prompts 单独效果 ======
 # Fed Loss是LVIS必须的基础设施，所有实验都需要使用
