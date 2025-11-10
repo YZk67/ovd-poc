@@ -153,12 +153,12 @@ os.environ['OPENBLAS_NUM_THREADS'] = '1'
 os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
 os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'OFF'
 
-from detectron2.config import CfgNode as CN
-if not hasattr(model, "cfg_overrides"):
-    model.cfg_overrides = CN()
-model.cfg_overrides.DATASETS = CN()
-model.cfg_overrides.DATASETS.TRAIN = ("ovcoco_2017_train_b",)
-model.cfg_overrides.DATASETS.TEST  = ("ovcoco_2017_val_b", "ovcoco_2017_val_t")
+# from detectron2.config import CfgNode as CN
+# if not hasattr(model, "cfg_overrides"):
+#     model.cfg_overrides = CN()
+# model.cfg_overrides.DATASETS = CN()
+# model.cfg_overrides.DATASETS.TRAIN = ("ovcoco_2017_train_b",)
+# model.cfg_overrides.DATASETS.TEST  = ("ovcoco_2017_val_b", "ovcoco_2017_val_t")
 
 from detectron2.data import MetadataCatalog
 import numpy as np
