@@ -213,8 +213,8 @@ def register_all_coco(root):
                 meta.evaluator_type = "coco"
                 jf = meta.json_file
                 # 你的 id 映射逻辑不变
-                id_map = _ovcoco_build_id_map(jf)
-                meta.thing_dataset_id_to_contiguous_id = id_map
+                #id_map = _ovcoco_build_id_map(jf)
+                #meta.thing_dataset_id_to_contiguous_id = id_map
 
 
     for (
