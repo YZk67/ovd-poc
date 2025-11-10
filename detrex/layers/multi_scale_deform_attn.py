@@ -324,19 +324,43 @@ class MultiScaleDeformableAttention(nn.Module):
                     reference_points.shape[-1]
                 )
             )
+        # if torch.cuda.is_available() and value.is_cuda:
+        #     output = MultiScaleDeformableAttnFunction.apply(
+        #         value,
+        #         spatial_shapes,
+        #         level_start_index,
+        #         sampling_locations,
+        #         attention_weights,
+        #         self.im2col_step,
+        #     )
+        # else:
+        #     output = multi_scale_deformable_attn_pytorch(
+        #         value, spatial_shapes, sampling_locations, attention_weights
+        #     )
+
+                # --- Only this op runs in FP32; keep global AMP elsewhere ---
+        orig_dtype = value.dtype
         if torch.cuda.is_available() and value.is_cuda:
-            output = MultiScaleDeformableAttnFunction.apply(
-                value,
-                spatial_shapes,
-                level_start_index,
-                sampling_locations,
-                attention_weights,
-                self.im2col_step,
-            )
+            with torch.cuda.amp.autocast(enabled=False):
+                output = MultiScaleDeformableAttnFunction.apply(
+                    value.float(),
+                    spatial_shapes,              # int tensor, keep dtype
+                    level_start_index,           # int tensor, keep dtype
+                    sampling_locations.float(),
+                    attention_weights.float(),
+                    self.im2col_step,
+                )
+            output = output.to(orig_dtype)
         else:
-            output = multi_scale_deformable_attn_pytorch(
-                value, spatial_shapes, sampling_locations, attention_weights
+            # CPU / fallback path：也用 FP32 计算，再转回
+            out32 = multi_scale_deformable_attn_pytorch(
+                value.float(),
+                spatial_shapes,
+                sampling_locations.float(),
+                attention_weights.float(),
             )
+            output = out32.to(orig_dtype)
+
 
         output = self.output_proj(output)
 
