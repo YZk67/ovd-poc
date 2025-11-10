@@ -84,7 +84,7 @@ model.eval_query_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl.npy"
 # modify optimizer config
 # 假设你单卡用 1e-4 (1GPU); 1e-4 使用原来成功的学习率
 base_lr = 1e-4
-world_size = 1  # GPU 数
+world_size = 4  # GPU 数
 optimizer.lr = base_lr * world_size
 optimizer.betas = (0.9, 0.999)
 optimizer.weight_decay = 1e-4
