@@ -48,7 +48,7 @@ train.output_dir = f"/root/dino_convnext_large_ovcoco65_{timestamp}"
 # - Batch size 64: 100,170 ÷ 64 = 1,565 iter/epoch → 18,780 total (12 epochs)
 # - Standardized values: 7,100 (bs16), 3,550 (bs32), 1,775 (bs64)
 # - LR scheduler: use lr_multiplier_12ep_warmup for batch size 32
-train.max_iter = 88700 #85200  # Single GPU A100 4 epochs 12 epochs with batch size 32: 100170/32*12 -- 85200
+train.max_iter = 85200 #85200  # Single GPU A100 4 epochs 12 epochs with batch size 32: 100170/32*12 -- 85200
 
 # run evaluation every 3130 iters
 train.eval_period = 99999999  # Evaluate after each epoch 7100//2
@@ -57,7 +57,7 @@ train.eval_period = 99999999  # Evaluate after each epoch 7100//2
 train.log_period = 50
 
 # save checkpoint every 3130 iters
-train.checkpointer.period = 7400  # 1 epoch worth of iterations
+train.checkpointer.period = 7100  # 1 epoch worth of iterations
 
 # gradient clipping for training
 train.clip_grad.enabled = True
@@ -70,7 +70,7 @@ train.sync_batchnorm = True
 train.device = "cuda"
 model.device = train.device
 
-model.num_classes = 65
+model.num_classes = 1203
 # Set the text embedding paths for TPA (using Claude-generated 8 prompts per class)
 model.query_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl.npy"
 model.eval_query_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl.npy"
