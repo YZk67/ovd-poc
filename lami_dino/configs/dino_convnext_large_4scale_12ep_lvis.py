@@ -128,7 +128,17 @@ tt.num_workers = 0
 dataloader["test"] = [tb, tt]
 
 # evaluator：给一个就够，你的 do_test() 会在数量不匹配时复用
-dataloader["evaluator"] = get_config("common/data/coco_detr.py").dataloader.evaluator
+#dataloader["evaluator"] = get_config("common/data/coco_detr.py").dataloader.evaluator
+# evaluator：为每个 test 显式指定 dataset_name，避免插值到 list
+_base_ev = _base_dl.evaluator
+ev_b = deepcopy(_base_ev)
+ev_b.dataset_name = "ovcoco_2017_val_b"
+
+ev_t = deepcopy(_base_ev)
+ev_t.dataset_name = "ovcoco_2017_val_t"
+
+dataloader["evaluator"] = [ev_b, ev_t]
+
 
 
 # dataloader.evaluator = [
