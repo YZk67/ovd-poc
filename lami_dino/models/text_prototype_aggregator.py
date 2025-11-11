@@ -78,26 +78,20 @@ class TextPrototypeAggregator(nn.Module):
         
         # Improved initialization for prototype_queries to encourage diversity
         # Use orthogonal initialization to make initial queries more diverse
+        # Note: Simplified to avoid QR decomposition issues - use xavier with different seeds
         if self.num_prototypes == 1:
             nn.init.xavier_uniform_(self.prototype_queries)
         else:
-            # Initialize with orthogonal vectors to encourage different prototypes
-            # to attend to different aspects from the start
+            # Initialize with xavier but ensure different initial values
+            # This is simpler and more reliable than QR decomposition
+            nn.init.xavier_uniform_(self.prototype_queries)
+            # Add small random perturbations to encourage diversity
             with torch.no_grad():
-                # Generate orthogonal vectors
-                if self.prototype_queries.shape[0] <= self.prototype_queries.shape[1]:
-                    # Use QR decomposition for orthogonal initialization
-                    init_queries = torch.randn(self.num_prototypes, self.prototype_queries.shape[1])
-                    # Use torch.linalg.qr for PyTorch 1.9+, fallback to torch.qr for older versions
-                    try:
-                        Q, R = torch.linalg.qr(init_queries)
-                    except AttributeError:
-                        Q, R = torch.qr(init_queries)
-                    # Normalize and scale
-                    self.prototype_queries.data = Q * 0.1  # Small initial scale
-                else:
-                    # Fallback to xavier if more prototypes than dimensions
-                    nn.init.xavier_uniform_(self.prototype_queries)
+                # Add small orthogonal-like perturbations
+                noise = torch.randn_like(self.prototype_queries) * 0.01
+                self.prototype_queries.data += noise
+                # Normalize to prevent initial values from being too large
+                self.prototype_queries.data = F.normalize(self.prototype_queries.data, p=2, dim=1) * 0.1
 
     # === lambda warmup ===
     def _effective_lambdas(self) -> Tuple[float, float]:
