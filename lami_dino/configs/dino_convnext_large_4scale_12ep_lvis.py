@@ -133,6 +133,23 @@ ta.dataset.names = "ovcoco_2017_val_all"   # 统一 65 类评测
 ta.num_workers = 0
 dataloader["test"] = ta
 
+# ★★★ 关键：给出 evaluator（否则会评成 {}）
+dataloader["evaluator"] = deepcopy(_base_dl.evaluator)
+# 有些 LazyConfig 里 evaluator 需要 dataset_name
+#（如果你的 _base_dl.evaluator 是 CocoEvaluator 风格，这行可有可无）
+try:
+    dataloader["evaluator"].dataset_name = "ovcoco_2017_val_all"
+except Exception:
+    pass
+# 指定输出目录，方便保存 metrics.json
+dataloader["evaluator"].output_dir = train.output_dir
+
+# —— 一致性断言，避免 silent failure —— #
+from detectron2.data import MetadataCatalog
+import numpy as np
+_meta = MetadataCatalog.get("ovcoco_2017_val_all")
+assert len(_meta.thing_classes) == 65, "ovcoco_2017_val_all 的 thing_classes 不是 65！"
+assert np.load(model.eval_query_path).shape[0] == 65, "eval_text_embed 的 .npy 行数不是 65！"
 
 # evaluator：给一个就够，你的 do_test() 会在数量不匹配时复用
 #dataloader["evaluator"] = get_config("common/data/coco_detr.py").dataloader.evaluator
