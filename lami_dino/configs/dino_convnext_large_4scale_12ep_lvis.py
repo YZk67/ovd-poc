@@ -70,7 +70,7 @@ train.output_dir = f"/root/dino_convnext_large_ovcoco65_{timestamp}"
 train.max_iter = 88700 #85200  # Single GPU A100 4 epochs 12 epochs with batch size 32: 100170/32*12 -- 85200
 
 # run evaluation every 3130 iters
-train.eval_period = 500  # Evaluate after each epoch 7100//2
+train.eval_period = 5000  # Evaluate after each epoch 7100//2
 
 # log training infomation every 20 iters
 train.log_period = 50
