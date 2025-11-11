@@ -1,0 +1,162 @@
+"""
+COCO Zero-Shot训练配置文件模板
+
+从LVIS训练配置转换而来，主要修改：
+1. 类别数量：1203 -> 80
+2. 数据集：lvis_v1_train_norare -> zeroshot_coco_2017_train
+3. 类别列表：lvis_v1_seen_classes.json -> coco_seen_classes.json
+4. 文本embeddings：lvis_claude_prompts -> coco_claude_prompts
+5. 评估器：LVISEvaluator -> COCOEvaluator
+6. Fed Loss：通常不需要（COCO类别数少）
+
+使用方法：
+1. 复制此文件为 dino_convnext_large_4scale_12ep_coco_zeroshot.py
+2. 修改路径和参数
+3. 运行训练
+"""
+
+from detrex.config import get_config
+from .models.dino_convnextl import model
+from datetime import datetime
+
+# Remove 'language' key from model config
+if "language" in model:
+    del model["language"]
+
+# ====== 1. 文本Embedding路径（需要修改） ======
+model.vlm_query_path = "dataset/metadata/coco_visual_desc_convnextl.npy"  # 改为COCO
+model.score_ensemble = True
+model.backbone.score_ensemble = model.score_ensemble
+
+# ====== 2. 类别列表路径（需要修改） ======
+model.seen_classes = 'dataset/coco/coco_seen_classes.json'      # 48个base类
+model.all_classes = 'dataset/coco/coco_all_classes.json'        # 80个所有类
+# model.unseen_classes = 'dataset/coco/coco_unseen_classes.json'  # 可选：17个novel类
+
+model.vlm_temperature = 100.0
+model.alpha = 0.0
+model.beta = 0.4
+model.novel_scale = 5.0
+
+# ====== 3. 数据加载器（需要修改） ======
+dataloader = get_config("common/data/coco_zeroshot_detr.py").dataloader  # 使用COCO zero-shot配置
+optimizer = get_config("common/optim.py").AdamW
+lr_multiplier = get_config("common/coco_schedule.py").lr_multiplier_12ep_warmup  # 使用COCO schedule
+train = get_config("common/train.py").train
+
+# ====== 4. 训练配置 ======
+train.seed = 42
+
+# 预训练模型路径（需要修改）
+train.init_checkpoint = "./pretrained_models/your_pretrained_model.pth"  # 可能需要修改
+
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+train.output_dir = f"/path/to/output/coco_zeroshot_{timestamp}"  # 需要修改输出路径
+
+# ====== 5. 训练迭代次数（COCO有118K训练图片） ======
+# COCO: 118,287 training images
+# Batch size 32: 118,287 ÷ 32 = 3,696 iter/epoch
+# 12 epochs: 3,696 × 12 = 44,352 iterations
+train.max_iter = 44352  # 12 epochs with batch size 32
+train.eval_period = 3696  # 每个epoch评估一次
+train.log_period = 50
+train.checkpointer.period = 3696  # 每个epoch保存一次
+
+# ====== 6. 梯度裁剪 ======
+train.clip_grad.enabled = True
+train.clip_grad.params.max_norm = 0.1
+train.clip_grad.params.norm_type = 2
+
+train.sync_batchnorm = True
+
+# ====== 7. 设备配置 ======
+train.device = "cuda"
+model.device = train.device
+
+# ====== 8. 类别数量（重要！改为80） ======
+model.num_classes = 80  # COCO有80个类别（不是1203）
+
+# ====== 9. 文本Embedding路径（需要修改） ======
+model.query_path = "dataset/metadata/coco_claude_prompts_convnextl.npy"
+model.eval_query_path = "dataset/metadata/coco_claude_prompts_convnextl.npy"
+
+# ====== 10. Fed Loss配置（COCO通常不需要） ======
+# COCO类别数量少（80类），通常不需要Fed Loss
+# 但如果想保持一致性，可以保留
+model.use_fed_loss = False  # COCO不需要Fed Loss（可以改为True如果需要）
+# model.use_fed_loss = True
+# model.fed_loss_num_cat = 50  # 如果启用，设置为较小的值
+model.cluster_fed_loss = False
+# model.cat_freq_path = "dataset/coco/coco_cat_info.json"  # 如果需要Fed Loss
+model.select_box_nums_for_evaluation = 100  # COCO默认是100
+
+# ====== 11. TPA配置 ======
+model.classifier.use_tpa = True
+model.classifier.text_embed_path = "dataset/metadata/coco_claude_prompts_convnextl.npy"
+model.classifier.eval_text_embed_path = "dataset/metadata/coco_claude_prompts_convnextl.npy"
+model.classifier.tpa_num_prototypes = 5
+model.classifier.tpa_hidden_dim = 256
+model.classifier.tpa_dropout = 0.05
+model.classifier.tpa_tau = 0.07
+model.classifier.tpa_log_interval = 200
+
+# ====== 12. Soft Attention配置 ======
+model.use_soft_attention = True
+model.soft_attention_tau = 0.08
+
+# ====== 13. RPSA配置（如果使用） ======
+model.transformer.use_rpsa = True
+model.criterion.weight_dict["loss_rpsa"] = 0.05
+model.transformer.rpsa_module.K = 8
+model.transformer.rpsa_module.tau_align = 0.06
+model.transformer.rpsa_module.sigma = 1.0
+model.transformer.rpsa_module.bg_thresh = 0.05
+model.transformer.rpsa_module.bg_percentile = 0.60
+model.transformer.rpsa_module.subsample_tokens = 2048
+model.transformer.rpsa_module.subsample_method = "confidence"
+model.transformer.rpsa_module.detach_pi = False
+model.transformer.rpsa_module.stop_grad_vision = False
+model.transformer.rpsa_module.stop_grad_text = False
+model.transformer.rpsa_token_topk = 1024
+model.transformer.rpsa_confidence_threshold = 0.3
+model.transformer.rpsa_warmup_start = 20000
+model.transformer.rpsa_warmup_iters = 8000
+model.transformer.rpsa_warmup_init_scale = 0.0
+model.transformer.rpsa_warmup_power = 1.0
+
+# ====== 14. 优化器配置 ======
+base_lr = 1e-4
+world_size = 1.5  # GPU数量
+optimizer.lr = base_lr * world_size
+optimizer.betas = (0.9, 0.999)
+optimizer.weight_decay = 1e-4
+optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 1
+
+# ====== 15. 数据加载器配置 ======
+dataloader.train.num_workers = 4
+dataloader.train.total_batch_size = 16  # 可以根据GPU数量调整
+
+# ====== 16. 评估器配置 ======
+dataloader.evaluator.output_dir = train.output_dir
+dataloader.test.dataset.names = "zeroshot_coco_2017_val"  # Zero-shot验证集
+
+# ====== 17. AMP配置 ======
+train.amp.enabled = True
+
+# ====== 18. 多进程稳定性配置 ======
+import torch.multiprocessing as mp
+import os
+
+try:
+    mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass
+
+os.environ['PYTHONUNBUFFERED'] = '1'
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['NUMEXPR_NUM_THREADS'] = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
+os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'OFF'
+
