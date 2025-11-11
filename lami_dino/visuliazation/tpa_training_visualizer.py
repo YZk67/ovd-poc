@@ -437,9 +437,8 @@ def load_model_from_checkpoint(checkpoint_path: str, config_path: str):
     Returns:
         model: 加载的模型
     """
-    from detectron2.config import LazyConfig
+    from detectron2.config import LazyConfig, instantiate
     from detectron2.checkpoint import DetectionCheckpointer
-    from detrex.config import instantiate
     
     # 加载配置
     cfg = LazyConfig.load(config_path)

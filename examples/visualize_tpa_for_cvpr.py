@@ -66,9 +66,8 @@ class TPAVisualizerForCVPR:
                 - class_names: 类别名称列表
                 - selected_indices: 选定的10个类别的索引
         """
-        from detectron2.config import LazyConfig
+        from detectron2.config import LazyConfig, instantiate
         from detectron2.checkpoint import DetectionCheckpointer
-        from detrex.config import instantiate
         
         print("[Info] Loading model...")
         cfg = LazyConfig.load(config_path)
