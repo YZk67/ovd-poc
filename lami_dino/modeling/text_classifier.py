@@ -35,6 +35,7 @@ class TextClassifier(nn.Module):
         tpa_log_interval: int = 200,
         tpa_lambda_orth: float = 0.10,
         tpa_lambda_div: float = 0.03,
+        tpa_warmup_steps: Optional[int] = None,
     ) -> None:
         super().__init__()
 
@@ -81,6 +82,7 @@ class TextClassifier(nn.Module):
                 log_interval=tpa_log_interval,
                 lambda_orth=tpa_lambda_orth,
                 lambda_div=tpa_lambda_div,
+                warmup_steps=tpa_warmup_steps,  # Pass warmup_steps if provided
             )
             self.num_prototypes = tpa_num_prototypes
             self._cached_eval = None

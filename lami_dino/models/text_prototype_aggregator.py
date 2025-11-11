@@ -7,9 +7,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# 假设 total_iters = cfg.train.max_iter = 85200
+# Default warmup configuration
+# Note: warmup_steps should be set via config, not hardcoded
+# Default warmup_ratio = 0.05 (5% of max_iter)
+# For max_iter=92300, warmup_steps should be ~4615
 warmup_ratio = 0.05  # 5% 标准档
-warmup_steps = int(85200 * warmup_ratio)  # ≈ 4300
+# Default warmup_steps (will be overridden by config)
+# This is a fallback value, should be set via tpa_warmup_steps in config
+warmup_steps = int(92300 * warmup_ratio)  # ≈ 4615 (updated default)
 
 
 def _is_main_process() -> bool:

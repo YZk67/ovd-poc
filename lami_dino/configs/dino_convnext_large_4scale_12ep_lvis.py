@@ -119,6 +119,8 @@ model.classifier.tpa_log_interval = 200
 # Fixed diversity loss hyperparameters (after fixing diversity loss implementation)
 model.classifier.tpa_lambda_orth = 0.20  # Increased from 0.10 for better orthogonality
 model.classifier.tpa_lambda_div = 0.12  # Increased from 0.03 for better diversity (4x increase)
+# TPA warmup configuration: 5% of max_iter (92300 * 0.05 = 4615)
+model.classifier.tpa_warmup_steps = int(92300 * 0.05)  # 4615 steps (~0.74 epochs)
 
 # Query initialization: Soft-attention aggregation parameters for multi-prototype query initialization
 model.use_soft_attention = True  # Enable soft-attention aggregation in query initialization
