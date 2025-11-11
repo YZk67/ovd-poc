@@ -197,7 +197,7 @@ def register_all_coco(root):
         for key, (image_root, json_file) in splits_per_dataset.items():
             # Assume pre-defined datasets live in `./datasets`.
             # 对 ovcoco_*：不要用 _get_builtin_metadata("coco")，避免先被写成 80 类
-            use_meta = {} if key.startswith("ovcoco_2017_") else _get_builtin_metadata(dataset_name)
+            #use_meta = {} if key.startswith("ovcoco_2017_") else _get_builtin_metadata(dataset_name)
 
             register_coco_instances(
                 key,
@@ -207,15 +207,17 @@ def register_all_coco(root):
             )
 
             if key.startswith("ovcoco_2017_"):
-                # 仅当尚未设置过时再写 65 类，避免断言
-                _safe_set_thing_classes(key, COCO65)
-
                 meta = MetadataCatalog.get(key)
                 meta.evaluator_type = "coco"
+
+                # ✅ 仅对 'all(65)' 的 split 设 65 类；其余交给 JSON 自己决定（48/17）
+                if key.endswith("_val_all") or key.endswith("_train_all"):
+                    _safe_set_thing_classes(key, COCO65)
+
                 jf = meta.json_file
-                # 你的 id 映射逻辑不变
                 id_map = _ovcoco_build_id_map(jf)
                 meta.thing_dataset_id_to_contiguous_id = id_map
+
 
 
     for (
