@@ -214,9 +214,9 @@ def register_all_coco(root):
                 if key.endswith("_val_all") or key.endswith("_train_all"):
                     _safe_set_thing_classes(key, COCO65)
 
-                jf = meta.json_file
-                id_map = _ovcoco_build_id_map(jf)
-                meta.thing_dataset_id_to_contiguous_id = id_map
+                #jf = meta.json_file
+                #id_map = _ovcoco_build_id_map(jf)
+                #meta.thing_dataset_id_to_contiguous_id = id_map
 
 
 
