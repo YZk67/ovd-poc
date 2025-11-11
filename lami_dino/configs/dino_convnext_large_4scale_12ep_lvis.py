@@ -125,7 +125,7 @@ tt = deepcopy(_base_dl.test)
 tt.dataset.names = "ovcoco_2017_val_t"
 tt.num_workers = 0
 
-dataloader["test"] = [tb, tt]
+dataloader["test"] = tt
 
 # evaluator：给一个就够，你的 do_test() 会在数量不匹配时复用
 #dataloader["evaluator"] = get_config("common/data/coco_detr.py").dataloader.evaluator
