@@ -18,6 +18,25 @@ model.alpha = 0.0
 model.beta = 0.4
 model.novel_scale = 5.0
 
+# --- 1) 确保注册代码被执行（很关键，不然 Dataset/Metadata 都是空的） ---
+try:
+    import lami_dino.data.builtin as _ov_builtin  # 按你项目实际注册模块路径
+except Exception:
+    pass
+
+# --- 2) 若 metadata 为空，用 all_classes.json 手动补上 thing_classes ---
+import json
+from detectron2.data import MetadataCatalog, DatasetCatalog
+
+assert "ovcoco_2017_val_all" in DatasetCatalog.list(), "未注册 ovcoco_2017_val_all（检查 builtin 注册是否被导入）"
+
+_meta = MetadataCatalog.get("ovcoco_2017_val_all")
+if not hasattr(_meta, "thing_classes") or not _meta.thing_classes:
+    with open(model.all_classes, "r") as f:
+        names = json.load(f)  # 期望为 65 个类名，顺序要与你的 .npy 一致
+    assert len(names) == 65, "all_classes.json 中的类数不是 65！"
+    _meta.thing_classes = names  # ★ 填入 65 类，解除后续断言/评测报错
+
 # get default config
 #dataloader = get_config("common/data/coco_detr.py").dataloader
 optimizer = get_config("common/optim.py").AdamW
