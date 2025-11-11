@@ -116,16 +116,23 @@ dataloader["train"].num_workers = 4
 dataloader["train"].total_batch_size = 16  # 4卡×每卡4
 
 # 验证集1：base(48)
-tb = deepcopy(_base_dl.test)
-tb.dataset.names = "ovcoco_2017_val_b"
-tb.num_workers = 0   # 单进程评测更稳（可按需改）
+# tb = deepcopy(_base_dl.test)
+# tb.dataset.names = "ovcoco_2017_val_b"
+# tb.num_workers = 0   # 单进程评测更稳（可按需改）
 
-# 验证集2：novel(17)
-tt = deepcopy(_base_dl.test)
-tt.dataset.names = "ovcoco_2017_val_t"
-tt.num_workers = 0
+# # 验证集2：novel(17)
+# tt = deepcopy(_base_dl.test)
+# tt.dataset.names = "ovcoco_2017_val_t"
+# tt.num_workers = 0
 
-dataloader["test"] = tt
+# dataloader["test"] = tt
+
+# 验证集：all(65)
+ta = deepcopy(_base_dl.test)
+ta.dataset.names = "ovcoco_2017_val_all"   # 统一 65 类评测
+ta.num_workers = 0
+dataloader["test"] = ta
+
 
 # evaluator：给一个就够，你的 do_test() 会在数量不匹配时复用
 #dataloader["evaluator"] = get_config("common/data/coco_detr.py").dataloader.evaluator
