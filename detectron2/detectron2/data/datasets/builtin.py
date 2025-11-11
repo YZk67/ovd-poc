@@ -71,6 +71,7 @@ _PREDEFINED_SPLITS_COCO["coco"].update({
     "ovcoco_2017_train_t":   ("coco/train2017", "coco/annotations/ovd_ins_train2017_t.json"),  # 一般不用训练
     "ovcoco_2017_val_b":     ("coco/val2017",   "coco/annotations/ovd_ins_val2017_b.json"),
     "ovcoco_2017_val_t":     ("coco/val2017",   "coco/annotations/ovd_ins_val2017_t.json"),
+    "ovcoco_2017_val_all": ("coco/val2017", "coco/annotations/ovd_ins_val2017_all.json"),
 })
 
 def _ovcoco_build_id_map(json_path):
@@ -207,14 +208,14 @@ def register_all_coco(root):
 
             if key.startswith("ovcoco_2017_"):
                 # 仅当尚未设置过时再写 65 类，避免断言
-                #_safe_set_thing_classes(key, COCO65)
+                _safe_set_thing_classes(key, COCO65)
 
                 meta = MetadataCatalog.get(key)
                 meta.evaluator_type = "coco"
                 jf = meta.json_file
                 # 你的 id 映射逻辑不变
                 id_map = _ovcoco_build_id_map(jf)
-                #meta.thing_dataset_id_to_contiguous_id = id_map
+                meta.thing_dataset_id_to_contiguous_id = id_map
 
 
     for (
