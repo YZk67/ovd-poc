@@ -53,6 +53,7 @@ class TPAVisualizerForCVPR:
         checkpoint_path: str,
         config_path: str,
         prompts_json_path: str,
+        text_embed_path: Optional[str] = None,
     ) -> Dict:
         """
         加载模型并提取TPA相关数据
@@ -85,7 +86,21 @@ class TPAVisualizerForCVPR:
         tpa = text_classifier.tpa
         
         # 获取原始text embeddings
-        text_feats = text_classifier.train_text_feats  # [C, N, D]
+        # 优先使用指定的npy文件，否则使用模型已加载的
+        if text_embed_path and Path(text_embed_path).exists():
+            print(f"[Info] Loading text embeddings from: {text_embed_path}")
+            text_feats_raw = np.load(text_embed_path)
+            if text_feats_raw.ndim == 2:
+                text_feats_raw = text_feats_raw[:, None, :]  # [C, 1, D] -> [C, N, D]
+            text_feats = torch.from_numpy(text_feats_raw).to(dtype=torch.float32)
+            print(f"[Info] Loaded text embeddings shape: {text_feats.shape}")
+        else:
+            # 从模型获取（模型初始化时已从npy文件加载）
+            text_feats = text_classifier.train_text_feats  # [C, N, D]
+            if text_embed_path:
+                print(f"[Warning] Text embed path {text_embed_path} not found, using model's loaded embeddings")
+            else:
+                print(f"[Info] Using text embeddings from model (loaded from config)")
         
         # 确保text_feats在正确的设备上
         device = next(model.parameters()).device
@@ -385,6 +400,7 @@ class TPAVisualizerForCVPR:
         checkpoint_path: str,
         config_path: str,
         prompts_json_path: str,
+        text_embed_path: Optional[str] = None,
     ):
         """创建所有可视化"""
         print("=" * 70)
@@ -393,7 +409,7 @@ class TPAVisualizerForCVPR:
         
         # 加载数据
         data = self.load_model_and_extract_data(
-            checkpoint_path, config_path, prompts_json_path
+            checkpoint_path, config_path, prompts_json_path, text_embed_path
         )
         
         # 1. Attention热力图
@@ -460,6 +476,13 @@ def main():
         help="Path to prompts JSON file"
     )
     parser.add_argument(
+        "--text-embed",
+        type=str,
+        default=None,
+        help="Path to text embeddings npy file (e.g., dataset2/metadata/lvis_claude_prompts_convnextl.npy). "
+             "If not provided, will use embeddings loaded by the model."
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default="tpa_cvpr_visualizations",
@@ -473,6 +496,7 @@ def main():
         checkpoint_path=args.checkpoint,
         config_path=args.config,
         prompts_json_path=args.prompts_json,
+        text_embed_path=args.text_embed,
     )
 
 

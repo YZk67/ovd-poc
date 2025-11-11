@@ -33,6 +33,8 @@ class TextClassifier(nn.Module):
         tpa_dropout: float = 0.1,
         tpa_tau: float = 0.1,
         tpa_log_interval: int = 200,
+        tpa_lambda_orth: float = 0.10,
+        tpa_lambda_div: float = 0.03,
     ) -> None:
         super().__init__()
 
@@ -77,6 +79,8 @@ class TextClassifier(nn.Module):
                 dropout=tpa_dropout,
                 tau=tpa_tau,
                 log_interval=tpa_log_interval,
+                lambda_orth=tpa_lambda_orth,
+                lambda_div=tpa_lambda_div,
             )
             self.num_prototypes = tpa_num_prototypes
             self._cached_eval = None

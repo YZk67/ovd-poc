@@ -75,7 +75,29 @@ class TextPrototypeAggregator(nn.Module):
         nn.init.constant_(self.key_proj.bias, 0.0)
         nn.init.xavier_uniform_(self.value_proj.weight)
         nn.init.constant_(self.value_proj.bias, 0.0)
-        nn.init.xavier_uniform_(self.prototype_queries)
+        
+        # Improved initialization for prototype_queries to encourage diversity
+        # Use orthogonal initialization to make initial queries more diverse
+        if self.num_prototypes == 1:
+            nn.init.xavier_uniform_(self.prototype_queries)
+        else:
+            # Initialize with orthogonal vectors to encourage different prototypes
+            # to attend to different aspects from the start
+            with torch.no_grad():
+                # Generate orthogonal vectors
+                if self.prototype_queries.shape[0] <= self.prototype_queries.shape[1]:
+                    # Use QR decomposition for orthogonal initialization
+                    init_queries = torch.randn(self.num_prototypes, self.prototype_queries.shape[1])
+                    # Use torch.linalg.qr for PyTorch 1.9+, fallback to torch.qr for older versions
+                    try:
+                        Q, R = torch.linalg.qr(init_queries)
+                    except AttributeError:
+                        Q, R = torch.qr(init_queries)
+                    # Normalize and scale
+                    self.prototype_queries.data = Q * 0.1  # Small initial scale
+                else:
+                    # Fallback to xavier if more prototypes than dimensions
+                    nn.init.xavier_uniform_(self.prototype_queries)
 
     # === lambda warmup ===
     def _effective_lambdas(self) -> Tuple[float, float]:
@@ -142,12 +164,36 @@ class TextPrototypeAggregator(nn.Module):
 
     # === diversity term ===
     def _diversity_term(self, logits: torch.Tensor) -> torch.Tensor:
+        """
+        Encourage different prototypes to attend to different prompts.
+        Minimize the similarity between attention distributions of different prototypes.
+        
+        Previous version encouraged uniform usage frequency but not diverse attention patterns.
+        This version directly penalizes similarity between prototypes' attention distributions.
+        """
         C, K, N = logits.shape
-        w = torch.softmax(logits, dim=1)
-        votes = w.sum(dim=-1)
-        p = votes / (votes.sum(dim=1, keepdim=True) + 1e-8)
-        entropy = -(p * (p.clamp_min(1e-8)).log()).sum(dim=1) / math.log(K)
-        return entropy.mean()
+        w = torch.softmax(logits, dim=1)  # [C, K, N] - attention weights
+        
+        # For each class, compute similarity between different prototypes' attention distributions
+        diversity_loss = 0.0
+        for c in range(C):
+            attn_c = w[c]  # [K, N] - attention distributions for all prototypes of this class
+            
+            # Normalize attention distributions
+            attn_norm = F.normalize(attn_c, p=2, dim=1)  # [K, N]
+            
+            # Compute pairwise cosine similarity between prototypes' attention distributions
+            similarity_matrix = torch.mm(attn_norm, attn_norm.t())  # [K, K]
+            
+            # Only consider off-diagonal elements (similarity between different prototypes)
+            mask = ~torch.eye(K, dtype=bool, device=similarity_matrix.device)
+            off_diag_similarities = similarity_matrix[mask]
+            
+            # Minimize similarity = maximize diversity
+            # We want off-diagonal similarities to be close to 0 (different attention patterns)
+            diversity_loss += off_diag_similarities.mean()
+        
+        return diversity_loss / C
 
     # === bookkeeping ===
     def _store_loss_terms(self, loss_orth, loss_div, apr_loss, lam_orth, lam_div):
