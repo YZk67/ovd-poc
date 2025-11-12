@@ -170,6 +170,42 @@ _meta = MetadataCatalog.get("ovcoco_2017_val_all")
 assert len(_meta.thing_classes) == 65, "ovcoco_2017_val_all 的 thing_classes 不是 65！"
 assert np.load(model.eval_query_path).shape[0] == 65, "eval_text_embed 的 .npy 行数不是 65！"
 
+# —— 训练/评测类别顺序自检与对齐 —— #
+# 放在你两个断言之后：
+#   assert len(_meta.thing_classes) == 65
+#   assert np.load(model.eval_query_path).shape[0] == 65
+
+# 1) 触发加载，拿到 train_b 的真实顺序（长度=48）
+_ = DatasetCatalog.get("ovcoco_2017_train_b")
+tc_train = MetadataCatalog.get("ovcoco_2017_train_b").thing_classes  # 训练端 48 类名（顺序=Detectron2的连续 id 0..47）
+
+# 2) 读取全局 65 顺序（与你 .npy 行顺序一致）
+with open(model.all_classes, "r") as f:
+    coco65 = json.load(f)
+assert len(coco65) == 65
+
+# 3) 构造 “训练48类 -> 65类下标” 映射
+name2idx65 = {n: i for i, n in enumerate(coco65)}
+try:
+    train48_to_65 = [name2idx65[n] for n in tc_train]  # len=48
+except KeyError as e:
+    raise ValueError(f"[类名不匹配] {e}. 请确保 train_b JSON 的类名与 all_classes(=COCO65) 完全一致（空格/连字符/大小写）。")
+
+# 4) 将映射交给模型/分类头（按你的代码结构，这里放到 model/classifier 最稳妥）
+model.classifier.train_class_indices = train48_to_65   # 训练时只取这 48 列进行监督
+model.classifier.eval_class_indices  = list(range(65)) # 评测时走全 65 列
+model.label_map_48to65               = {i:k for i,k in enumerate(train48_to_65)}  # 可供 loss/可视化使用
+
+# （可选）如果你在别处读取 seen_classes.json 来切 .npy，
+# 建议把 seen 改成与 tc_train 完全一致，避免顺序错位：
+try:
+    with open(model.seen_classes, "r") as f:
+        seen_list = json.load(f)
+    if seen_list != tc_train:
+        print("[WARN] seen_classes.json 的顺序 ≠ 训练端实际顺序；建议用 tc_train 覆盖或统一以 tc_train 为准。")
+except Exception:
+    pass
+
 # evaluator：给一个就够，你的 do_test() 会在数量不匹配时复用
 #dataloader["evaluator"] = get_config("common/data/coco_detr.py").dataloader.evaluator
 
