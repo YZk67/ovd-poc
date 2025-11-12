@@ -7,20 +7,20 @@ from datetime import datetime
 if "language" in model:
     del model["language"]
 
-model.vlm_query_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl.npy"
+model.vlm_query_path = "dataset/metadata/lvis_visual_desc_confuse_lvis_convnextl.npy"
 model.score_ensemble = True
 model.backbone.score_ensemble = model.score_ensemble
-model.seen_classes = None
-model.all_classes = None
+model.seen_classes = 'dataset/lvis/lvis_v1_seen_classes.json'
+model.all_classes = 'dataset/lvis/lvis_v1_all_classes.json'
 model.vlm_temperature = 100.0 # keep same with f-vlm
 model.alpha = 0.0
 model.beta = 0.4
 model.novel_scale = 5.0
 
 # get default config
-dataloader = get_config("common/data/coco_detr.py").dataloader
+dataloader = get_config("common/data/lvis_detr.py").dataloader
 optimizer = get_config("common/optim.py").AdamW
-lr_multiplier = get_config("common/coco_schedule.py").lr_multiplier_12ep_warmup
+lr_multiplier = get_config("common/lvis_schedule.py").lr_multiplier_12ep_warmup
 # lr_multiplier = get_config("common/lvis_schedule.py").lr_multiplier_12ep_64bs  # Use 64bs scheduler for batch size 64
 train = get_config("common/train.py").train
 
@@ -30,11 +30,11 @@ train.seed = 42  # Fixed seed for fair comparison
 
 # modify training config
 # train.init_checkpoint = "clip_convnext_large_trans.pth"
-train.init_checkpoint = "./pretrained_models/clip_convnext_large_trans.pth"
+train.init_checkpoint = "./pretrained_models/lami_convnext_large_12ep_lvis/model_final.pth"
 # Add timestamp to output directory
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 # resume training from the last checkpoint
-train.output_dir = f"/root/dino_convnext_large_ovcoco65_{timestamp}"
+train.output_dir = f"/root/lami_convnext_large_12ep_lvis_{timestamp}"
 
 # max training iterations
 # - Original COCO dataset: 113600 images
@@ -47,16 +47,16 @@ train.output_dir = f"/root/dino_convnext_large_ovcoco65_{timestamp}"
 # - Batch size 64: 100,170 ÷ 64 = 1,565 iter/epoch → 18,780 total (12 epochs)
 # - Standardized values: 7,100 (bs16), 3,550 (bs32), 1,775 (bs64)
 # - LR scheduler: use lr_multiplier_12ep_warmup for batch size 32
-train.max_iter = 88700 #85200  # Single GPU A100 4 epochs 12 epochs with batch size 32: 100170/32*12 -- 85200
+train.max_iter = 85200 #85200  # Single GPU A100 4 epochs 12 epochs with batch size 32: 100170/32*12 -- 85200
 
 # run evaluation every 3130 iters
-train.eval_period = 5000  # Evaluate after each epoch 7100//2
+train.eval_period = 99999999  # Evaluate after each epoch 7100//2
 
 # log training infomation every 20 iters
 train.log_period = 50
 
 # save checkpoint every 3130 iters
-train.checkpointer.period = 7400  # 1 epoch worth of iterations
+train.checkpointer.period = 7100  # 1 epoch worth of iterations
 
 # gradient clipping for training
 train.clip_grad.enabled = True
@@ -69,10 +69,10 @@ train.sync_batchnorm = True
 train.device = "cuda"
 model.device = train.device
 
-model.num_classes = 65
+model.num_classes = 1203
 # Set the text embedding paths for TPA (using Claude-generated 8 prompts per class)
-model.query_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl.npy"
-model.eval_query_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl.npy"
+model.query_path = "dataset/metadata/lvis_claude_prompts_convnextl.npy"
+model.eval_query_path = "dataset/metadata/lvis_claude_prompts_convnextl.npy"
 
 # model.use_fed_loss = True
 # model.cluster_fed_loss = True
@@ -103,22 +103,21 @@ dataloader.train.total_batch_size = 16  # Can use 4 with Option 3
 
 # dump the testing results into output_dir for visualization
 dataloader.evaluator.output_dir = train.output_dir
-dataloader.test.dataset.names = "ovcoco_2017_val_all"
-dataloader.train.dataset.names = "ovcoco_2017_train_all"
+dataloader.test.dataset.names = "lvis_v1_val"
 
 # ====== Phase 1：测试 Claude Prompts 单独效果 ======
 # Fed Loss是LVIS必须的基础设施，所有实验都需要使用
-model.use_fed_loss = False  # ✅ 必须开启，处理长尾分布
+model.use_fed_loss = True  # ✅ 必须开启，处理长尾分布
 model.cluster_fed_loss = False
-model.cluster_label_path = None
-model.cat_freq_path = None
-model.fed_loss_num_cat = 0  # 每次采样100个类别计算loss
+model.cluster_label_path = 'dataset/cluster/lvis_cluster_128.npy'
+model.cat_freq_path = "dataset/lvis/lvis_v1_train_norare_cat_info.json"
+model.fed_loss_num_cat = 100  # 每次采样100个类别计算loss
 model.select_box_nums_for_evaluation = 300
 
 # Enable TPA (Text Prototype Aggregator) by modifying the classifier
 model.classifier.use_tpa = True
-model.classifier.text_embed_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl.npy"
-model.classifier.eval_text_embed_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl.npy"
+model.classifier.text_embed_path = "dataset/metadata/lvis_claude_prompts_convnextl.npy"
+model.classifier.eval_text_embed_path = "dataset/metadata/lvis_claude_prompts_convnextl.npy"
 model.classifier.tpa_num_prototypes = 5  # 8 prompts -> 5 prototypes (better utilization)
 model.classifier.tpa_hidden_dim = 256
 model.classifier.tpa_dropout = 0.05  # Add dropout for regularization
@@ -152,16 +151,3 @@ os.environ['NUMEXPR_NUM_THREADS'] = '1'
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
 os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
 os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'OFF'
-
-from detectron2.config import CfgNode as CN
-if not hasattr(model, "cfg_overrides"):
-    model.cfg_overrides = CN()
-model.cfg_overrides.DATASETS = CN()
-model.cfg_overrides.DATASETS.TRAIN = ("ovcoco_2017_train_all",)
-model.cfg_overrides.DATASETS.TEST  = ("ovcoco_2017_val_all",)
-
-from detectron2.data import MetadataCatalog
-import numpy as np
-_ov_meta = MetadataCatalog.get("ovcoco_2017_train_all")
-assert len(_ov_meta.thing_classes) == 65, "thing_classes 不是 65！"
-assert np.load(model.query_path).shape[0] == 65, ".npy 行数不是 65！"
