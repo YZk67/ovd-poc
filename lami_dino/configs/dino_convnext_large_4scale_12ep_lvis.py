@@ -203,11 +203,11 @@ except Exception:
 
 # ====== Phase 1：测试 Claude Prompts 单独效果 ======
 # Fed Loss是LVIS必须的基础设施，所有实验都需要使用
-model.use_fed_loss = False  # ✅ 必须开启，处理长尾分布
+model.use_fed_loss = True  # ✅ 必须开启，处理长尾分布
 model.cluster_fed_loss = False
-model.cluster_label_path = None
-model.cat_freq_path = None
-model.fed_loss_num_cat = 0  # 每次采样100个类别计算loss
+model.cluster_label_path = 'dataset/cluster/ovdcoco_trainb_cluster_128.npy'
+model.cat_freq_path = "dataset/coco/ovcoco_train_b_freq.json"
+model.fed_loss_num_cat = 100  # 每次采样100个类别计算loss
 model.select_box_nums_for_evaluation = 300
 
 # Enable TPA (Text Prototype Aggregator) by modifying the classifier
