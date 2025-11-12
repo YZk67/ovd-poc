@@ -138,6 +138,25 @@ class TextPrototypeAggregator(nn.Module):
         # Only update when computing loss (with_loss=True) to match iteration count
         if self.training and with_loss:
             self._step += 1
+            # Direct orthogonalization: if prototypes are too similar, force orthogonality
+            # This provides immediate diversity without relying solely on gradients
+            step_value = int(self._step.item()) if isinstance(self._step, torch.Tensor) else self._step
+            if step_value > 0 and step_value % 100 == 0:  # Every 100 steps
+                with torch.no_grad():
+                    queries_norm = F.normalize(self.prototype_queries, p=2, dim=1)
+                    similarity_matrix = torch.mm(queries_norm, queries_norm.t())
+                    max_similarity = similarity_matrix[~torch.eye(self.num_prototypes, dtype=bool, device=similarity_matrix.device)].max()
+                    # If max similarity > 0.95, force orthogonality using Gram-Schmidt
+                    if max_similarity > 0.95:
+                        # Gram-Schmidt orthogonalization
+                        Q = self.prototype_queries.clone()
+                        for i in range(1, self.num_prototypes):
+                            for j in range(i):
+                                Q[i] -= torch.dot(Q[i], Q[j]) * Q[j]
+                            Q[i] = F.normalize(Q[i], p=2, dim=0)
+                        # Preserve magnitude
+                        orig_norms = self.prototype_queries.norm(p=2, dim=1, keepdim=True)
+                        self.prototype_queries.data = Q * orig_norms
 
         apr_loss = None
         if with_loss:
@@ -156,7 +175,8 @@ class TextPrototypeAggregator(nn.Module):
         # Direct term has stronger gradient, so give it more weight
         loss_div_attn = self._diversity_term(logits)
         loss_div_direct = self._diversity_term_direct()
-        loss_div = loss_div_attn + 2.0 * loss_div_direct  # Increased from 0.5 to 2.0 for stronger gradient
+        # Combine both terms with higher weight on direct term
+        loss_div = loss_div_attn + 2.0 * loss_div_direct
         lam_orth, lam_div = self._effective_lambdas()
         apr_loss = lam_orth * loss_orth + lam_div * loss_div
         self._store_loss_terms(loss_orth, loss_div, apr_loss, lam_orth, lam_div)
@@ -236,7 +256,9 @@ class TextPrototypeAggregator(nn.Module):
     def _update_metrics_no_grad(self, prototypes, logits):
         with torch.no_grad():
             loss_orth = self._orthogonality_term(prototypes)
-            loss_div = self._diversity_term(logits)
+            loss_div_attn = self._diversity_term(logits)
+            loss_div_direct = self._diversity_term_direct()
+            loss_div = loss_div_attn + 2.0 * loss_div_direct
             lam_orth, lam_div = self._effective_lambdas()
             apr_loss = lam_orth * loss_orth + lam_div * loss_div
         self._store_loss_terms(loss_orth, loss_div, apr_loss, lam_orth, lam_div)

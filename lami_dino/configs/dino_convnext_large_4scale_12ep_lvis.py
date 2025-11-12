@@ -118,7 +118,7 @@ model.classifier.tpa_tau = 0.10  # Increased from 0.07 for softer attention (all
 model.classifier.tpa_log_interval = 200
 # Fixed diversity loss hyperparameters (after fixing diversity loss implementation)
 model.classifier.tpa_lambda_orth = 0.20  # Increased from 0.10 for better orthogonality
-model.classifier.tpa_lambda_div = 0.50  # Increased from 0.30 to 0.50 for even stronger diversity gradient
+model.classifier.tpa_lambda_div = 2.0  # Dramatically increased from 0.50 to 2.0 to force diversity
 # TPA warmup configuration: 5% of max_iter (85200 * 0.05 = 4260)
 model.classifier.tpa_warmup_steps = int(85200 * 0.05)  # 4260 steps (~0.60 epochs)
 

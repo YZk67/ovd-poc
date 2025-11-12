@@ -148,7 +148,7 @@ class Trainer(SimpleTrainer):
             
             self.tpa_grad_printed = True  # ✅ 确保只打印一次
         
-        # === 定期监控TPA指标 ===
+        # === 定期监控TPA指标和梯度 ===
         if self.iter % 100 == 0:  # 每100次iteration监控一次
             try:
                 from examples.monitor_tpa_during_training import monitor_tpa_metrics, print_tpa_metrics
@@ -158,6 +158,43 @@ class Trainer(SimpleTrainer):
                     print_tpa_metrics(metrics)
             except Exception as e:
                 # 如果导入失败或出错，静默忽略（不影响训练）
+                pass
+            
+            # === 监控prototype_queries的梯度 ===
+            try:
+                model_for_grad = self.model.module if hasattr(self.model, 'module') else self.model
+                if hasattr(model_for_grad, 'transformer') and hasattr(model_for_grad.transformer, 'decoder'):
+                    if hasattr(model_for_grad.transformer.decoder, 'class_embed'):
+                        if len(model_for_grad.transformer.decoder.class_embed) > 0:
+                            text_classifier = model_for_grad.transformer.decoder.class_embed[0]
+                            if hasattr(text_classifier, 'tpa') and hasattr(text_classifier.tpa, 'prototype_queries'):
+                                prototype_queries = text_classifier.tpa.prototype_queries
+                                if prototype_queries.grad is not None:
+                                    grad = prototype_queries.grad
+                                    grad_norm = grad.norm().item()
+                                    grad_mean = grad.abs().mean().item()
+                                    grad_max = grad.abs().max().item()
+                                    
+                                    # 计算prototype_queries之间的相似度
+                                    with torch.no_grad():
+                                        queries_norm = torch.nn.functional.normalize(prototype_queries.data, p=2, dim=1)
+                                        similarity_matrix = torch.mm(queries_norm, queries_norm.t())
+                                        off_diag_mask = ~torch.eye(similarity_matrix.size(0), dtype=bool, device=similarity_matrix.device)
+                                        max_similarity = similarity_matrix[off_diag_mask].max().item()
+                                        mean_similarity = similarity_matrix[off_diag_mask].mean().item()
+                                    
+                                    logger.info(
+                                        f"[Gradient Monitor] iter={self.iter} "
+                                        f"grad_norm={grad_norm:.6f} "
+                                        f"grad_mean={grad_mean:.6f} "
+                                        f"grad_max={grad_max:.6f} "
+                                        f"max_sim={max_similarity:.4f} "
+                                        f"mean_sim={mean_similarity:.4f}"
+                                    )
+                                else:
+                                    logger.warning(f"[Gradient Monitor] iter={self.iter} prototype_queries.grad is None!")
+            except Exception as e:
+                # 如果监控失败，静默忽略（不影响训练）
                 pass
         
         if hasattr(self.model, "transformer") and hasattr(self.model.transformer, "text_proto_bank"):
