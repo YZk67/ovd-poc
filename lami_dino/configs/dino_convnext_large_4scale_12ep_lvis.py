@@ -206,7 +206,7 @@ except Exception:
 model.use_fed_loss = True  # ✅ 必须开启，处理长尾分布
 model.cluster_fed_loss = False
 model.cluster_label_path = 'dataset/cluster/ovdcoco_trainb_cluster_128.npy'
-model.cat_freq_path = "dataset/coco/ovcoco_train_b_freq.json"
+model.cat_freq_path = "dataset/coco/ovcoco_train_b_cat_info_like_lvis.json"
 model.fed_loss_num_cat = 100  # 每次采样100个类别计算loss
 model.select_box_nums_for_evaluation = 300
 
