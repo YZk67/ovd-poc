@@ -47,7 +47,7 @@ train.output_dir = f"/root/lami_convnext_large_12ep_lvis_{timestamp}"
 # - Batch size 64: 100,170 ÷ 64 = 1,565 iter/epoch → 18,780 total (12 epochs)
 # - Standardized values: 7,100 (bs16), 3,550 (bs32), 1,775 (bs64)
 # - LR scheduler: use lr_multiplier_12ep_warmup for batch size 32
-train.max_iter = 92300 #85200 #85200  # Single GPU A100 4 epochs 12 epochs with batch size 32: 100170/32*12 -- 85200
+train.max_iter = 85200  # 12 epochs with batch size 32: 100170/32*12 = 85200
 
 # run evaluation every 3130 iters
 train.eval_period = 99999999  # Evaluate after each epoch 7100//2
@@ -119,8 +119,8 @@ model.classifier.tpa_log_interval = 200
 # Fixed diversity loss hyperparameters (after fixing diversity loss implementation)
 model.classifier.tpa_lambda_orth = 0.20  # Increased from 0.10 for better orthogonality
 model.classifier.tpa_lambda_div = 0.12  # Increased from 0.03 for better diversity (4x increase)
-# TPA warmup configuration: 5% of max_iter (92300 * 0.05 = 4615)
-model.classifier.tpa_warmup_steps = int(92300 * 0.05)  # 4615 steps (~0.74 epochs)
+# TPA warmup configuration: 5% of max_iter (85200 * 0.05 = 4260)
+model.classifier.tpa_warmup_steps = int(85200 * 0.05)  # 4260 steps (~0.60 epochs)
 
 # Query initialization: Soft-attention aggregation parameters for multi-prototype query initialization
 model.use_soft_attention = True  # Enable soft-attention aggregation in query initialization
