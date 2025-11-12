@@ -14,7 +14,7 @@ import torch.nn.functional as F
 warmup_ratio = 0.05  # 5% 标准档
 # Default warmup_steps (will be overridden by config)
 # This is a fallback value, should be set via tpa_warmup_steps in config
-warmup_steps = int(92300 * warmup_ratio)  # ≈ 4615 (updated default)
+warmup_steps = int(85200 * warmup_ratio)  # ≈ 4260 (updated default for 85200 max_iter)
 
 
 def _is_main_process() -> bool:
@@ -134,6 +134,10 @@ class TextPrototypeAggregator(nn.Module):
         self._last_logits = logits.detach()
         self._last_prototypes = prototypes_clean.detach()
 
+        # Update _step before computing APR loss (so effective lambdas are correct)
+        if self.training:
+            self._step += 1
+
         apr_loss = None
         if with_loss:
             apr_loss = self.compute_apr_loss(prototypes_clean, logits)
@@ -216,7 +220,7 @@ class TextPrototypeAggregator(nn.Module):
 
     # === logging ===
     def _maybe_log(self, apr_value):
-        self._step += 1  # This will update the buffer
+        # Note: _step is now updated in forward() before computing APR loss
         step_value = int(self._step.item()) if isinstance(self._step, torch.Tensor) else self._step
         if (not self._logger) or (self.training and step_value % self.log_interval != 0):
             return
