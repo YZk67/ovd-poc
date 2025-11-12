@@ -27,6 +27,9 @@ import torch
 import torch.nn.functional as F
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
+from PIL import Image
+import cv2
+from typing import Union
 
 from examples.tpa_visualization_classes import (
     SELECTED_CLASSES,
@@ -448,6 +451,14 @@ class TPAVisualizerForCVPR:
             data['simple_mean'],
             data['class_names'],
             save_name="prototype_vs_mean.png"
+        )
+        
+        # 4. Prototype Usage Histogram
+        print("\n[4/4] Creating prototype usage histogram...")
+        self.visualize_prototype_usage(
+            data['attention_weights'],
+            data['class_names'],
+            save_name="prototype_usage_histogram.png"
         )
         
         print("\n" + "=" * 70)
