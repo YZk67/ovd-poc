@@ -50,6 +50,9 @@ class TextClassifier(nn.Module):
         self.use_tpa = use_tpa
         self.num_classes = num_classes
 
+        self.train_class_indices = None
+        self.eval_class_indices  = None
+
         if self.use_tpa:
             train_feats = self._load_text_embeddings(text_embed_path or zs_weight_path)
             eval_feats = self._load_text_embeddings(
@@ -215,15 +218,42 @@ class TextClassifier(nn.Module):
         additional_class: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x = self.linear(x)
+
+        # 1) 先得到 logits
         if self.use_tpa:
-            return self._compute_tpa_logits(
+            logits = self._compute_tpa_logits(
                 x,
                 content_inds=content_inds,
                 additional_class=additional_class,
             )
-        return self._compute_static_logits(
-            x,
-            classifier=classifier,
-            content_inds=content_inds,
-            additional_class=additional_class,
-        )
+        else:
+            logits = self._compute_static_logits(
+                x,
+                classifier=classifier,
+                content_inds=content_inds,
+                additional_class=additional_class,
+            )
+
+        # 2) 统一的列选择逻辑（训练=48；评测=65），适配 [B, Q, C] 或 [B, C]
+        dim_cls = -1
+        idx = self.train_class_indices if self.training else self.eval_class_indices
+        if idx is not None:
+            if not torch.is_tensor(idx):
+                idx = torch.as_tensor(idx, dtype=torch.long, device=logits.device)
+            else:
+                idx = idx.to(device=logits.device, dtype=torch.long)
+
+            # 健壮性检查：最大索引必须 < 类别维度
+            num_classes_in_logits = logits.shape[dim_cls]
+            max_idx = int(idx.max().item()) if idx.numel() > 0 else -1
+            if max_idx >= num_classes_in_logits:
+                raise IndexError(
+                    f"[TextClassifier] class index out of range: max(idx)={max_idx} "
+                    f">= logits.shape[{dim_cls}]={num_classes_in_logits}. "
+                    "请确认 train_class_indices / eval_class_indices 是否与模型输出列数一致。"
+                )
+
+            logits = logits.index_select(dim=dim_cls, index=idx)
+
+        return logits
+

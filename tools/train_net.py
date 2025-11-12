@@ -316,6 +316,39 @@ def _broadcast_tpa_buffers(model):
         print(f"[Warning] broadcast_tpa_buffers failed: {e}")
 # ==== End ====
 
+def _inject_ovd_indices(model, cfg):
+    """
+    把 48->65 的映射以“运行期属性”的方式塞进模型，
+    避免 __init__ 参数报错；训练时会在 TextClassifier.forward 里切列。
+    """
+    if not hasattr(cfg, "ovd"):
+        return
+    tr = cfg.ovd.get("train48_to_65", None)
+    ev = cfg.ovd.get("eval_idx_65", None)
+    if tr is None or ev is None:
+        return
+
+    device = next(model.parameters()).device
+    import torch
+    tr = torch.as_tensor(tr, dtype=torch.long, device=device)
+    ev = torch.as_tensor(ev, dtype=torch.long, device=device)
+
+    # 你分类头的挂载位置（按你的工程，通常是 model.classifier）
+    head = getattr(model, "classifier", None)
+    if head is None:
+        # 兜底：尝试从 transformer.decoder.class_embed 找最后一个头
+        try:
+            head = model.transformer.decoder.class_embed[-1]
+        except Exception:
+            head = None
+    if head is None:
+        raise RuntimeError("未找到分类头以注入 OVD 索引（model.classifier 或 decoder.class_embed[-1]）。")
+
+    head.train_class_indices = tr
+    head.eval_class_indices  = ev
+
+    assert tr.numel() == 48 and ev.numel() == 65, "OVD 索引长度异常（应为 48 和 65）"
+
 def do_train(args, cfg):
     """
     Args:
@@ -350,8 +383,11 @@ def do_train(args, cfg):
     logger.info("Model:\n{}".format(model))
     model.to(cfg.train.device)
 
+    _inject_ovd_indices(model, cfg)
+
     # ==== Added by ChatGPT ====
     # Convert BN -> SyncBN (only when multi-GPU is initialized)
+
     syncbn_flag = getattr(cfg.train, "sync_batchnorm", True)
     model = _maybe_convert_syncbn(model, enable=syncbn_flag)
 
@@ -444,6 +480,8 @@ def main(args):
     if args.eval_only:
         model = instantiate(cfg.model)
         model.to(cfg.train.device)
+
+        _inject_ovd_indices(model, cfg)
 
         # ==== Added by ChatGPT ====
         # Keep eval path consistent: convert SyncBN & broadcast buffers pre-DDP as well.

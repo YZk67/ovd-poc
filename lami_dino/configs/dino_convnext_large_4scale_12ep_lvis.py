@@ -134,18 +134,6 @@ dataloader["train"].dataset.names = "ovcoco_2017_train_b"
 dataloader["train"].num_workers = 4
 dataloader["train"].total_batch_size = 16  # 4卡×每卡4
 
-# 验证集1：base(48)
-# tb = deepcopy(_base_dl.test)
-# tb.dataset.names = "ovcoco_2017_val_b"
-# tb.num_workers = 0   # 单进程评测更稳（可按需改）
-
-# # 验证集2：novel(17)
-# tt = deepcopy(_base_dl.test)
-# tt.dataset.names = "ovcoco_2017_val_t"
-# tt.num_workers = 0
-
-# dataloader["test"] = tt
-
 # 验证集：all(65)
 ta = deepcopy(_base_dl.test)
 ta.dataset.names = "ovcoco_2017_val_all"   # 统一 65 类评测
@@ -192,9 +180,16 @@ except KeyError as e:
     raise ValueError(f"[类名不匹配] {e}. 请确保 train_b JSON 的类名与 all_classes(=COCO65) 完全一致（空格/连字符/大小写）。")
 
 # 4) 将映射交给模型/分类头（按你的代码结构，这里放到 model/classifier 最稳妥）
-model.classifier.train_class_indices = train48_to_65   # 训练时只取这 48 列进行监督
-model.classifier.eval_class_indices  = list(range(65)) # 评测时走全 65 列
-model.label_map_48to65               = {i:k for i,k in enumerate(train48_to_65)}  # 可供 loss/可视化使用
+#model.classifier.train_class_indices = train48_to_65   # 训练时只取这 48 列进行监督
+#model.classifier.eval_class_indices  = list(range(65)) # 评测时走全 65 列
+#model.label_map_48to65               = {i:k for i,k in enumerate(train48_to_65)}  # 可供 loss/可视化使用
+
+# … 你构造完 train48_to_65 之后，添加：
+ovd = dict(
+    train48_to_65 = train48_to_65,
+    eval_idx_65   = list(range(65)),
+)
+
 
 # （可选）如果你在别处读取 seen_classes.json 来切 .npy，
 # 建议把 seen 改成与 tc_train 完全一致，避免顺序错位：
@@ -205,27 +200,6 @@ try:
         print("[WARN] seen_classes.json 的顺序 ≠ 训练端实际顺序；建议用 tc_train 覆盖或统一以 tc_train 为准。")
 except Exception:
     pass
-
-# evaluator：给一个就够，你的 do_test() 会在数量不匹配时复用
-#dataloader["evaluator"] = get_config("common/data/coco_detr.py").dataloader.evaluator
-
-
-
-# dataloader.evaluator = [
-#     get_config("common/data/coco_detr.py").dataloader.evaluator.clone(),
-#     get_config("common/data/coco_detr.py").dataloader.evaluator.clone(),
-# ]
-#dataloader.test.dataset.names = ("ovcoco_2017_val_b", "ovcoco_2017_val_t")
-# dataloader.test = [
-#     get_config("common/data/coco_detr.py").dataloader.test.clone()
-# ]
-#dataloader.test[0].dataset.names = "ovcoco_2017_val_b"
-
-# dataloader.test += [
-#     get_config("common/data/coco_detr.py").dataloader.test.clone()
-# ]
-#dataloader.test[1].dataset.names = "ovcoco_2017_val_t"
-#dataloader["train"].dataset.names = "ovcoco_2017_train_b"
 
 # ====== Phase 1：测试 Claude Prompts 单独效果 ======
 # Fed Loss是LVIS必须的基础设施，所有实验都需要使用
@@ -273,19 +247,3 @@ os.environ['NUMEXPR_NUM_THREADS'] = '1'
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
 os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
 os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'OFF'
-
-# from detectron2.config import CfgNode as CN
-# if not hasattr(model, "cfg_overrides"):
-#     model.cfg_overrides = CN()
-# model.cfg_overrides.DATASETS = CN()
-# model.cfg_overrides.DATASETS.TRAIN = ("ovcoco_2017_train_b",)
-# model.cfg_overrides.DATASETS.TEST  = ("ovcoco_2017_val_b", "ovcoco_2017_val_t")
-
-# from detectron2.data import MetadataCatalog
-# import numpy as np
-# #_ov_meta = MetadataCatalog.get("ovcoco_2017_train_all")
-# for _name in ["ovcoco_2017_train_b", "ovcoco_2017_val_b", "ovcoco_2017_val_t"]:
-#     _meta = MetadataCatalog.get(_name)
-#     assert len(_meta.thing_classes) == 65, f"{_name} thing_classes 不是 65！"
-# #assert len(_ov_meta.thing_classes) == 65, "thing_classes 不是 65！"
-# assert np.load(model.query_path).shape[0] == 65, ".npy 行数不是 65！"
