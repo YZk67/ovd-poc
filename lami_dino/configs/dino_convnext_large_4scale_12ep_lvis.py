@@ -89,7 +89,7 @@ train.sync_batchnorm = True
 train.device = "cuda"
 model.device = train.device
 
-model.num_classes = 65  # OV-Coco 65 classes
+model.num_classes = 48  # OV-Coco 65 classes
 # Set the text embedding paths for TPA (using Claude-generated 8 prompts per class)
 model.query_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl.npy"
 model.eval_query_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl.npy"
