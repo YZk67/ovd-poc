@@ -559,6 +559,14 @@ class DINO(nn.Module):
             # === 1️⃣ 添加 APR 损失（保持原逻辑） ===
             if apr_loss is not None:
                 loss_dict["loss_apr"] = apr_loss
+                # 添加loss_div和loss_orth到loss_dict，方便监控
+                text_classifier = self.transformer.decoder.class_embed[0]
+                if hasattr(text_classifier, 'tpa') and hasattr(text_classifier.tpa, 'last_loss_terms'):
+                    loss_terms = text_classifier.tpa.last_loss_terms
+                    if "loss_orth" in loss_terms:
+                        loss_dict["loss_orth"] = torch.tensor(loss_terms["loss_orth"], device=apr_loss.device)
+                    if "loss_div" in loss_terms:
+                        loss_dict["loss_div"] = torch.tensor(loss_terms["loss_div"], device=apr_loss.device)
 
             # === 2️⃣ 添加 RPSA 损失（Region–Prototype Semantic Alignment） ===
             # RPSA 模块的损失在 transformer 内部计算，并暂存在 encoder分类器中
