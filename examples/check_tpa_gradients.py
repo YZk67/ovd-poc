@@ -42,7 +42,10 @@ def check_tpa_gradients(checkpoint_path: str, config_path: str):
     tpa = text_classifier.tpa
     print(f"\n【TPA模块信息】")
     print(f"  num_prototypes: {tpa.num_prototypes}")
-    print(f"  hidden_dim: {tpa.hidden_dim}")
+    # hidden_dim is not stored as an attribute, get it from key_proj
+    if hasattr(tpa, 'key_proj'):
+        hidden_dim = tpa.key_proj.out_features
+        print(f"  hidden_dim: {hidden_dim}")
     print(f"  lambda_orth_base: {tpa.lambda_orth_base}")
     print(f"  lambda_div_base: {tpa.lambda_div_base}")
     print(f"  warmup_steps: {tpa.warmup_steps}")
@@ -92,16 +95,23 @@ def check_tpa_gradients(checkpoint_path: str, config_path: str):
     # 创建dummy输入
     device = next(model.parameters()).device
     C = 1203  # num_classes
-    N = 8     # num_prompts
-    D = 256   # feat_dim
     
     # 获取text_feats（从TPA中获取）
     if hasattr(text_classifier, 'train_text_feats'):
         text_feats = text_classifier.train_text_feats
         if text_feats.device != device:
             text_feats = text_feats.to(device)
+        # Get actual dimensions from loaded text_feats
+        if text_feats.ndim == 3:
+            C, N, D = text_feats.shape
+        else:
+            D = text_feats.shape[-1]
+            text_feats = text_feats.unsqueeze(1)  # [C, D] -> [C, 1, D]
+            N = 1
     else:
-        # 创建dummy text_feats
+        # 创建dummy text_feats - need to get D from key_proj input features
+        D = tpa.key_proj.in_features
+        N = 8  # default num_prompts
         text_feats = torch.randn(C, N, D, device=device)
     
     # Forward pass
