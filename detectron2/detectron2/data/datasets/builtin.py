@@ -195,28 +195,32 @@ def _safe_set_thing_classes(dataset_key, classes):
 def register_all_coco(root):
     for dataset_name, splits_per_dataset in _PREDEFINED_SPLITS_COCO.items():
         for key, (image_root, json_file) in splits_per_dataset.items():
-            # Assume pre-defined datasets live in `./datasets`.
-            # 对 ovcoco_*：不要用 _get_builtin_metadata("coco")，避免先被写成 80 类
-            #use_meta = {} if key.startswith("ovcoco_2017_") else _get_builtin_metadata(dataset_name)
-
+            # 统一注册
             register_coco_instances(
                 key,
-                {},
+                {},  # 不传 COCO 的 80 类 meta，避免先被写死
                 os.path.join(root, json_file) if "://" not in json_file else json_file,
                 os.path.join(root, image_root),
             )
 
+            # 只处理 ovcoco_* 的特殊逻辑
             if key.startswith("ovcoco_2017_"):
                 meta = MetadataCatalog.get(key)
                 meta.evaluator_type = "coco"
 
-                # ✅ 仅对 'all(65)' 的 split 设 65 类；其余交给 JSON 自己决定（48/17）
+                # ✅ 仅对 all(65) 的 split 显式设置 65 类顺序 & 65 对齐 id_map
                 if key.endswith("_val_all") or key.endswith("_train_all"):
+                    # 1) thing_classes = 65 类（与你 .npy 行顺序一致）
                     _safe_set_thing_classes(key, COCO65)
 
-                jf = meta.json_file
-                id_map = _ovcoco_build_id_map(jf)
-                meta.thing_dataset_id_to_contiguous_id = id_map
+                    # 2) id_map: 原始 category_id -> 按 COCO65 顺序的连续 id(0..64)
+                    jf = meta.json_file
+                    id_map = _ovcoco_build_id_map(jf)
+                    meta.thing_dataset_id_to_contiguous_id = id_map
+
+                # ❌ 千万不要给 train_b / val_b / train_t / val_t 设置 id_map
+                # 让 detectron2 在 load_coco_json 时自动产生 0..(K-1) 的连续映射
+
 
 
 
