@@ -135,7 +135,8 @@ class TextPrototypeAggregator(nn.Module):
         self._last_prototypes = prototypes_clean.detach()
 
         # Update _step before computing APR loss (so effective lambdas are correct)
-        if self.training:
+        # Only update when computing loss (with_loss=True) to match iteration count
+        if self.training and with_loss:
             self._step += 1
 
         apr_loss = None
@@ -151,7 +152,11 @@ class TextPrototypeAggregator(nn.Module):
     # === APR loss ===
     def compute_apr_loss(self, prototypes: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
         loss_orth = self._orthogonality_term(prototypes)
-        loss_div = self._diversity_term(logits)
+        # Use both diversity terms: attention-based and direct prototype_queries-based
+        # Direct term has stronger gradient, so give it more weight
+        loss_div_attn = self._diversity_term(logits)
+        loss_div_direct = self._diversity_term_direct()
+        loss_div = loss_div_attn + 2.0 * loss_div_direct  # Increased from 0.5 to 2.0 for stronger gradient
         lam_orth, lam_div = self._effective_lambdas()
         apr_loss = lam_orth * loss_orth + lam_div * loss_div
         self._store_loss_terms(loss_orth, loss_div, apr_loss, lam_orth, lam_div)
@@ -198,6 +203,25 @@ class TextPrototypeAggregator(nn.Module):
             diversity_loss += off_diag_similarities.mean()
         
         return diversity_loss / C
+
+    # === diversity term (direct on prototype_queries) ===
+    def _diversity_term_direct(self) -> torch.Tensor:
+        """
+        Directly encourage diversity in prototype_queries.
+        This provides stronger gradients when prototypes are similar.
+        """
+        # Normalize prototype_queries
+        queries_norm = F.normalize(self.prototype_queries, p=2, dim=1)  # [K, D]
+        
+        # Compute pairwise cosine similarity
+        similarity_matrix = torch.mm(queries_norm, queries_norm.t())  # [K, K]
+        
+        # Only consider off-diagonal elements
+        mask = ~torch.eye(self.num_prototypes, dtype=bool, device=similarity_matrix.device)
+        off_diag_similarities = similarity_matrix[mask]
+        
+        # Minimize similarity = maximize diversity
+        return off_diag_similarities.mean()
 
     # === bookkeeping ===
     def _store_loss_terms(self, loss_orth, loss_div, apr_loss, lam_orth, lam_div):

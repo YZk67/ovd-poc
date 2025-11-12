@@ -148,6 +148,18 @@ class Trainer(SimpleTrainer):
             
             self.tpa_grad_printed = True  # ✅ 确保只打印一次
         
+        # === 定期监控TPA指标 ===
+        if self.iter % 100 == 0:  # 每100次iteration监控一次
+            try:
+                from examples.monitor_tpa_during_training import monitor_tpa_metrics, print_tpa_metrics
+                model_for_monitor = self.model.module if hasattr(self.model, 'module') else self.model
+                metrics = monitor_tpa_metrics(model_for_monitor, self.iter, log_interval=1)
+                if metrics:
+                    print_tpa_metrics(metrics)
+            except Exception as e:
+                # 如果导入失败或出错，静默忽略（不影响训练）
+                pass
+        
         if hasattr(self.model, "transformer") and hasattr(self.model.transformer, "text_proto_bank"):
             monitor_dict = self.model.transformer.text_proto_bank.aggregator.get_monitor_dict()
             loss_dict.update(monitor_dict)
