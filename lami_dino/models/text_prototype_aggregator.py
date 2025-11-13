@@ -49,6 +49,7 @@ class TextPrototypeAggregator(nn.Module):
         assert num_prototypes > 0 and hidden_dim > 0
 
         self.num_prototypes = num_prototypes
+        self.hidden_dim = hidden_dim  # Store hidden_dim for use in _reset_parameters
         self.tau = max(float(tau), 1e-6)
         self.lambda_orth_base = float(lambda_orth)
         self.lambda_div_base = float(lambda_div)
