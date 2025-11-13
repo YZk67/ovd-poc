@@ -82,21 +82,21 @@ class TextPrototypeAggregator(nn.Module):
         nn.init.constant_(self.value_proj.bias, 0.0)
         
         # Improved initialization for prototype_queries to encourage diversity
-        # Use orthogonal initialization to make initial queries more diverse
-        # Note: Simplified to avoid QR decomposition issues - use xavier with different seeds
+        # Use orthogonal initialization to ensure initial queries are diverse
         if self.num_prototypes == 1:
             nn.init.xavier_uniform_(self.prototype_queries)
         else:
-            # Initialize with xavier but ensure different initial values
-            # This is simpler and more reliable than QR decomposition
-            nn.init.xavier_uniform_(self.prototype_queries)
-            # Add small random perturbations to encourage diversity
+            # Use orthogonal initialization via QR decomposition
+            # This ensures prototypes start with maximum diversity
             with torch.no_grad():
-                # Add small orthogonal-like perturbations
-                noise = torch.randn_like(self.prototype_queries) * 0.01
-                self.prototype_queries.data += noise
-                # Normalize to prevent initial values from being too large
-                self.prototype_queries.data = F.normalize(self.prototype_queries.data, p=2, dim=1) * 0.1
+                # Initialize with random values
+                init_vectors = torch.randn(self.num_prototypes, self.hidden_dim)
+                # Use QR decomposition to get orthogonal vectors
+                Q, R = torch.linalg.qr(init_vectors.t())
+                # Use Q (orthogonal) and normalize
+                orthogonal_queries = Q.t()[:self.num_prototypes]
+                # Normalize and scale to small initial values
+                self.prototype_queries.data = F.normalize(orthogonal_queries, p=2, dim=1) * 0.1
 
     # === lambda warmup ===
     def _effective_lambdas(self) -> Tuple[float, float]:
@@ -139,24 +139,26 @@ class TextPrototypeAggregator(nn.Module):
         if self.training and with_loss:
             self._step += 1
             # Direct orthogonalization: if prototypes are too similar, force orthogonality
-            # This provides immediate diversity without relying solely on gradients
+            # This is necessary because gradient-based methods alone are not sufficient
+            # We use it conservatively: only when really needed (high similarity) and infrequently
             step_value = int(self._step.item()) if isinstance(self._step, torch.Tensor) else self._step
+            # Check periodically (every 100 steps) throughout training, not just warmup
+            # This ensures diversity is maintained even when gradients are weak
             if step_value > 0 and step_value % 100 == 0:  # Every 100 steps
                 with torch.no_grad():
                     queries_norm = F.normalize(self.prototype_queries, p=2, dim=1)
                     similarity_matrix = torch.mm(queries_norm, queries_norm.t())
-                    max_similarity = similarity_matrix[~torch.eye(self.num_prototypes, dtype=bool, device=similarity_matrix.device)].max()
-                    # If max similarity > 0.95, force orthogonality using Gram-Schmidt
+                    off_diag_mask = ~torch.eye(self.num_prototypes, dtype=bool, device=similarity_matrix.device)
+                    max_similarity = similarity_matrix[off_diag_mask].max()
+                    # High threshold (0.95) - only trigger when prototypes are very similar
+                    # This minimizes interference with normal gradient-based learning
                     if max_similarity > 0.95:
-                        # Gram-Schmidt orthogonalization
-                        Q = self.prototype_queries.clone()
-                        for i in range(1, self.num_prototypes):
-                            for j in range(i):
-                                Q[i] -= torch.dot(Q[i], Q[j]) * Q[j]
-                            Q[i] = F.normalize(Q[i], p=2, dim=0)
-                        # Preserve magnitude
+                        # Use QR decomposition for stable orthogonalization
+                        Q, R = torch.linalg.qr(self.prototype_queries.t())
+                        orthogonal_queries = Q.t()[:self.num_prototypes]
+                        # Preserve magnitude to avoid disrupting training dynamics
                         orig_norms = self.prototype_queries.norm(p=2, dim=1, keepdim=True)
-                        self.prototype_queries.data = Q * orig_norms
+                        self.prototype_queries.data = F.normalize(orthogonal_queries, p=2, dim=1) * orig_norms
 
         apr_loss = None
         if with_loss:

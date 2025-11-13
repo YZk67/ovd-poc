@@ -117,8 +117,9 @@ model.classifier.tpa_dropout = 0.05  # Add dropout for regularization
 model.classifier.tpa_tau = 0.10  # Increased from 0.07 for softer attention (allows more exploration)
 model.classifier.tpa_log_interval = 200
 # Fixed diversity loss hyperparameters (after fixing diversity loss implementation)
+# Balanced settings: strong enough for diversity but not too aggressive for detection task
 model.classifier.tpa_lambda_orth = 0.20  # Increased from 0.10 for better orthogonality
-model.classifier.tpa_lambda_div = 2.0  # Dramatically increased from 0.50 to 2.0 to force diversity
+model.classifier.tpa_lambda_div = 1.0  # Balanced: 1.0 (was 2.0) - apr_loss ~5-7% instead of 10-15%
 # TPA warmup configuration: 5% of max_iter (85200 * 0.05 = 4260)
 model.classifier.tpa_warmup_steps = int(85200 * 0.05)  # 4260 steps (~0.60 epochs)
 
