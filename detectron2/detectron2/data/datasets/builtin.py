@@ -28,6 +28,20 @@ from .coco import load_sem_seg, register_coco_instances
 from .coco_panoptic import register_coco_panoptic, register_coco_panoptic_separated
 from .lvis import get_lvis_instances_meta, register_lvis_instances
 from .pascal_voc import register_pascal_voc
+import json
+
+COCO65 = [
+    "person","bicycle","car","motorcycle","airplane","bus","train","truck","boat","bench",
+    "bird","cat","dog","horse","sheep","cow",
+    "elephant","bear","zebra","giraffe",
+    "backpack","umbrella","handbag","tie","suitcase",
+    "frisbee","skis","snowboard","kite","skateboard",
+    "surfboard","bottle","cup","fork","knife","spoon","bowl",
+    "banana","apple","sandwich","orange","broccoli","carrot","pizza","donut","cake",
+    "chair","couch","bed","toilet","tv","laptop","mouse","remote","keyboard",
+    "microwave","oven","toaster","sink","refrigerator","book","clock","vase",
+    "scissors","toothbrush"
+]
 
 # ==== Predefined datasets and splits for COCO ==========
 
@@ -47,7 +61,7 @@ _PREDEFINED_SPLITS_COCO["coco"] = {
     "coco_2017_val_100": ("coco/val2017", "coco/annotations/instances_val2017_100.json"),
 }
 
-_PREDEFINED_SPLITS_COCO["ovdcoco"] ={
+_PREDEFINED_SPLITS_COCO["coco"].update({
 
     # 标准 48/17：b=base(48)，t=novel(17)
     "ovcoco_2017_train_b":   ("coco/train2017", "coco/annotations/ovd_ins_train2017_b.json"),
@@ -55,7 +69,7 @@ _PREDEFINED_SPLITS_COCO["ovdcoco"] ={
     "ovcoco_2017_val_b":     ("coco/val2017",   "coco/annotations/ovd_ins_val2017_b.json"),
     "ovcoco_2017_val_t":     ("coco/val2017",   "coco/annotations/ovd_ins_val2017_t.json"),
     "ovcoco_2017_val_all": ("coco/val2017", "coco/annotations/ovd_ins_val2017_all.json"),
-}
+})
 
 # _PREDEFINED_SPLITS_COCO["obj365v2"] = {
 #     "obj365v2_train": ("object365/train/", "object365/annotations/obj365v2_train_filtered.json"),
@@ -129,17 +143,80 @@ _PREDEFINED_SPLITS_COCO_PANOPTIC = {
 }
 
 
+def _safe_set_thing_classes(dataset_key, classes):
+    """仅当尚未设置过 thing_classes 时设置，避免触发 D2 断言。"""
+    meta = MetadataCatalog.get(dataset_key)
+    old = getattr(meta, "thing_classes", None)
+    if old is None:
+        meta.thing_classes = classes
+    elif list(old) != list(classes):
+        import logging
+        from detectron2.utils.logger import log_first_n
+        log_first_n(
+            logging.WARN,
+            f"[ovcoco] keep existing thing_classes for '{dataset_key}' (len={len(old)}), "
+            f"skip replacing with len={len(classes)}.",
+            n=1
+        )
+
+def _ovcoco_build_id_map(json_path):
+    """
+    从 json categories 读取 原始 category_id -> 连续 id 的映射，
+    连续 id 顺序严格等于 COCO65（必须与 .npy 行顺序一致）。
+    """
+    with open(json_path, "r") as f:
+        data = json.load(f)
+    cat_id_to_name = {c["id"]: c["name"] for c in data.get("categories", [])}
+    name_to_contig = {n: i for i, n in enumerate(COCO65)}
+    id_map, missing = {}, []
+    for k, v in cat_id_to_name.items():
+        if v not in name_to_contig:
+            missing.append((k, v))
+        else:
+            id_map[k] = name_to_contig[v]
+    if missing:
+        raise ValueError(
+            "[OVD-COCO] 标注中存在 COCO65 之外或名称不匹配的类别：\n"
+            + "\n".join([f"  id={k}, name='{v}'" for k, v in missing])
+            + "\n请确保类别名与 COCO65 完全一致（大小写/空格/连字符）。"
+        )
+    return id_map
+
 def register_all_coco(root):
     for dataset_name, splits_per_dataset in _PREDEFINED_SPLITS_COCO.items():
         for key, (image_root, json_file) in splits_per_dataset.items():
-            # Assume pre-defined datasets live in `./datasets`.
+            jf = os.path.join(root, json_file) if "://" not in json_file else json_file
+            ir = os.path.join(root, image_root)
+
+            if key.startswith("ovcoco_2017_"):
+                # ⭐ OVD-COCO：避免套用 COCO-80 的内置 meta
+                register_coco_instances(
+                    key,
+                    {},   # 空 meta
+                    jf,
+                    ir,
+                )
+                meta = MetadataCatalog.get(key)
+                meta.evaluator_type = "coco"
+
+                # ✅ 仅对 all(65) split 显式设置 65 顺序与 id_map（与 .npy 对齐）
+                if key.endswith("_val_all") or key.endswith("_train_all"):
+                    _safe_set_thing_classes(key, COCO65)
+                    id_map = _ovcoco_build_id_map(jf)
+                    meta.thing_dataset_id_to_contiguous_id = id_map
+
+                # train_b / val_b / val_t 不要设置 thing_classes/id_map
+                continue
+
+            # 其它 COCO 正常 split：沿用内置 meta
             register_coco_instances(
                 key,
                 _get_builtin_metadata(dataset_name),
-                os.path.join(root, json_file) if "://" not in json_file else json_file,
-                os.path.join(root, image_root),
+                jf,
+                ir,
             )
 
+    # panoptic 保持原样
     for (
         prefix,
         (panoptic_root, panoptic_json, semantic_root),
@@ -147,8 +224,7 @@ def register_all_coco(root):
         prefix_instances = prefix[: -len("_panoptic")]
         instances_meta = MetadataCatalog.get(prefix_instances)
         image_root, instances_json = instances_meta.image_root, instances_meta.json_file
-        # The "separated" version of COCO panoptic segmentation dataset,
-        # e.g. used by Panoptic FPN
+
         register_coco_panoptic_separated(
             prefix,
             _get_builtin_metadata("coco_panoptic_separated"),
@@ -158,8 +234,6 @@ def register_all_coco(root):
             os.path.join(root, semantic_root),
             instances_json,
         )
-        # The "standard" version of COCO panoptic segmentation dataset,
-        # e.g. used by Panoptic-DeepLab
         register_coco_panoptic(
             prefix,
             _get_builtin_metadata("coco_panoptic_standard"),
@@ -168,6 +242,7 @@ def register_all_coco(root):
             os.path.join(root, panoptic_json),
             instances_json,
         )
+
 
 
 # ==== Predefined datasets and splits for LVIS ==========
