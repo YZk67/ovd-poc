@@ -103,7 +103,7 @@ dataloader.train.total_batch_size = 16  # Can use 4 with Option 3
 
 # dump the testing results into output_dir for visualization
 dataloader.evaluator.output_dir = train.output_dir
-dataloader.test.dataset.names = "lvis_v1_val"
+dataloader.test.dataset.names = "ovcoco_2017_val_all"
 
 # ====== Phase 1：测试 Claude Prompts 单独效果 ======
 # Fed Loss是LVIS必须的基础设施，所有实验都需要使用
