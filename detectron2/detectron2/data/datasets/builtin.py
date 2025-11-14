@@ -43,6 +43,17 @@ COCO65 = [
     "scissors","toothbrush"
 ]
 
+COCO65_DATASET_IDS = [
+    1,2,3,4,5,6,7,8,9,      # person..boat
+    15,16,17,18,19,20,21,22,23,24,25,
+    27,28,31,32,33,34,35,36,38,41,42,
+    44,47,48,49,50,51,52,53,54,55,56,57,
+    59,60,61,62,63,65,70,72,73,74,75,76,
+    78,79,80,81,82,84,85,86,87,90
+]
+# 顺序必须与 COCO65 名称列表一一对应（你当前的 COCO65 顺序是对的）
+
+
 # ==== Predefined datasets and splits for COCO ==========
 
 _PREDEFINED_SPLITS_COCO = {}
@@ -161,26 +172,34 @@ def _safe_set_thing_classes(dataset_key, classes):
 
 def _ovcoco_build_id_map(json_path):
     """
-    从 json categories 读取 原始 category_id -> 连续 id 的映射，
-    连续 id 顺序严格等于 COCO65（必须与 .npy 行顺序一致）。
+    生成 原始 category_id -> 连续 id(0..64) 的映射。
+    1) 若 JSON 含 categories：按名字与 COCO65 对齐生成映射（更稳，能校验名字拼写）
+    2) 若不含 categories：退回固定的 COCO65_DATASET_IDS 常量
     """
     with open(json_path, "r") as f:
         data = json.load(f)
-    cat_id_to_name = {c["id"]: c["name"] for c in data.get("categories", [])}
-    name_to_contig = {n: i for i, n in enumerate(COCO65)}
-    id_map, missing = {}, []
-    for k, v in cat_id_to_name.items():
-        if v not in name_to_contig:
-            missing.append((k, v))
-        else:
-            id_map[k] = name_to_contig[v]
-    if missing:
-        raise ValueError(
-            "[OVD-COCO] 标注中存在 COCO65 之外或名称不匹配的类别：\n"
-            + "\n".join([f"  id={k}, name='{v}'" for k, v in missing])
-            + "\n请确保类别名与 COCO65 完全一致（大小写/空格/连字符）。"
-        )
-    return id_map
+
+    cats = data.get("categories", [])
+    if cats:  # 路径1：严格校验名字
+        cat_id_to_name = {c["id"]: c["name"] for c in cats}
+        name_to_contig = {n: i for i, n in enumerate(COCO65)}
+        id_map, missing = {}, []
+        for k, v in cat_id_to_name.items():
+            if v not in name_to_contig:
+                missing.append((k, v))
+            else:
+                id_map[k] = name_to_contig[v]
+        if missing:
+            raise ValueError(
+                "[OVD-COCO] 标注中存在 COCO65 之外或名称不匹配的类别：\n"
+                + "\n".join([f"  id={k}, name='{v}'" for k, v in missing])
+                + "\n请确保类别名与 COCO65 完全一致（大小写/空格/连字符）。"
+            )
+        return id_map
+
+    # 路径2：无 categories，用固定 ID 列表兜底
+    return {did: i for i, did in enumerate(COCO65_DATASET_IDS)}
+
 
 def register_all_coco(root):
     for dataset_name, splits_per_dataset in _PREDEFINED_SPLITS_COCO.items():
