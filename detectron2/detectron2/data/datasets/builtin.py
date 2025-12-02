@@ -79,7 +79,7 @@ _PREDEFINED_SPLITS_COCO["coco"].update({
     "ovcoco_2017_train_t":   ("coco/train2017", "coco/annotations/ovd_ins_train2017_t.json"),  # 一般不用训练
     "ovcoco_2017_val_b":     ("coco/val2017",   "coco/annotations/ovd_ins_val2017_b.json"),
     "ovcoco_2017_val_t":     ("coco/val2017",   "coco/annotations/ovd_ins_val2017_t.json"),
-    "ovcoco_2017_val_all": ("coco/val2017", "coco/annotations/ovd_ins_val2017_all.json"),
+    "ovcoco_2017_val_all": ("coco/val2017", "coco/annotations1/instances_val2017.json.json"),
 })
 
 # _PREDEFINED_SPLITS_COCO["obj365v2"] = {
