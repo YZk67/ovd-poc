@@ -47,6 +47,17 @@ _PREDEFINED_SPLITS_COCO["coco"] = {
     "coco_2017_val_100": ("coco/val2017", "coco/annotations/instances_val2017_100.json"),
 }
 
+
+_PREDEFINED_SPLITS_COCO["coco"].update({
+
+    # 标准 48/17：b=base(48)，t=novel(17)
+    "ovcoco_2017_train_b":   ("coco/train2017", "coco/annotations/ovd_ins_train2017_b.json"),
+    "ovcoco_2017_train_t":   ("coco/train2017", "coco/annotations/ovd_ins_train2017_t.json"),  # 一般不用训练
+    "ovcoco_2017_val_b":     ("coco/val2017",   "coco/annotations/ovd_ins_val2017_b.json"),
+    "ovcoco_2017_val_t":     ("coco/val2017",   "coco/annotations/ovd_ins_val2017_t.json"),
+    "ovcoco_2017_val_all": ("coco/val2017", "coco/annotations1/instances_val2017.json"),
+})
+
 # _PREDEFINED_SPLITS_COCO["obj365v2"] = {
 #     "obj365v2_train": ("object365/train/", "object365/annotations/obj365v2_train_filtered.json"),
 #     "obj365v2_val": ("object365/val/", "object365/annotations/zhiyuan_objv2_val.json")

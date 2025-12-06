@@ -1,27 +1,31 @@
 from detrex.config import get_config
 from .models.dino_convnextl import model
+from datetime import datetime
 
-model.vlm_query_path = "dataset/metadata/lvis_visual_desc_confuse_lvis_convnextl.npy"
+model.vlm_query_path = "dataset/metadata/coco_80_simple.npy"
 model.score_ensemble = True
 model.backbone.score_ensemble = model.score_ensemble
-model.seen_classes = 'dataset/lvis/lvis_v1_seen_classes.json'
-model.all_classes = 'dataset/lvis/lvis_v1_all_classes.json'
+model.seen_classes = 'dataset/metadata/ovcoco_seen_classes.json'
+model.all_classes = 'dataset/metadata/ovcoco_all_classes_80.json'
 model.vlm_temperature = 100.0 # keep same with f-vlm
 model.alpha = 0.0
 model.beta = 0.4
 model.novel_scale = 5.0
 
 # get default config
-dataloader = get_config("common/data/lvis_detr.py").dataloader
+dataloader = get_config("common/data/coco_detr.py").dataloader
 optimizer = get_config("common/optim.py").AdamW
-lr_multiplier = get_config("common/lvis_schedule.py").lr_multiplier_12ep_warmup
+lr_multiplier = get_config("common/coco_schedule.py").lr_multiplier_12ep_warmup
 train = get_config("common/train.py").train
 
 
 # modify training config
 # train.init_checkpoint = "clip_convnext_large_trans.pth"
-train.init_checkpoint = "./pretrained_models/lami_convnext_large_12ep_lvis/model_final.pth"
-train.output_dir = "./output/lami_convnext_large_12ep_lvis"
+train.init_checkpoint = "./pretrained_models/clip_convnext_large_trans.pth"
+# Add timestamp to output directory
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+# resume training from the last checkpoint
+train.output_dir = f"/root/dino_convnext_large_ovcoco65_{timestamp}"
 
 # max training iterations
 train.max_iter = 85200# TODO
@@ -33,7 +37,7 @@ train.eval_period = 85200
 train.log_period = 200
 
 # save checkpoint every 5000 iters
-train.checkpointer.period = 7100//2
+train.checkpointer.period = 7100
 
 # gradient clipping for training
 train.clip_grad.enabled = True
@@ -44,9 +48,9 @@ train.clip_grad.params.norm_type = 2
 train.device = "cuda"
 model.device = train.device
 
-model.num_classes = 1203
-model.query_path = "dataset/metadata/lvis_visual_desc_convnextl.npy"
-model.eval_query_path = "dataset/metadata/lvis_visual_desc_convnextl.npy"
+model.num_classes = 80
+model.query_path = "dataset/metadata/coco_80_hybrid_classifier.npy"
+model.eval_query_path = "dataset/metadata/lvis_tpa_prompts_convnextl80.npy"
 
 model.use_fed_loss = True
 model.cluster_fed_loss = True
@@ -62,13 +66,13 @@ optimizer.weight_decay = 1e-4
 optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 1
 
 # modify dataloader config
-dataloader.train.num_workers = 8
+dataloader.train.num_workers = 4
 
 # please notice that this is total batch size.
 # surpose you're using 4 gpus for training and the batch size for
 # each gpu is 16/4 = 4
-dataloader.train.total_batch_size = 32
+dataloader.train.total_batch_size = 16
 
 # dump the testing results into output_dir for visualization
 dataloader.evaluator.output_dir = train.output_dir
-dataloader.test.dataset.names = "lvis_v1_val"
+dataloader.test.dataset.names = "ovcoco_2017_val_all"
