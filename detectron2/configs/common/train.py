@@ -7,7 +7,7 @@ train = dict(
     amp=dict(enabled=False),  # options for Automatic Mixed Precision
     ddp=dict(  # options for DistributedDataParallel
         broadcast_buffers=False,
-        find_unused_parameters=False,
+        find_unused_parameters=True,
         fp16_compression=False,
     ),
     checkpointer=dict(period=5000, max_to_keep=100),  # options for PeriodicCheckpointer
