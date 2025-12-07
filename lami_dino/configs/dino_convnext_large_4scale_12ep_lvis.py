@@ -2,7 +2,7 @@ from detrex.config import get_config
 from .models.dino_convnextl import model
 from datetime import datetime
 
-model.vlm_query_path = "dataset/metadata/coco_80_simple.npy"
+model.vlm_query_path = "dataset/metadata/coco_80_hybrid_aligned.npy"
 model.score_ensemble = True
 model.backbone.score_ensemble = model.score_ensemble
 model.seen_classes = 'dataset/metadata/ovcoco_seen_classes.json'
@@ -49,15 +49,15 @@ train.device = "cuda"
 model.device = train.device
 
 model.num_classes = 80
-model.query_path = "dataset/metadata/coco_80_hybrid_classifier.npy"
-model.eval_query_path = "dataset/metadata/lvis_tpa_prompts_convnextl80.npy"
+model.query_path = "dataset/metadata/coco_80_hybrid_aligned.npy"
+model.eval_query_path = "dataset/metadata/coco_80_hybrid_aligned.npy"
 
-model.use_fed_loss = True
-model.cluster_fed_loss = True
-model.cluster_label_path = 'dataset/cluster/lvis_cluster_128.npy'
-model.cat_freq_path = "dataset/lvis/lvis_v1_train_norare_cat_info.json"
-model.fed_loss_num_cat=100
-model.select_box_nums_for_evaluation = 300
+#model.use_fed_loss = True
+#model.cluster_fed_loss = True
+#model.cluster_label_path = 'dataset/cluster/lvis_cluster_128.npy'
+#model.cat_freq_path = "dataset/lvis/lvis_v1_train_norare_cat_info.json"
+#model.fed_loss_num_cat=100
+#model.select_box_nums_for_evaluation = 300
 
 # modify optimizer config
 optimizer.lr = 1e-4
