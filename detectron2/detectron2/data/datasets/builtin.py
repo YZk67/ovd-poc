@@ -31,6 +31,16 @@ from .pascal_voc import register_pascal_voc
 
 # ==== Predefined datasets and splits for COCO ==========
 
+# ==== 插入这个列表定义 (OV-COCO 48个 Base 类) ====
+_COCO_OVD_CATEGORIES = [
+    'person', 'bicycle', 'car', 'motorcycle', 'train', 'truck', 'boat', 'bench', 
+    'bird', 'horse', 'sheep', 'bear', 'zebra', 'giraffe', 'backpack', 'handbag', 
+    'suitcase', 'frisbee', 'skis', 'kite', 'surfboard', 'bottle', 'fork', 'spoon', 
+    'bowl', 'banana', 'apple', 'sandwich', 'orange', 'broccoli', 'carrot', 'pizza', 
+    'donut', 'chair', 'bed', 'toilet', 'tv', 'laptop', 'mouse', 'remote', 'microwave', 
+    'oven', 'toaster', 'refrigerator', 'book', 'clock', 'vase', 'toothbrush'
+]
+
 _PREDEFINED_SPLITS_COCO = {}
 _PREDEFINED_SPLITS_COCO["coco"] = {
     "coco_2014_train": ("coco/train2014", "coco/annotations/instances_train2014.json"),
@@ -133,10 +143,24 @@ _PREDEFINED_SPLITS_COCO_PANOPTIC = {
 def register_all_coco(root):
     for dataset_name, splits_per_dataset in _PREDEFINED_SPLITS_COCO.items():
         for key, (image_root, json_file) in splits_per_dataset.items():
+
+            # 获取默认 metadata
+            current_metadata = _get_builtin_metadata(dataset_name)
+            
+            # --- 补丁开始 ---
+            # 针对 OVD Base 数据集，强制替换类别列表为 48 类
+            if key.startswith("ovcoco") and key.endswith("_b"):
+                current_metadata = {
+                    "thing_classes": _COCO_OVD_CATEGORIES,
+                     # 注意：如果是 Base 训练，通常不需要 id_map，或者 json 里已经对了
+                     # 为了避免 id map 冲突，最好只传 thing_classes
+                }
+            # --- 补丁结束 ---
+
             # Assume pre-defined datasets live in `./datasets`.
             register_coco_instances(
                 key,
-                _get_builtin_metadata(dataset_name),
+                current_metadata,
                 os.path.join(root, json_file) if "://" not in json_file else json_file,
                 os.path.join(root, image_root),
             )
