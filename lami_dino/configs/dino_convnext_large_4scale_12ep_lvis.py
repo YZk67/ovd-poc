@@ -2,7 +2,7 @@ from detrex.config import get_config
 from .models.dino_convnextl import model
 from datetime import datetime
 
-model.vlm_query_path = "dataset/metadata/coco_80_mean_aligned.npy"
+model.vlm_query_path = "dataset/metadata/coco_80_mean_aligned_fixed.npy"
 model.score_ensemble = True
 model.backbone.score_ensemble = model.score_ensemble
 model.seen_classes = 'dataset/metadata/ovcoco_seen_classes.json'
@@ -49,8 +49,8 @@ train.device = "cuda"
 model.device = train.device
 
 model.num_classes = 80
-model.query_path = "dataset/metadata/coco_80_mean_aligned.npy"
-model.eval_query_path = "dataset/metadata/coco_80_mean_aligned.npy"
+model.query_path = "dataset/metadata/coco_80_mean_aligned_fixed.npy"
+model.eval_query_path = "dataset/metadata/coco_80_mean_aligned_fixed.npy"
 
 #model.use_fed_loss = True
 #model.cluster_fed_loss = True
