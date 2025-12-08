@@ -31,7 +31,7 @@ train.output_dir = f"/root/dino_convnext_large_ovcoco65_{timestamp}"
 train.max_iter = 85200# TODO
 
 # run evaluation every 5000 iters
-train.eval_period = 85200
+train.eval_period = 5000
 
 # log training infomation every 20 iters
 train.log_period = 200
