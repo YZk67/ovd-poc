@@ -234,7 +234,7 @@ class DINO(nn.Module):
 
         convert_map = torch.ones(self.num_classes, dtype=torch.int64) * -1
         for idx, content_id in enumerate(content_inds):
-            convert_map[content_id.item() -1] = idx
+            convert_map[content_id.item()] = idx
         for idx, target in enumerate(batched_inputs):
             cats = target['instances'].gt_classes
             batched_inputs[idx]['instances'].gt_classes = convert_map[batched_inputs[idx]['instances'].gt_classes]
