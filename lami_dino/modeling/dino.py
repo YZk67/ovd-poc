@@ -245,21 +245,20 @@ class DINO(nn.Module):
                 C=self.num_classes,
                 weight=freq_weight)
 
-        convert_map = torch.ones(self.num_classes, dtype=torch.int64, device=self.device) * -1 
+        convert_map = torch.ones(self.num_classes, dtype=torch.int64, device=self.device) * -1
         for idx, content_id in enumerate(content_inds):
             convert_map[content_id.item()] = idx
         
         # 4. 转换批次输入中的 GT 标签 (核心修正：确保不会出现索引 80)
         for idx, target in enumerate(batched_inputs):
-            gt_classes = batched_inputs[idx]['instances'].gt_classes.clone() # 克隆以避免直接修改原始 Instances 结构
+        # 获取 GT 类别，并将其克隆到 GPU 以进行原地操作
+            gt_classes = batched_inputs[idx]['instances'].gt_classes.clone().to(self.device)
         
         # ✅ 修正：将原 batched_inputs 中所有 >= num_classes 的 ID 设为 -1 (忽略)
-        # 这一步是关键，它确保了 convert_map 索引不会越界 (80 -> -1)
             gt_classes[gt_classes >= self.num_classes] = -1 
         
         # 将修正后的 GT 类别映射到 FedLoss 的新索引
-        # 注意：PyTorch 允许负数索引，但是我们这里将 convert_map 放在 device 上，
-        # 并且将无效索引设为 -1，预期 convert_map[-1] 结果为 -1 (忽略)
+        # 注意：这里使用修正后的 gt_classes 来索引 convert_map
             batched_inputs[idx]['instances'].gt_classes = convert_map[gt_classes]
 
         return content_inds, batched_inputs
