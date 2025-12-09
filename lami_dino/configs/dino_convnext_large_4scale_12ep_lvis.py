@@ -56,7 +56,7 @@ model.use_fed_loss = True
 model.cluster_fed_loss = True
 model.cluster_label_path = 'dataset/cluster/coco_cluster_20.npy'
 model.cat_freq_path = "dataset/coco/instances_train2017_cat_info.json"
-model.fed_loss_num_cat=100
+model.fed_loss_num_cat=20
 model.select_box_nums_for_evaluation = 300
 
 # modify optimizer config
