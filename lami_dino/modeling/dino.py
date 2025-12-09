@@ -218,6 +218,13 @@ class DINO(nn.Module):
             inner_gt.append(target)
         inner_gt = torch.cat(inner_gt)
 
+        # 找出所有超出 [0, 79] 范围的类别 ID
+        invalid_mask = (inner_gt >= self.num_classes) | (inner_gt < 0)
+        if invalid_mask.any():
+            print(f"Warning: Found invalid class IDs: {inner_gt[invalid_mask].unique().tolist()}")
+            # 排除这些无效的 GT 标签，防止它们被选中进入 content_inds
+            inner_gt = inner_gt[~invalid_mask]
+
         if self.cluster_fed_loss:
             content_inds = get_cluster_fed_loss_inds(
                 inner_gt,
