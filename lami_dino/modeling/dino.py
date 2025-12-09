@@ -218,33 +218,49 @@ class DINO(nn.Module):
             inner_gt.append(target)
         inner_gt = torch.cat(inner_gt)
 
-        # 找出所有超出 [0, 79] 范围的类别 ID
-        invalid_mask = (inner_gt >= self.num_classes) | (inner_gt < 0)
+        invalid_mask = inner_gt >= self.num_classes
+    
         if invalid_mask.any():
-            print(f"Warning: Found invalid class IDs: {inner_gt[invalid_mask].unique().tolist()}")
-            # 排除这些无效的 GT 标签，防止它们被选中进入 content_inds
-            inner_gt = inner_gt[~invalid_mask]
+        # 警告或记录哪些无效 ID 被发现 (可选)
+            invalid_ids = inner_gt[invalid_mask].unique().tolist()
+            print(f"Warning: Found invalid class IDs >= {self.num_classes}: {invalid_ids}. Filtering these for FedLoss calculation.")
+
+        # 过滤掉这些无效 ID，使其不参与 content_inds (FedLoss) 的计算
+        # 否则 content_inds 中可能会包含 ID 80，导致 convert_map[80] 错误
+            inner_gt_filtered = inner_gt[~invalid_mask]
+        else:
+            inner_gt_filtered = inner_gt
 
         if self.cluster_fed_loss:
             content_inds = get_cluster_fed_loss_inds(
-                inner_gt,
+                inner_gt_filtered,
                 num_sample_cats=self.fed_loss_num_cat,
                 C=self.num_classes,
                 weight=freq_weight,
                 cluster_label=self.cluster_label)
         else:
             content_inds = get_fed_loss_inds(
-                inner_gt,
+                inner_gt_filtered,
                 num_sample_cats=self.fed_loss_num_cat,
                 C=self.num_classes,
                 weight=freq_weight)
 
-        convert_map = torch.ones(self.num_classes, dtype=torch.int64) * -1
+        convert_map = torch.ones(self.num_classes, dtype=torch.int64, device=self.device) * -1 
         for idx, content_id in enumerate(content_inds):
             convert_map[content_id.item()] = idx
+        
+        # 4. 转换批次输入中的 GT 标签 (核心修正：确保不会出现索引 80)
         for idx, target in enumerate(batched_inputs):
-            cats = target['instances'].gt_classes
-            batched_inputs[idx]['instances'].gt_classes = convert_map[batched_inputs[idx]['instances'].gt_classes]
+            gt_classes = batched_inputs[idx]['instances'].gt_classes.clone() # 克隆以避免直接修改原始 Instances 结构
+        
+        # ✅ 修正：将原 batched_inputs 中所有 >= num_classes 的 ID 设为 -1 (忽略)
+        # 这一步是关键，它确保了 convert_map 索引不会越界 (80 -> -1)
+            gt_classes[gt_classes >= self.num_classes] = -1 
+        
+        # 将修正后的 GT 类别映射到 FedLoss 的新索引
+        # 注意：PyTorch 允许负数索引，但是我们这里将 convert_map 放在 device 上，
+        # 并且将无效索引设为 -1，预期 convert_map[-1] 结果为 -1 (忽略)
+            batched_inputs[idx]['instances'].gt_classes = convert_map[gt_classes]
 
         return content_inds, batched_inputs
  
