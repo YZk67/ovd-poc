@@ -244,6 +244,17 @@ class DINO(nn.Module):
                 num_sample_cats=self.fed_loss_num_cat,
                 C=self.num_classes,
                 weight=freq_weight)
+        
+        if content_inds.numel() > 0 and content_inds.max() >= self.num_classes:
+            # 你可以先打印看看有哪些越界的 id
+            print(
+                "[FedLoss] WARNING: content_inds.max() =",
+                int(content_inds.max()),
+                ">= num_classes =",
+                int(self.num_classes),
+                " – clipping."
+            )
+            content_inds = content_inds[content_inds < self.num_classes]
 
         convert_map = torch.ones(self.num_classes, dtype=torch.int64, device=self.device) * -1
         for idx, content_id in enumerate(content_inds):
