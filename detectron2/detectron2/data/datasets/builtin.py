@@ -172,7 +172,7 @@ def _safe_set_thing_classes(dataset_key, classes, force=False):
             n=1
         )
 
-def _ovcoco_build_id_map(json_path):
+def _ovcoco_build_id_map(_json_path=None):
     # """
     # 生成 原始 category_id -> 连续 id(0..64) 的映射。
     # 1) 若 JSON 含 categories：按名字与 COCO65 对齐生成映射（更稳，能校验名字拼写）
