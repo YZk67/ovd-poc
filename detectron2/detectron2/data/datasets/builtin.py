@@ -200,7 +200,7 @@ def _ovcoco_build_id_map(json_path):
     #     return id_map
 
     # # 路径2：无 categories，用固定 ID 列表兜底
-    return {did: i for i, did in enumerate(COCO65_DATASET_IDS)}
+    return {did: i for i, did in enumerate(COCO80_DATASET_IDS)}
 
 
 def register_all_coco(root):
@@ -215,7 +215,7 @@ def register_all_coco(root):
                 meta.evaluator_type = "coco"
 
                 # 统一：所有 split 都用同一套 80类定义
-                _safe_set_thing_classes(key, COCO65, force=True)  # 你这里 COCO65=COCO80类名
+                _safe_set_thing_classes(key, COCO80, force=True)  # 你这里 COCO65=COCO80类名
                 meta.thing_dataset_id_to_contiguous_id = _ovcoco_build_id_map()
 
                 continue
