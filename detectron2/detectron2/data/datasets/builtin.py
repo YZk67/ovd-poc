@@ -33,7 +33,7 @@ import json
 # ==================================================================
 # 直接修改原来的 COCO65 变量，放入 80 类全集
 # ==================================================================
-COCO65 = [
+COCO80 = [
     "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
     "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
     "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack",
@@ -48,7 +48,7 @@ COCO65 = [
 ]
 
 # 同时也必须修改对应的 ID 列表 (这是标准 COCO 的 1-90 ID，对应上面的 80 类)
-COCO65_DATASET_IDS = [
+COCO80_DATASET_IDS = [
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 27, 28, 31, 32, 33, 34,
     35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
     64, 65, 67, 70, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 84, 85, 86, 87, 88, 89, 90
@@ -156,11 +156,11 @@ _PREDEFINED_SPLITS_COCO_PANOPTIC = {
 }
 
 
-def _safe_set_thing_classes(dataset_key, classes):
+def _safe_set_thing_classes(dataset_key, classes, force=False):
     """仅当尚未设置过 thing_classes 时设置，避免触发 D2 断言。"""
     meta = MetadataCatalog.get(dataset_key)
     old = getattr(meta, "thing_classes", None)
-    if old is None:
+    if force or old is None:
         meta.thing_classes = classes
     elif list(old) != list(classes):
         import logging
@@ -173,33 +173,33 @@ def _safe_set_thing_classes(dataset_key, classes):
         )
 
 def _ovcoco_build_id_map(json_path):
-    """
-    生成 原始 category_id -> 连续 id(0..64) 的映射。
-    1) 若 JSON 含 categories：按名字与 COCO65 对齐生成映射（更稳，能校验名字拼写）
-    2) 若不含 categories：退回固定的 COCO65_DATASET_IDS 常量
-    """
-    with open(json_path, "r") as f:
-        data = json.load(f)
+    # """
+    # 生成 原始 category_id -> 连续 id(0..64) 的映射。
+    # 1) 若 JSON 含 categories：按名字与 COCO65 对齐生成映射（更稳，能校验名字拼写）
+    # 2) 若不含 categories：退回固定的 COCO65_DATASET_IDS 常量
+    # """
+    # with open(json_path, "r") as f:
+    #     data = json.load(f)
 
-    cats = data.get("categories", [])
-    if cats:  # 路径1：严格校验名字
-        cat_id_to_name = {c["id"]: c["name"] for c in cats}
-        name_to_contig = {n: i for i, n in enumerate(COCO65)}
-        id_map, missing = {}, []
-        for k, v in cat_id_to_name.items():
-            if v not in name_to_contig:
-                missing.append((k, v))
-            else:
-                id_map[k] = name_to_contig[v]
-        if missing:
-            raise ValueError(
-                "[OVD-COCO] 标注中存在 COCO65 之外或名称不匹配的类别：\n"
-                + "\n".join([f"  id={k}, name='{v}'" for k, v in missing])
-                + "\n请确保类别名与 COCO65 完全一致（大小写/空格/连字符）。"
-            )
-        return id_map
+    # cats = data.get("categories", [])
+    # if cats:  # 路径1：严格校验名字
+    #     cat_id_to_name = {c["id"]: c["name"] for c in cats}
+    #     name_to_contig = {n: i for i, n in enumerate(COCO65)}
+    #     id_map, missing = {}, []
+    #     for k, v in cat_id_to_name.items():
+    #         if v not in name_to_contig:
+    #             missing.append((k, v))
+    #         else:
+    #             id_map[k] = name_to_contig[v]
+    #     if missing:
+    #         raise ValueError(
+    #             "[OVD-COCO] 标注中存在 COCO65 之外或名称不匹配的类别：\n"
+    #             + "\n".join([f"  id={k}, name='{v}'" for k, v in missing])
+    #             + "\n请确保类别名与 COCO65 完全一致（大小写/空格/连字符）。"
+    #         )
+    #     return id_map
 
-    # 路径2：无 categories，用固定 ID 列表兜底
+    # # 路径2：无 categories，用固定 ID 列表兜底
     return {did: i for i, did in enumerate(COCO65_DATASET_IDS)}
 
 
@@ -210,24 +210,16 @@ def register_all_coco(root):
             ir = os.path.join(root, image_root)
 
             if key.startswith("ovcoco_2017_"):
-                # ⭐ OVD-COCO：避免套用 COCO-80 的内置 meta
-                register_coco_instances(
-                    key,
-                    {},   # 空 meta
-                    jf,
-                    ir,
-                )
+                register_coco_instances(key, {}, jf, ir)
                 meta = MetadataCatalog.get(key)
                 meta.evaluator_type = "coco"
 
-                # ✅ 仅对 all(65) split 显式设置 65 顺序与 id_map（与 .npy 对齐）
-                if key.endswith("_val_all") or key.endswith("_train_all"):
-                    _safe_set_thing_classes(key, COCO65)
-                    id_map = _ovcoco_build_id_map(jf)
-                    meta.thing_dataset_id_to_contiguous_id = id_map
+                # 统一：所有 split 都用同一套 80类定义
+                _safe_set_thing_classes(key, COCO65, force=True)  # 你这里 COCO65=COCO80类名
+                meta.thing_dataset_id_to_contiguous_id = _ovcoco_build_id_map()
 
-                # train_b / val_b / val_t 不要设置 thing_classes/id_map
                 continue
+
 
             # 其它 COCO 正常 split：沿用内置 meta
             register_coco_instances(
