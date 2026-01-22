@@ -77,7 +77,15 @@ def load_coco_json(json_file, image_root, dataset_name=None, extra_annotation_ke
         cats = coco_api.loadCats(cat_ids)
         # The categories in a custom json file may not be sorted.
         thing_classes = [c["name"] for c in sorted(cats, key=lambda x: x["id"])]
-        meta.thing_classes = thing_classes
+        #meta.thing_classes = thing_classes
+        old = getattr(meta, "thing_classes", None)
+        if old is None:
+            meta.thing_classes = thing_classes
+        else:
+            # 如果已经被你在 builtin.py 里强制设过（比如 80 类），就不要再覆盖成 48 类
+            # 也可以选择 assert old == thing_classes，但你现在就是希望跳过覆盖
+            pass
+
 
         # In COCO, certain category ids are artificially removed,
         # and by convention they are always ignored.
@@ -94,8 +102,12 @@ def load_coco_json(json_file, image_root, dataset_name=None, extra_annotation_ke
                     Category ids in annotations are not in [1, #categories]! We'll apply a mapping for you.
                     """
                 )
-        id_map = {v: i for i, v in enumerate(cat_ids)}
-        meta.thing_dataset_id_to_contiguous_id = id_map
+        # 如果 builtin.py 已经设置过固定映射（COCO80），这里就不要覆盖
+        if not hasattr(meta, "thing_dataset_id_to_contiguous_id"):
+            id_map = {v: i for i, v in enumerate(cat_ids)}
+            meta.thing_dataset_id_to_contiguous_id = id_map
+        else:
+            id_map = meta.thing_dataset_id_to_contiguous_id
 
     # sort indices for reproducible results
     img_ids = sorted(coco_api.imgs.keys())
@@ -211,8 +223,10 @@ def load_coco_json(json_file, image_root, dataset_name=None, extra_annotation_ke
                     obj["category_id"] = id_map[annotation_category_id]
                 except KeyError as e:
                     raise KeyError(
-                        f"Encountered category_id={annotation_category_id} "
-                        "but this id does not exist in 'categories' of the json file."
+                        f"Encountered category_id={annotation_category_id}, but it's not in "
+                        f"meta.thing_dataset_id_to_contiguous_id (len={len(id_map)}). "
+                        f"This usually means your json uses contiguous ids (e.g., 0..47) "
+                        f"instead of COCO original ids (e.g., 1..90 subset)."
                     ) from e
             objs.append(obj)
         record["annotations"] = objs

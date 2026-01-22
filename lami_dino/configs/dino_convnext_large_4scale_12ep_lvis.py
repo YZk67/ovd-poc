@@ -34,7 +34,7 @@ train.init_checkpoint = "./pretrained_models/clip_convnext_large_trans.pth"
 # Add timestamp to output directory
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 # resume training from the last checkpoint
-train.output_dir = f"/root/dino_convnext_large_ovcoco65_{timestamp}"
+train.output_dir = f"/root/dino_convnext_large_ovcoco80_{timestamp}"
 
 # max training iterations
 # - Original COCO dataset: 113600 images
