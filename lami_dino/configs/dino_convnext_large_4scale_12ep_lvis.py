@@ -152,3 +152,6 @@ os.environ['NUMEXPR_NUM_THREADS'] = '1'
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
 os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
 os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'OFF'
+
+print("TRAIN:", dataloader.train.dataset.names)
+print("TEST :", dataloader.test.dataset.names)
