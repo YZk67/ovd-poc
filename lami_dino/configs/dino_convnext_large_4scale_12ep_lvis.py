@@ -84,11 +84,26 @@ model.eval_query_path = "dataset/metadata/lvis_tpa_prompts_convnextl80.npy"
 # modify optimizer config
 # 假设你单卡用 1e-4 (1GPU); 1e-4 使用原来成功的学习率
 base_lr = 1e-4
-world_size = 1.5  # GPU 数
+world_size = 4  # GPU 数
 optimizer.lr = base_lr * world_size
 optimizer.betas = (0.9, 0.999)
 optimizer.weight_decay = 1e-4
-optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 1
+#optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 1
+def lr_factor(module_name: str) -> float:
+    name = module_name.lower()
+
+    # 1) backbone：常规做法，低 10x
+    if "backbone" in name:
+        return 0.1
+
+    # 2) open-vocab / CLIP 对齐相关：低 100x（最关键）
+    if ("clip" in name) or ("text" in name) or ("classifier" in name) or ("class_embed" in name) or ("logit_scale" in name):
+        return 0.01
+
+    # 3) 默认
+    return 1.0
+
+optimizer.params.lr_factor_func = lr_factor
 
 # modify dataloader config
 # Start with conservative setting, can be increased if stable
@@ -107,11 +122,11 @@ dataloader.test.dataset.names = "ovcoco_2017_val_all"
 
 # ====== Phase 1：测试 Claude Prompts 单独效果 ======
 # Fed Loss是LVIS必须的基础设施，所有实验都需要使用
-model.use_fed_loss = False  # ✅ 必须开启，处理长尾分布
-model.cluster_fed_loss = False
-model.cluster_label_path = None
-model.cat_freq_path = None
-model.fed_loss_num_cat = 0  # 每次采样100个类别计算loss
+model.use_fed_loss = True  # ✅ 必须开启，处理长尾分布
+model.cluster_fed_loss = True
+model.cluster_label_path = 'dataset/cluster/coco_cluster_20.npy'
+model.cat_freq_path = "dataset/coco/instances_train2017_cat_info.json"
+model.fed_loss_num_cat = 30  # 每次采样100个类别计算loss
 model.select_box_nums_for_evaluation = 300
 
 # Enable TPA (Text Prototype Aggregator) by modifying the classifier

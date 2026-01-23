@@ -215,7 +215,7 @@ def register_all_coco(root):
                 meta.evaluator_type = "coco"
 
                 # 统一：所有 split 都用同一套 80类定义
-                _safe_set_thing_classes(key, COCO80, force=True)  # 你这里 COCO65=COCO80类名
+                meta.thing_classes = COCO80
                 meta.thing_dataset_id_to_contiguous_id = _ovcoco_build_id_map()
 
                 continue
