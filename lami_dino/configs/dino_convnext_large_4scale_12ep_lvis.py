@@ -110,8 +110,8 @@ dataloader.test.dataset.names = "ovdcoco65_2017_val_all"
 # Fed Loss是LVIS必须的基础设施，所有实验都需要使用
 model.use_fed_loss = True  # ✅ 必须开启，处理长尾分布
 model.cluster_fed_loss = True
-model.cluster_label_path = 'dataset/cluster/coco_cluster_20.npy'
-model.cat_freq_path = "dataset/coco/instances_train2017_cat_info.json"
+model.cluster_label_path = 'dataset/cluster/ovdcoco65_cluster_20.npy'
+model.cat_freq_path = "dataset/coco/instances_train2017_cat_info_ovdcoco65.json"
 model.fed_loss_num_cat = 20  # 每次采样100个类别计算loss
 model.select_box_nums_for_evaluation = 300
 
