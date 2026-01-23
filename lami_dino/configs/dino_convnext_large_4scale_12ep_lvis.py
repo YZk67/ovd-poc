@@ -93,14 +93,14 @@ optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in modul
 
 # modify dataloader config
 # Start with conservative setting, can be increased if stable
-dataloader.train.num_workers = 4  # 1 worker per GPU for 4GPU training
+dataloader.train.num_workers = 1  # 1 worker per GPU for 4GPU training
 
 # please notice that this is total batch size.
 # surpose you're using 4 gpus for training and the batch size for
 # each gpu is 16/4 = 4
 # Note: Using Option 3 (averaged embeddings), batch_size can remain at 4
 # If using Option 2 (6015 queries), reduce to batch_size=1
-dataloader.train.total_batch_size = 16  # Can use 4 with Option 3
+dataloader.train.total_batch_size = 4  # Can use 4 with Option 3
 
 # dump the testing results into output_dir for visualization
 dataloader.evaluator.output_dir = train.output_dir
@@ -112,7 +112,7 @@ model.use_fed_loss = True  # ✅ 必须开启，处理长尾分布
 model.cluster_fed_loss = True
 model.cluster_label_path = 'dataset/cluster/coco_cluster_20.npy'
 model.cat_freq_path = "dataset/coco/instances_train2017_cat_info.json"
-model.fed_loss_num_cat = 30  # 每次采样100个类别计算loss
+model.fed_loss_num_cat = 20  # 每次采样100个类别计算loss
 model.select_box_nums_for_evaluation = 300
 
 # Enable TPA (Text Prototype Aggregator) by modifying the classifier
