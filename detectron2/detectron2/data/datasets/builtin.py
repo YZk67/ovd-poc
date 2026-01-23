@@ -18,6 +18,7 @@ To add new dataset, refer to the tutorial "docs/DATASETS.md".
 """
 
 import os
+from detectron2.data.datasets.builtin_meta import COCO_CATEGORIES
 
 from detectron2.data import DatasetCatalog, MetadataCatalog
 
@@ -29,6 +30,21 @@ from .coco_panoptic import register_coco_panoptic, register_coco_panoptic_separa
 from .lvis import get_lvis_instances_meta, register_lvis_instances
 from .pascal_voc import register_pascal_voc
 import json
+
+def _build_name_to_coco_id():
+    return {c["name"]: c["id"] for c in COCO_CATEGORIES}
+
+def _build_id_map_from_names(classnames):
+    name_to_id = _build_name_to_coco_id()
+
+    missing = [n for n in classnames if n not in name_to_id]
+    if missing:
+        raise ValueError(f"[ovdcoco65] class names not in COCO_CATEGORIES: {missing}")
+
+    dataset_ids = [name_to_id[n] for n in classnames]  # 按你的顺序生成 category_id 列表
+    id_map = {cid: i for i, cid in enumerate(dataset_ids)}  # category_id -> contiguous id
+    return dataset_ids, id_map
+
 
 # ==================================================================
 # 直接修改原来的 COCO65 变量，放入 80 类全集
@@ -45,6 +61,16 @@ COCO80 = [
     "mouse", "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
     "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier",
     "toothbrush"
+]
+
+OVDCOCO65 = [
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", 
+    "bench", "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", 
+    "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", 
+    "kite", "skateboard", "surfboard", "bottle", "cup", "fork", "knife", "spoon", "bowl", "banana", 
+    "apple", "sandwich", "orange", "broccoli", "carrot", "pizza", "donut", "cake", "chair", "couch", 
+    "bed", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "microwave", "oven", "toaster", 
+    "sink", "refrigerator", "book", "clock", "vase", "scissors", "toothbrush"
 ]
 
 # 同时也必须修改对应的 ID 列表 (这是标准 COCO 的 1-90 ID，对应上面的 80 类)
@@ -81,7 +107,11 @@ _PREDEFINED_SPLITS_COCO["coco"].update({
     "ovcoco_2017_train_t":   ("coco/train2017", "coco/annotations/ovd_ins_train2017_t.json"),  # 一般不用训练
     "ovcoco_2017_val_b":     ("coco/val2017",   "coco/annotations/ovd_ins_val2017_b.json"),
     "ovcoco_2017_val_t":     ("coco/val2017",   "coco/annotations/ovd_ins_val2017_t.json"),
-    "ovcoco_2017_val_all": ("coco/val2017", "coco/annotations1/instances_val2017.json"),
+    "ovcoco_2017_val_all": ("coco/val2017", "coco/annotations/ovd_ins_val2017_all.json"),
+    "ovdcoco65_2017_train_b": ("coco/train2017", "coco/annotations/ovd_ins_train2017_b.json"),
+    "ovdcoco65_2017_val_b":   ("coco/val2017",   "coco/annotations/ovd_ins_val2017_b.json"),
+    "ovdcoco65_2017_val_all": ("coco/val2017",   "coco/annotations/ovd_ins_val2017_all.json"),
+
 })
 
 # _PREDEFINED_SPLITS_COCO["obj365v2"] = {
@@ -155,6 +185,16 @@ _PREDEFINED_SPLITS_COCO_PANOPTIC = {
     ),
 }
 
+OVDCOCO65_DATASET_IDS, OVDCOCO65_IDMAP = _build_id_map_from_names(OVDCOCO65)
+
+# 额外强校验：确保你打印出来的那些 id 都在
+assert len(OVDCOCO65_DATASET_IDS) == 65
+assert OVDCOCO65_IDMAP[1] == 0  # person
+assert OVDCOCO65_IDMAP[90] == 64  # toothbrush
+assert OVDCOCO65_IDMAP[_build_name_to_coco_id()["person"]] == 0
+assert OVDCOCO65_IDMAP[_build_name_to_coco_id()["toothbrush"]] == 64
+
+
 
 def _safe_set_thing_classes(dataset_key, classes, force=False):
     """仅当尚未设置过 thing_classes 时设置，避免触发 D2 断言。"""
@@ -209,6 +249,14 @@ def register_all_coco(root):
             jf = os.path.join(root, json_file) if "://" not in json_file else json_file
             ir = os.path.join(root, image_root)
 
+            if key.startswith("ovdcoco65_2017_"):
+                register_coco_instances(key, {}, jf, ir)
+                meta = MetadataCatalog.get(key)
+                meta.evaluator_type = "coco"
+                meta.thing_classes = OVDCOCO65
+                meta.thing_dataset_id_to_contiguous_id = OVDCOCO65_IDMAP
+                continue
+
             if key.startswith("ovcoco_2017_"):
                 register_coco_instances(key, {}, jf, ir)
                 meta = MetadataCatalog.get(key)
@@ -219,7 +267,6 @@ def register_all_coco(root):
                 meta.thing_dataset_id_to_contiguous_id = _ovcoco_build_id_map()
 
                 continue
-
 
             # 其它 COCO 正常 split：沿用内置 meta
             register_coco_instances(

@@ -11,7 +11,7 @@ model.vlm_query_path = "dataset/metadata/ovdcoco_visual_desc_confuse_convnextl_8
 model.score_ensemble = True
 model.backbone.score_ensemble = model.score_ensemble
 model.seen_classes = 'dataset/metadata/ovcoco_seen_classes.json'
-model.all_classes = 'dataset/metadata/ovcoco_all_classes_80.json'
+model.all_classes = 'dataset/metadata/ovcoco_all_classes.json'
 model.vlm_temperature = 100.0 # keep same with f-vlm
 model.alpha = 0.0
 model.beta = 0.4
@@ -34,7 +34,7 @@ train.init_checkpoint = "./pretrained_models/clip_convnext_large_trans.pth"
 # Add timestamp to output directory
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 # resume training from the last checkpoint
-train.output_dir = f"/root/dino_convnext_large_ovcoco80_{timestamp}"
+train.output_dir = f"/root/dino_convnext_large_ovcoco65_{timestamp}"
 
 # max training iterations
 # - Original COCO dataset: 113600 images
@@ -69,10 +69,10 @@ train.sync_batchnorm = True
 train.device = "cuda"
 model.device = train.device
 
-model.num_classes = 80
+model.num_classes = 65
 # Set the text embedding paths for TPA (using Claude-generated 8 prompts per class)
-model.query_path = "dataset/metadata/coco_80_hybrid_classifier.npy"
-model.eval_query_path = "dataset/metadata/lvis_tpa_prompts_convnextl80.npy"
+model.query_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl.npy"
+model.eval_query_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl.npy"
 
 # model.use_fed_loss = True
 # model.cluster_fed_loss = True
@@ -104,7 +104,7 @@ dataloader.train.total_batch_size = 16  # Can use 4 with Option 3
 
 # dump the testing results into output_dir for visualization
 dataloader.evaluator.output_dir = train.output_dir
-dataloader.test.dataset.names = "ovcoco_2017_val_all"
+dataloader.test.dataset.names = "ovdcoco65_2017_val_all"
 
 # ====== Phase 1：测试 Claude Prompts 单独效果 ======
 # Fed Loss是LVIS必须的基础设施，所有实验都需要使用
@@ -117,8 +117,8 @@ model.select_box_nums_for_evaluation = 300
 
 # Enable TPA (Text Prototype Aggregator) by modifying the classifier
 model.classifier.use_tpa = True
-model.classifier.text_embed_path = "dataset/metadata/coco_80_hybrid_classifier.npy"
-model.classifier.eval_text_embed_path = "dataset/metadata/coco_80_hybrid_classifier.npy"
+model.classifier.text_embed_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl.npy"
+model.classifier.eval_text_embed_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl.npy"
 model.classifier.tpa_num_prototypes = 5  # 8 prompts -> 5 prototypes (better utilization)
 model.classifier.tpa_hidden_dim = 256
 model.classifier.tpa_dropout = 0.05  # Add dropout for regularization
