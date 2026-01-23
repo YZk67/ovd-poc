@@ -84,26 +84,12 @@ model.eval_query_path = "dataset/metadata/lvis_tpa_prompts_convnextl80.npy"
 # modify optimizer config
 # 假设你单卡用 1e-4 (1GPU); 1e-4 使用原来成功的学习率
 base_lr = 1e-4
-world_size = 4  # GPU 数
+world_size = 1.5  # GPU 数
 optimizer.lr = base_lr * world_size
 optimizer.betas = (0.9, 0.999)
 optimizer.weight_decay = 1e-4
 #optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 1
-def lr_factor(module_name: str) -> float:
-    name = module_name.lower()
-
-    # 1) backbone：常规做法，低 10x
-    if "backbone" in name:
-        return 0.1
-
-    # 2) open-vocab / CLIP 对齐相关：低 100x（最关键）
-    if ("clip" in name) or ("text" in name) or ("classifier" in name) or ("class_embed" in name) or ("logit_scale" in name):
-        return 0.01
-
-    # 3) 默认
-    return 1.0
-
-optimizer.params.lr_factor_func = lr_factor
+optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 1
 
 # modify dataloader config
 # Start with conservative setting, can be increased if stable
