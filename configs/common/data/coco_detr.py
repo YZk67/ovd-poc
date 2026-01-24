@@ -14,7 +14,7 @@ from detrex.data import DetrDatasetMapper
 dataloader = OmegaConf.create()
 
 dataloader.train = L(build_detection_train_loader)(
-    dataset=L(get_detection_dataset_dicts)(names="ovcoco65_2017_train_b"),
+    dataset=L(get_detection_dataset_dicts)(names="ovdcoco65_2017_train_b"),
     mapper=L(DetrDatasetMapper)(
         augmentation=[
             L(T.RandomFlip)(),
