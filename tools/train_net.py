@@ -165,16 +165,17 @@ class Trainer(SimpleTrainer):
 
 def do_test(cfg, model):
     if "evaluator" in cfg.dataloader:
+        training_mode = model.training  # CHANGE: remember current mode to restore after eval
         try:
             # Temporarily reduce num_workers for evaluation to prevent BrokenPipeError
             original_num_workers = cfg.dataloader.test.num_workers
             cfg.dataloader.test.num_workers = 0  # Use single process for evaluation
-            
+
             ret = inference_on_dataset(
                 model, instantiate(cfg.dataloader.test), instantiate(cfg.dataloader.evaluator), cfg.DDEBUG
             )
             print_csv_format(ret)
-            
+
             # Restore original num_workers
             cfg.dataloader.test.num_workers = original_num_workers
             return ret
@@ -192,6 +193,8 @@ def do_test(cfg, model):
             # Restore original num_workers
             cfg.dataloader.test.num_workers = original_num_workers
             return {}
+        finally:
+            model.train(training_mode)  # CHANGE: ensure training mode is restored
 
 
 # ==== Added by ChatGPT ====
