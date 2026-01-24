@@ -104,6 +104,8 @@ dataloader.train.total_batch_size = 4  # Can use 4 with Option 3
 
 # dump the testing results into output_dir for visualization
 dataloader.evaluator.output_dir = train.output_dir
+# keep 65-class splits for both train/test
+dataloader.train.dataset.names = "ovdcoco65_2017_train_b"
 dataloader.test.dataset.names = "ovdcoco65_2017_val_all"
 
 # ====== Phase 1：测试 Claude Prompts 单独效果 ======
