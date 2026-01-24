@@ -358,6 +358,15 @@ class DINO(nn.Module):
         # 广播到所有 GPU（若未分布式则跳过）
         if is_dist_avail_and_initialized():
             dist.broadcast(content_inds, src=0)
+        # Sanity-check indices are within class range
+        if content_inds.numel() > 0:
+            max_idx = int(content_inds.max().item())
+            min_idx = int(content_inds.min().item())
+            if min_idx < 0 or max_idx >= self.num_classes:
+                raise ValueError(
+                    f"[FedLoss] content_inds out of range: min={min_idx}, max={max_idx}, "
+                    f"num_classes={self.num_classes}"
+                )
 
         # === 之后保持你原有的映射逻辑：将 gt_classes 映射到 [0..M-1] ===
         convert_map = torch.ones(self.num_classes, dtype=torch.int64, device=device) * -1
@@ -455,6 +464,12 @@ class DINO(nn.Module):
         if hasattr(self.transformer.decoder.class_embed[0], 'use_tpa') and self.transformer.decoder.class_embed[0].use_tpa:
             text_classifier = self.transformer.decoder.class_embed[0]
             text_feats = text_classifier._maybe_move_text_feats(training=self.training)
+            if content_inds is not None:
+                max_idx = int(content_inds.max().item())
+                if max_idx >= text_feats.shape[0]:
+                    raise ValueError(
+                        f"[TPA] content_inds max {max_idx} exceeds text_feats size {text_feats.shape[0]}"
+                    )
             if content_inds is not None:
                 text_feats = text_feats[content_inds]
             # [C,K,D_text]
