@@ -331,12 +331,13 @@ class DINO(nn.Module):
 
         # 仅在 rank 0 进行采样；其它 rank 准备占位
         need_sample = (not is_dist_avail_and_initialized()) or (dist.get_rank() == 0)
+        desired_len = max(self.fed_loss_num_cat, int(all_gt.numel()))
 
         if need_sample:
             if self.cluster_fed_loss:
                 content_inds = get_cluster_fed_loss_inds(
                     all_gt,
-                    num_sample_cats=self.fed_loss_num_cat,
+                    num_sample_cats=desired_len,
                     C=self.num_classes,
                     weight=freq_weight,
                     cluster_label=self.cluster_label,
@@ -344,7 +345,7 @@ class DINO(nn.Module):
             else:
                 content_inds = get_fed_loss_inds(
                     all_gt,
-                    num_sample_cats=self.fed_loss_num_cat,
+                    num_sample_cats=desired_len,
                     C=self.num_classes,
                     weight=freq_weight,
                 )
@@ -352,7 +353,7 @@ class DINO(nn.Module):
             content_inds = content_inds.to(device=device, dtype=torch.long)
         else:
             # 用固定长度占位，等会儿接收广播
-            content_inds = torch.zeros(self.fed_loss_num_cat, device=device, dtype=torch.long)
+            content_inds = torch.zeros(desired_len, device=device, dtype=torch.long)
 
         # 广播到所有 GPU（若未分布式则跳过）
         if is_dist_avail_and_initialized():
@@ -364,8 +365,16 @@ class DINO(nn.Module):
         convert_map[content_inds] = torch.arange(content_inds.numel(), device=device, dtype=torch.int64)
 
         for idx, target in enumerate(batched_inputs):
-            cats = target["instances"].gt_classes.to(device)
-            batched_inputs[idx]["instances"].gt_classes = convert_map[cats]
+            inst = target["instances"]
+            cats = inst.gt_classes.to(device)
+            mapped = convert_map[cats]
+            if (mapped < 0).any():
+                bad = cats[mapped < 0].detach().cpu().unique()
+                raise ValueError(
+                    f"[FedLoss] content_inds missing GT classes: {bad[:10].tolist()}"
+                )
+            inst.gt_classes = mapped
+            batched_inputs[idx]["instances"] = inst
         
         # DEBUG（可选）：多卡一致性哈希（仅前200 iter打印）
         if is_dist_avail_and_initialized():
@@ -468,7 +477,8 @@ class DINO(nn.Module):
         if self.training:
             gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
             targets = self.prepare_targets(gt_instances)
-            cdn_num_classes = self.fed_loss_num_cat if self.use_fed_loss else self.num_classes
+            # CDN labels are in full class space; do not shrink by fed_loss_num_cat
+            cdn_num_classes = self.num_classes
             input_query_label, input_query_bbox, attn_mask, dn_meta = self.prepare_for_cdn(
                 targets,
                 dn_number=self.dn_number,
