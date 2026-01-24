@@ -23,6 +23,10 @@ import torch
 # Suppress warnings for cleaner training output
 warnings.filterwarnings("ignore", category=FutureWarning, module="timm")
 warnings.filterwarnings("ignore", message="torch.meshgrid.*indexing.*")
+
+# CHANGE: force CUDA sync error reporting in spawned processes
+os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")
+os.environ.setdefault("TORCH_SHOW_CPP_STACKTRACES", "1")
 from torch.nn.parallel import DataParallel, DistributedDataParallel
 
 from detectron2.checkpoint import DetectionCheckpointer
