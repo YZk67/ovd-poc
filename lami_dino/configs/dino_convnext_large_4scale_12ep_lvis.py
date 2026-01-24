@@ -7,7 +7,7 @@ from datetime import datetime
 if "language" in model:
     del model["language"]
 
-model.vlm_query_path = "dataset/metadata/ovdcoco_visual_desc_confuse_convnextl_subset65.npy"
+model.vlm_query_path = "dataset/metadata/ovdcoco_vlm_query_convnextl.npy"
 model.score_ensemble = True
 model.backbone.score_ensemble = model.score_ensemble
 model.seen_classes = 'dataset/metadata/ovcoco_seen_classes.json'
