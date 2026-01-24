@@ -47,7 +47,7 @@ train.output_dir = f"/root/dino_convnext_large_ovcoco65_{timestamp}"
 # - Batch size 64: 100,170 ÷ 64 = 1,565 iter/epoch → 18,780 total (12 epochs)
 # - Standardized values: 7,100 (bs16), 3,550 (bs32), 1,775 (bs64)
 # - LR scheduler: use lr_multiplier_12ep_warmup for batch size 32
-train.max_iter = 85200 #85200  # Single GPU A100 4 epochs 12 epochs with batch size 32: 100170/32*12 -- 85200
+train.max_iter = 170400 #85200  # Single GPU A100 4 epochs 12 epochs with batch size 32: 100170/32*12 -- 85200
 
 # run evaluation every 3130 iters
 train.eval_period = 5000  # Evaluate after each epoch 7100//2
@@ -78,13 +78,13 @@ model.use_fed_loss = True
 model.cluster_fed_loss = True
 model.cluster_label_path = 'dataset/cluster/ovd_cluster_128.npy'
 model.cat_freq_path = "dataset/coco/ovd_ins_train2017_all_cat_info.json"
-model.fed_loss_num_cat=100
+model.fed_loss_num_cat = 20
 model.select_box_nums_for_evaluation = 300
 
 # modify optimizer config
 # 假设你单卡用 1e-4 (1GPU); 1e-4 使用原来成功的学习率
 base_lr = 1e-4
-world_size = 1.5  # GPU 数
+world_size = 2  # GPU 数
 optimizer.lr = base_lr * world_size
 optimizer.betas = (0.9, 0.999)
 optimizer.weight_decay = 1e-4
@@ -93,14 +93,14 @@ optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in modul
 
 # modify dataloader config
 # Start with conservative setting, can be increased if stable
-dataloader.train.num_workers = 1  # 1 worker per GPU for 4GPU training
+dataloader.train.num_workers = 2  # 1 worker per GPU for 4GPU training
 
 # please notice that this is total batch size.
 # surpose you're using 4 gpus for training and the batch size for
 # each gpu is 16/4 = 4
 # Note: Using Option 3 (averaged embeddings), batch_size can remain at 4
 # If using Option 2 (6015 queries), reduce to batch_size=1
-dataloader.train.total_batch_size = 4  # Can use 4 with Option 3
+dataloader.train.total_batch_size = 8  # Can use 4 with Option 3
 
 # dump the testing results into output_dir for visualization
 dataloader.evaluator.output_dir = train.output_dir
@@ -110,8 +110,8 @@ dataloader.test.dataset.names = "ovdcoco65_2017_val_all"
 
 # ====== Phase 1：测试 Claude Prompts 单独效果 ======
 # Fed Loss是LVIS必须的基础设施，所有实验都需要使用
-model.use_fed_loss = False  # ✅ 必须开启，处理长尾分布
-model.cluster_fed_loss = False
+#model.use_fed_loss = False  # ✅ 必须开启，处理长尾分布
+#model.cluster_fed_loss = False
 #model.cluster_label_path = 'dataset/cluster/ovdcoco65_cluster_20.npy'
 #model.cat_freq_path = "dataset/coco/instances_train2017_cat_info_ovdcoco65.json"
 #model.fed_loss_num_cat = 20  # 每次采样100个类别计算loss
