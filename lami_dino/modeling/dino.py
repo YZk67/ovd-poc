@@ -475,14 +475,7 @@ class DINO(nn.Module):
         if hasattr(self.transformer.decoder.class_embed[0], 'use_tpa') and self.transformer.decoder.class_embed[0].use_tpa:
             text_classifier = self.transformer.decoder.class_embed[0]
             text_feats = text_classifier._maybe_move_text_feats(training=self.training)
-            if content_inds is not None:
-                max_idx = int(content_inds.max().item())
-                if max_idx >= text_feats.shape[0]:
-                    raise ValueError(
-                        f"[TPA] content_inds max {max_idx} exceeds text_feats size {text_feats.shape[0]}"
-                    )
-            if content_inds is not None:
-                text_feats = text_feats[content_inds]
+            # Keep full class text_feats so CDN can index with full labels.
             # [C,K,D_text]
             proto_ckd, _ = text_classifier.tpa(text_feats, with_loss=False)
             # Project to decoder dim
