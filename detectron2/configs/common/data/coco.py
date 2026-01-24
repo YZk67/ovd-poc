@@ -13,7 +13,7 @@ from detectron2.evaluation import COCOEvaluator
 dataloader = OmegaConf.create()
 
 dataloader.train = L(build_detection_train_loader)(
-    dataset=L(get_detection_dataset_dicts)(names="ovcoco_2017_train_b"),
+    dataset=L(get_detection_dataset_dicts)(names="ovcoco65_2017_train_b"),
     mapper=L(DatasetMapper)(
         is_train=True,
         augmentations=[
