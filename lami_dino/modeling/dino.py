@@ -306,7 +306,15 @@ class DINO(nn.Module):
         # 本 rank 的 GT 类
         local_gt = []
         for target in batched_inputs:
-            local_gt.append(target["instances"].gt_classes.to(device))
+            gt_classes = target["instances"].gt_classes.to(device)
+            if (gt_classes < 0).any() or (gt_classes >= self.num_classes).any():
+                bad = gt_classes[(gt_classes < 0) | (gt_classes >= self.num_classes)]
+                bad = bad.detach().cpu().unique()
+                raise ValueError(
+                    f"[FedLoss] invalid gt_classes before remap (num_classes={self.num_classes}): "
+                    f"{bad[:10].tolist()}"
+                )
+            local_gt.append(gt_classes)
         if len(local_gt) > 0:
             local_gt = torch.unique(torch.cat(local_gt))
         else:
@@ -781,9 +789,19 @@ class DINO(nn.Module):
                 # Multi-prototype mode: [C, K, embed_dim]
                 # For CDN, we need to aggregate prototypes first
                 content_query_embeds_agg = content_query_embeds.mean(dim=1)  # [C, embed_dim]
+                if m.numel() and int(m.max().item()) >= content_query_embeds_agg.shape[0]:
+                    raise ValueError(
+                        f"[CDN] label index out of range for content_query_embeds: "
+                        f"max_label={int(m.max().item())}, C={content_query_embeds_agg.shape[0]}"
+                    )
                 input_label_content = content_query_embeds_agg[m]
             else:
                 # Single-prototype mode: [C, embed_dim]
+                if m.numel() and int(m.max().item()) >= content_query_embeds.shape[0]:
+                    raise ValueError(
+                        f"[CDN] label index out of range for content_query_embeds: "
+                        f"max_label={int(m.max().item())}, C={content_query_embeds.shape[0]}"
+                    )
                 input_label_content = content_query_embeds[m]
             input_label_embed = input_label_content
 
