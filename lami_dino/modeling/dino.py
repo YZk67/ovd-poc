@@ -800,7 +800,18 @@ class DINO(nn.Module):
             map_known_indice = torch.cat(
                 [map_known_indice + single_padding * i for i in range(2 * dn_number)]
             ).long()
+            # Debug: validate indices before advanced indexing
+            if map_known_indice.numel() > 0:
+                max_idx = int(map_known_indice.max().item())
+                if max_idx >= pad_size:
+                    raise ValueError(
+                        f"[CDN] map_known_indice out of range: max={max_idx}, pad_size={pad_size}"
+                    )
         if len(known_bid):
+            if int(known_bid.max().item()) >= batch_size:
+                raise ValueError(
+                    f"[CDN] known_bid out of range: max={int(known_bid.max().item())}, batch_size={batch_size}"
+                )
             input_query_label[(known_bid.long(), map_known_indice)] = input_label_embed
             input_query_bbox[(known_bid.long(), map_known_indice)] = input_bbox_embed
 
