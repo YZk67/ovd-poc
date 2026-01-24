@@ -697,6 +697,15 @@ class DINO(nn.Module):
         known_bboxs = boxes.repeat(2 * dn_number, 1)
         known_labels_expaned = known_labels.clone()
         known_bbox_expand = known_bboxs.clone()
+        # Debug: catch invalid labels/boxes early
+        if (known_labels_expaned < 0).any() or (known_labels_expaned >= num_classes).any():
+            bad = known_labels_expaned[(known_labels_expaned < 0) | (known_labels_expaned >= num_classes)]
+            bad = bad.detach().cpu().unique()
+            raise ValueError(
+                f"[CDN] invalid label(s) detected (num_classes={num_classes}): {bad[:10].tolist()}"
+            )
+        if not torch.isfinite(known_bboxs).all():
+            raise ValueError("[CDN] found NaN/Inf in known_bboxs")
 
         if label_noise_ratio > 0:
             p = torch.rand_like(known_labels_expaned.float())
@@ -875,5 +884,14 @@ class DINO(nn.Module):
             gt_scores = targets_per_image.gt_scores
             gt_boxes = targets_per_image.gt_boxes.tensor / image_size_xyxy
             gt_boxes = box_xyxy_to_cxcywh(gt_boxes)
+            # Debug: validate labels/boxes
+            if (gt_classes < 0).any() or (gt_classes >= self.num_classes).any():
+                bad = gt_classes[(gt_classes < 0) | (gt_classes >= self.num_classes)]
+                bad = bad.detach().cpu().unique()
+                raise ValueError(
+                    f"[Targets] invalid label(s) detected (num_classes={self.num_classes}): {bad[:10].tolist()}"
+                )
+            if not torch.isfinite(gt_boxes).all():
+                raise ValueError("[Targets] found NaN/Inf in gt_boxes")
             new_targets.append({"labels": gt_classes, "boxes": gt_boxes, "scores": gt_scores})
         return new_targets
