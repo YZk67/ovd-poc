@@ -278,6 +278,19 @@ def do_train(args, cfg):
     model = instantiate(cfg.model)
     logger = logging.getLogger("detectron2")
     logger.info("Model:\n{}".format(model))
+    # CHANGE: debug class counts / text embedding shapes for 65-class setup
+    try:
+        num_classes = getattr(model, "num_classes", None)
+        text_embed = None
+        if hasattr(model, "classifier"):
+            text_embed = getattr(model.classifier, "text_embed", None)
+        logger.info(f"[Debug] num_classes={num_classes}")
+        if text_embed is not None:
+            logger.info(f"[Debug] classifier.text_embed shape={tuple(text_embed.shape)}")
+        else:
+            logger.info("[Debug] classifier.text_embed not found")
+    except Exception as e:
+        logger.warning(f"[Debug] failed to report class/embed info: {e}")
     model.to(cfg.train.device)
 
     # ==== Added by ChatGPT ====
