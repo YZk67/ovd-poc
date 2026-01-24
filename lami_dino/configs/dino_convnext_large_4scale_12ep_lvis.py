@@ -105,17 +105,17 @@ dataloader.train.total_batch_size = 4  # Can use 4 with Option 3
 # dump the testing results into output_dir for visualization
 dataloader.evaluator.output_dir = train.output_dir
 # keep 65-class splits for both train/test
-dataloader.train.dataset.names = "ovdcoco65_2017_train_b"
+#dataloader.train.dataset.names = "ovdcoco65_2017_train_b"
 dataloader.test.dataset.names = "ovdcoco65_2017_val_all"
 
 # ====== Phase 1：测试 Claude Prompts 单独效果 ======
 # Fed Loss是LVIS必须的基础设施，所有实验都需要使用
-model.use_fed_loss = True  # ✅ 必须开启，处理长尾分布
-model.cluster_fed_loss = True
-model.cluster_label_path = 'dataset/cluster/ovdcoco65_cluster_20.npy'
-model.cat_freq_path = "dataset/coco/instances_train2017_cat_info_ovdcoco65.json"
-model.fed_loss_num_cat = 20  # 每次采样100个类别计算loss
-model.select_box_nums_for_evaluation = 300
+model.use_fed_loss = False  # ✅ 必须开启，处理长尾分布
+model.cluster_fed_loss = False
+#model.cluster_label_path = 'dataset/cluster/ovdcoco65_cluster_20.npy'
+#model.cat_freq_path = "dataset/coco/instances_train2017_cat_info_ovdcoco65.json"
+#model.fed_loss_num_cat = 20  # 每次采样100个类别计算loss
+#model.select_box_nums_for_evaluation = 300
 
 # Enable TPA (Text Prototype Aggregator) by modifying the classifier
 model.classifier.use_tpa = True
