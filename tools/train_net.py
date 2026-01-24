@@ -289,6 +289,14 @@ def do_train(args, cfg):
             logger.info(f"[Debug] classifier.text_embed shape={tuple(text_embed.shape)}")
         else:
             logger.info("[Debug] classifier.text_embed not found")
+        # Probe decoder text features (TPA / class_embed)
+        if hasattr(model, "transformer") and hasattr(model.transformer, "decoder"):
+            class_embed0 = model.transformer.decoder.class_embed[0]
+            if hasattr(class_embed0, "_maybe_move_text_feats"):
+                text_feats = class_embed0._maybe_move_text_feats(training=True)
+                logger.info(f"[Debug] decoder text_feats shape={tuple(text_feats.shape)}")
+            else:
+                logger.info("[Debug] decoder class_embed[0] has no _maybe_move_text_feats")
     except Exception as e:
         logger.warning(f"[Debug] failed to report class/embed info: {e}")
     model.to(cfg.train.device)
