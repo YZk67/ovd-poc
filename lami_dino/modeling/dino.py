@@ -334,20 +334,23 @@ class DINO(nn.Module):
         desired_len = max(self.fed_loss_num_cat, int(all_gt.numel()))
 
         if need_sample:
+            # Do sampling on CPU to avoid device-side index asserts
+            all_gt_cpu = all_gt.detach().cpu()
+            freq_weight_cpu = freq_weight.detach().cpu()
             if self.cluster_fed_loss:
                 content_inds = get_cluster_fed_loss_inds(
-                    all_gt,
+                    all_gt_cpu,
                     num_sample_cats=desired_len,
                     C=self.num_classes,
-                    weight=freq_weight,
+                    weight=freq_weight_cpu,
                     cluster_label=self.cluster_label,
                 )
             else:
                 content_inds = get_fed_loss_inds(
-                    all_gt,
+                    all_gt_cpu,
                     num_sample_cats=desired_len,
                     C=self.num_classes,
-                    weight=freq_weight,
+                    weight=freq_weight_cpu,
                 )
             # 保证类型与设备
             content_inds = content_inds.to(device=device, dtype=torch.long)
