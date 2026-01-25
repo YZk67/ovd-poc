@@ -97,6 +97,7 @@ class DINO(nn.Module):
         beta: float =0.7,
         novel_scale: float =5.0,
         novel_logit_scale: float = 1.0,
+        test_score_thresh: float = 0.0,
         clip_head_path=None,
         use_soft_attention: bool = True,
         soft_attention_tau: float = 0.1,
@@ -107,6 +108,7 @@ class DINO(nn.Module):
         self.beta = beta
         self.novel_scale = novel_scale
         self.novel_logit_scale = novel_logit_scale
+        self.test_score_thresh = test_score_thresh
         self.use_soft_attention = use_soft_attention
         self.soft_attention_tau = soft_attention_tau
         # define backbone and position embedding module
@@ -933,6 +935,11 @@ class DINO(nn.Module):
             result.pred_boxes = Boxes(box_cxcywh_to_xyxy(box_pred_per_image))
 
             result.pred_boxes.scale(scale_x=image_size[1], scale_y=image_size[0])
+            if self.test_score_thresh > 0:
+                keep = scores_per_image > self.test_score_thresh
+                scores_per_image = scores_per_image[keep]
+                labels_per_image = labels_per_image[keep]
+                result.pred_boxes = result.pred_boxes[keep]
             result.scores = scores_per_image
             result.pred_classes = labels_per_image
             results.append(result)
