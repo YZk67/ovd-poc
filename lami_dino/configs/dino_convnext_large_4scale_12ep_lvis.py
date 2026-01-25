@@ -1,6 +1,8 @@
 from detrex.config import get_config
 from .models.dino_convnextl import model
 from datetime import datetime
+from fvcore.common.param_scheduler import MultiStepParamScheduler
+from detectron2.solver import WarmupParamScheduler
 
 # Remove 'language' key from model config as it's not a parameter for DINO.__init__()
 # The language config is only used for TextClassifier via ${..language.xxx} references
@@ -17,12 +19,22 @@ model.alpha = 0.0
 model.beta = 0.4
 model.novel_scale = 5.0
 model.novel_logit_scale = 1.3  # moderate novel boost
+model.label_noise_ratio = 0.4  # stronger regularization for base overfitting
 model.test_score_thresh = 0.01  # filter low-confidence noise
 
 # get default config
 dataloader = get_config("common/data/coco_detr.py").dataloader
 optimizer = get_config("common/optim.py").AdamW
-lr_multiplier = get_config("common/coco_schedule.py").lr_multiplier_12ep_warmup
+# Use a scheduler with an earlier decay (~2 epochs) to slow base overfitting.
+lr_multiplier = WarmupParamScheduler(
+    scheduler=MultiStepParamScheduler(
+        values=[1.0, 0.5, 0.1],
+        milestones=[25000, 90000, 170400],
+    ),
+    warmup_length=1000 / 170400,
+    warmup_method="linear",
+    warmup_factor=0.001,
+)
 # lr_multiplier = get_config("common/lvis_schedule.py").lr_multiplier_12ep_64bs  # Use 64bs scheduler for batch size 64
 train = get_config("common/train.py").train
 
@@ -76,11 +88,11 @@ model.num_classes = 65
 model.query_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl.npy"
 model.eval_query_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl.npy"
 
-model.use_fed_loss = False
-model.cluster_fed_loss = False
-#model.cluster_label_path = 'dataset/cluster/ovd_cluster_128.npy'
-#model.cat_freq_path = "dataset/coco/ovd_ins_train2017_all_cat_info.json"
-#model.fed_loss_num_cat = 20
+model.use_fed_loss = True
+model.cluster_fed_loss = True
+model.cluster_label_path = 'dataset/cluster/ovd_cluster_128.npy'
+model.cat_freq_path = "dataset/coco/ovd_ins_train2017_all_cat_info.json"
+model.fed_loss_num_cat = 30
 model.select_box_nums_for_evaluation = 500  # balance recall vs noise
 
 # modify optimizer config
