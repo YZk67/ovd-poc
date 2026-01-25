@@ -383,13 +383,24 @@ class DINO(nn.Module):
             dist.broadcast(content_inds, src=0)
         # Sanity-check indices are within class range
         if content_inds.numel() > 0:
-            max_idx = int(content_inds.max().item())
-            min_idx = int(content_inds.min().item())
+            # Drop background id (== num_classes) if sampled
+            content_inds = content_inds[content_inds < self.num_classes]
+            max_idx = int(content_inds.max().item()) if content_inds.numel() else -1
+            min_idx = int(content_inds.min().item()) if content_inds.numel() else -1
             if min_idx < 0 or max_idx >= self.num_classes:
                 raise ValueError(
                     f"[FedLoss] content_inds out of range: min={min_idx}, max={max_idx}, "
                     f"num_classes={self.num_classes}"
                 )
+            # If filtering removed entries, resample to desired length
+            if content_inds.numel() < desired_len:
+                needed = desired_len - int(content_inds.numel())
+                pool = torch.ones(self.num_classes, device=device, dtype=torch.bool)
+                pool[content_inds] = False
+                candidates = torch.nonzero(pool).flatten()
+                if candidates.numel() >= needed:
+                    extra = candidates[torch.randperm(candidates.numel(), device=device)[:needed]]
+                    content_inds = torch.cat([content_inds, extra])
 
         # === 之后保持你原有的映射逻辑：将 gt_classes 映射到 [0..M-1] ===
         convert_map = torch.ones(self.num_classes, dtype=torch.int64, device=device) * -1
