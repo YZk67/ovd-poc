@@ -16,6 +16,7 @@ model.vlm_temperature = 100.0 # keep same with f-vlm
 model.alpha = 0.0
 model.beta = 0.4
 model.novel_scale = 5.0
+model.novel_logit_scale = 1.3  # boost novel logits at inference (ablation)
 
 # get default config
 dataloader = get_config("common/data/coco_detr.py").dataloader
@@ -74,12 +75,12 @@ model.num_classes = 65
 model.query_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl.npy"
 model.eval_query_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl.npy"
 
-model.use_fed_loss = True
-model.cluster_fed_loss = True
-model.cluster_label_path = 'dataset/cluster/ovd_cluster_128.npy'
-model.cat_freq_path = "dataset/coco/ovd_ins_train2017_all_cat_info.json"
-model.fed_loss_num_cat = 20
-model.select_box_nums_for_evaluation = 300
+model.use_fed_loss = False
+model.cluster_fed_loss = False
+#model.cluster_label_path = 'dataset/cluster/ovd_cluster_128.npy'
+#model.cat_freq_path = "dataset/coco/ovd_ins_train2017_all_cat_info.json"
+#model.fed_loss_num_cat = 20
+#model.select_box_nums_for_evaluation = 300
 
 # modify optimizer config
 # 假设你单卡用 1e-4 (1GPU); 1e-4 使用原来成功的学习率

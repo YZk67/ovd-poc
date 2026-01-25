@@ -96,6 +96,7 @@ class DINO(nn.Module):
         alpha: float =0.3,
         beta: float =0.7,
         novel_scale: float =5.0,
+        novel_logit_scale: float = 1.0,
         clip_head_path=None,
         use_soft_attention: bool = True,
         soft_attention_tau: float = 0.1,
@@ -105,6 +106,7 @@ class DINO(nn.Module):
         self.alpha = alpha
         self.beta = beta
         self.novel_scale = novel_scale
+        self.novel_logit_scale = novel_logit_scale
         self.use_soft_attention = use_soft_attention
         self.soft_attention_tau = soft_attention_tau
         # define backbone and position embedding module
@@ -235,6 +237,14 @@ class DINO(nn.Module):
                 self.novel_idx[idx_novel] = True
             else:
                 self.novel_idx = self.base_idx == False
+        elif all_classes and seen_classes and self.novel_logit_scale != 1.0:
+            # Build novel indices for logit scaling without enabling score ensemble
+            self.seen_classes = json.load(open(seen_classes))
+            self.all_classes = json.load(open(all_classes))
+            idx = [self.all_classes.index(seen) for seen in self.seen_classes]
+            self.base_idx = torch.zeros(len(self.all_classes), dtype=bool)
+            self.base_idx[idx] = True
+            self.novel_idx = self.base_idx == False
         self.save_dir = save_dir
         if self.save_dir:
             os.makedirs(self.save_dir, exist_ok=True)
@@ -617,6 +627,9 @@ class DINO(nn.Module):
                 box_cls = cls_score
                 results = self.inference(box_cls, box_pred, images.image_sizes, wo_sigmoid=True)
             else:
+                if self.novel_logit_scale != 1.0 and hasattr(self, "novel_idx"):
+                    box_cls = box_cls.clone()
+                    box_cls[:, :, self.novel_idx] = box_cls[:, :, self.novel_idx] * self.novel_logit_scale
                 results = self.inference(box_cls, box_pred, images.image_sizes)
             processed_results = []
             for results_per_image, input_per_image, image_size in zip(
