@@ -16,8 +16,8 @@ model.vlm_temperature = 100.0 # keep same with f-vlm
 model.alpha = 0.0
 model.beta = 0.4
 model.novel_scale = 5.0
-model.novel_logit_scale = 2.0  # boost novel logits at inference (ablation)
-model.test_score_thresh = 0.001  # lower test threshold to keep more novel predictions
+model.novel_logit_scale = 1.3  # moderate novel boost
+model.test_score_thresh = 0.01  # filter low-confidence noise
 
 # get default config
 dataloader = get_config("common/data/coco_detr.py").dataloader
@@ -81,7 +81,7 @@ model.cluster_fed_loss = False
 #model.cluster_label_path = 'dataset/cluster/ovd_cluster_128.npy'
 #model.cat_freq_path = "dataset/coco/ovd_ins_train2017_all_cat_info.json"
 #model.fed_loss_num_cat = 20
-model.select_box_nums_for_evaluation = 1000  # keep more candidates for APn
+model.select_box_nums_for_evaluation = 500  # balance recall vs noise
 
 # modify optimizer config
 # 假设你单卡用 1e-4 (1GPU); 1e-4 使用原来成功的学习率
