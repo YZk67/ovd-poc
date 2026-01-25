@@ -3,6 +3,7 @@ from .models.dino_convnextl import model
 from datetime import datetime
 from fvcore.common.param_scheduler import MultiStepParamScheduler
 from detectron2.solver import WarmupParamScheduler
+from detectron2.config import LazyCall as L
 
 # Remove 'language' key from model config as it's not a parameter for DINO.__init__()
 # The language config is only used for TextClassifier via ${..language.xxx} references
@@ -26,8 +27,8 @@ model.test_score_thresh = 0.01  # filter low-confidence noise
 dataloader = get_config("common/data/coco_detr.py").dataloader
 optimizer = get_config("common/optim.py").AdamW
 # Use a scheduler with an earlier decay (~2 epochs) to slow base overfitting.
-lr_multiplier = WarmupParamScheduler(
-    scheduler=MultiStepParamScheduler(
+lr_multiplier = L(WarmupParamScheduler)(
+    scheduler=L(MultiStepParamScheduler)(
         values=[1.0, 0.5, 0.1],
         milestones=[25000, 90000, 170400],
     ),
