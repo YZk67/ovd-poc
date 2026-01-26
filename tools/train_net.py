@@ -319,6 +319,7 @@ def do_train(args, cfg):
     optim = instantiate(cfg.optimizer)
 
     train_loader = instantiate(cfg.dataloader.train)
+    logger.info(f"TRAIN SAMPLER: {type(train_loader.sampler)} {train_loader.sampler}")
 
     model = create_ddp_model(model, **cfg.train.ddp)
 

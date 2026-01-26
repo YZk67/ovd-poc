@@ -946,13 +946,10 @@ class DINO(nn.Module):
             result.pred_boxes = Boxes(box_cxcywh_to_xyxy(box_pred_per_image))
 
             result.pred_boxes.scale(scale_x=image_size[1], scale_y=image_size[0])
-            if self.test_score_thresh > 0:
-                keep = scores_per_image > self.test_score_thresh
-                scores_per_image = scores_per_image[keep]
-                labels_per_image = labels_per_image[keep]
-                result.pred_boxes = result.pred_boxes[keep]
             result.scores = scores_per_image
             result.pred_classes = labels_per_image
+            if self.test_score_thresh > 0:
+                result = result[result.scores > self.test_score_thresh]
             results.append(result)
         return results
 
