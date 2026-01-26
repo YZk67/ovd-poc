@@ -319,7 +319,13 @@ def do_train(args, cfg):
     optim = instantiate(cfg.optimizer)
 
     train_loader = instantiate(cfg.dataloader.train)
-    logger.info(f"TRAIN SAMPLER: {type(train_loader.sampler)} {train_loader.sampler}")
+    sampler_obj = getattr(train_loader, "sampler", None)
+    if sampler_obj is None and hasattr(train_loader, "dataset"):
+        sampler_obj = getattr(train_loader.dataset, "sampler", None)
+    if sampler_obj is not None:
+        logger.info(f"TRAIN SAMPLER: {type(sampler_obj)} {sampler_obj}")
+    else:
+        logger.info(f"TRAIN SAMPLER: <unknown> (loader type {type(train_loader)})")
 
     model = create_ddp_model(model, **cfg.train.ddp)
 
