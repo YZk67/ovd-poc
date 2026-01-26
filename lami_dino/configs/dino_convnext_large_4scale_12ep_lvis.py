@@ -116,6 +116,9 @@ dataloader.train.num_workers = 2  # 1 worker per GPU for 4GPU training
 # Note: Using Option 3 (averaged embeddings), batch_size can remain at 4
 # If using Option 2 (6015 queries), reduce to batch_size=1
 dataloader.train.total_batch_size = 8  # Can use 4 with Option 3
+# Enable long-tail sampling (RepeatFactorTrainingSampler)
+dataloader.train.sampler = "RepeatFactorTrainingSampler"
+dataloader.train.repeat_threshold = 0.001
 
 # dump the testing results into output_dir for visualization
 dataloader.evaluator.output_dir = train.output_dir
