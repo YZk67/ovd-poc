@@ -352,7 +352,6 @@ class DINO(nn.Module):
 
         self.register_buffer("freq_score_scale", freq_scale)
         self.register_buffer("freq_log_scale", torch.log(freq_scale.clamp_min(1e-6)))
-            raise ValueError(f"Unknown aggregation method: {method}")
 
     def filter_content_info(self, batched_inputs):
         """
