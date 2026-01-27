@@ -289,7 +289,10 @@ class DINO(nn.Module):
         """
         if method == 'mean':
             # Simple averaging: mathematically equivalent to pre-averaging before indexing
-        return embeddings.mean(dim=1)
+            return embeddings.mean(dim=1)
+        if method == 'max':
+            return embeddings.max(dim=1).values
+        raise ValueError(f"Unknown aggregation method: {method}")
 
     def _init_freq_score_scale(self, cat_freq_path, device):
         with open(cat_freq_path, "r") as f:
