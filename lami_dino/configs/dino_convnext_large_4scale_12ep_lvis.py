@@ -94,7 +94,7 @@ model.cluster_fed_loss = True
 model.cluster_label_path = 'dataset/cluster/ovd_cluster_128.npy'
 model.cat_freq_path = "dataset/coco/ovd_ins_train2017_all_cat_info.json"
 model.fed_loss_num_cat = 30
-model.select_box_nums_for_evaluation = 1000  # balance recall vs noise
+model.select_box_nums_for_evaluation = 2000  # balance recall vs noise
 
 # modify optimizer config
 # 假设你单卡用 1e-4 (1GPU); 1e-4 使用原来成功的学习率
