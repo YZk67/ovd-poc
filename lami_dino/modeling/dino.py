@@ -291,7 +291,29 @@ class DINO(nn.Module):
             # Simple averaging: mathematically equivalent to pre-averaging before indexing
             return embeddings.mean(dim=1)
         if method == 'max':
+            # Max pooling: select strongest feature per dimension
             return embeddings.max(dim=1).values
+        if method == 'soft_attention':
+            # Soft-attention aggregation: preserves semantic granularity
+            # Formula: s_i,c = sum_k α_i,c,k * cos(f_i, t_c,k)
+            # where α_i,c,k = softmax(cos(f_i, t_c,k) / τ)
+            if region_feats is None:
+                raise ValueError("region_feats required for soft_attention method")
+
+            # Normalize embeddings and region features
+            embeddings_norm = F.normalize(embeddings, p=2, dim=-1)  # [C, K, D]
+            region_feats_norm = F.normalize(region_feats, p=2, dim=-1)  # [B, N, D]
+
+            # Compute similarity: [B, N, D] @ [C, K, D]^T -> [B, C, N, K]
+            sim = torch.einsum("bnd,ckd->bcnk", region_feats_norm, embeddings_norm)
+
+            # Soft-attention weights: α_i,c,k = softmax(cos(f_i, t_c,k) / τ)
+            alpha = F.softmax(sim / tau, dim=-1)  # [B, C, N, K]
+
+            # Weighted aggregation: s_i,c = sum_k α_i,c,k * cos(f_i, t_c,k)
+            sim_aggregated = (alpha * sim).sum(dim=-1)  # [B, C, N]
+
+            return sim_aggregated
         raise ValueError(f"Unknown aggregation method: {method}")
 
     def _init_freq_score_scale(self, cat_freq_path, device):
@@ -330,34 +352,6 @@ class DINO(nn.Module):
 
         self.register_buffer("freq_score_scale", freq_scale)
         self.register_buffer("freq_log_scale", torch.log(freq_scale.clamp_min(1e-6)))
-        
-        elif method == 'max':
-            # Max pooling: select strongest feature per dimension
-            return embeddings.max(dim=1)[0]
-        
-        elif method == 'soft_attention':
-            # Soft-attention aggregation: preserves semantic granularity
-            # Formula: s_i,c = sum_k α_i,c,k * cos(f_i, t_c,k)
-            # where α_i,c,k = softmax(cos(f_i, t_c,k) / τ)
-            if region_feats is None:
-                raise ValueError("region_feats required for soft_attention method")
-            
-            # Normalize embeddings and region features
-            embeddings_norm = F.normalize(embeddings, p=2, dim=-1)  # [C, K, D]
-            region_feats_norm = F.normalize(region_feats, p=2, dim=-1)  # [B, N, D]
-            
-            # Compute similarity: [B, N, D] @ [C, K, D]^T -> [B, C, N, K]
-            sim = torch.einsum("bnd,ckd->bcnk", region_feats_norm, embeddings_norm)
-            
-            # Soft-attention weights: α_i,c,k = softmax(cos(f_i, t_c,k) / τ)
-            alpha = F.softmax(sim / tau, dim=-1)  # [B, C, N, K]
-            
-            # Weighted aggregation: s_i,c = sum_k α_i,c,k * cos(f_i, t_c,k)
-            sim_aggregated = (alpha * sim).sum(dim=-1)  # [B, C, N]
-            
-            return sim_aggregated
-        
-        else:
             raise ValueError(f"Unknown aggregation method: {method}")
 
     def filter_content_info(self, batched_inputs):
