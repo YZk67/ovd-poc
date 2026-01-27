@@ -67,10 +67,10 @@ train.output_dir = f"/root/dino_convnext_large_ovcoco65_{timestamp}"
 # - Batch size 64: 100,170 ÷ 64 = 1,565 iter/epoch → 18,780 total (12 epochs)
 # - Standardized values: 7,100 (bs16), 3,550 (bs32), 1,775 (bs64)
 # - LR scheduler: use lr_multiplier_12ep_warmup for batch size 32
-train.max_iter = 170400 #85200  # Single GPU A100 4 epochs 12 epochs with batch size 32: 100170/32*12 -- 85200
+train.max_iter = 85200 #85200  # Single GPU A100 4 epochs 12 epochs with batch size 32: 100170/32*12 -- 85200
 
 # run evaluation every 3130 iters
-train.eval_period = 5000  # Evaluate after each epoch 7100//2
+train.eval_period = 7100  # Evaluate after each epoch 7100//2
 
 # log training infomation every 20 iters
 train.log_period = 200
@@ -91,8 +91,8 @@ model.device = train.device
 
 model.num_classes = 65
 # Set the text embedding paths for TPA (using Claude-generated 8 prompts per class)
-model.query_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl2.npy"
-model.eval_query_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl2.npy"
+model.query_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl.npy"
+model.eval_query_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl.npy"
 
 model.use_fed_loss = True
 model.cluster_fed_loss = True
@@ -113,14 +113,14 @@ optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in modul
 
 # modify dataloader config
 # Start with conservative setting, can be increased if stable
-dataloader.train.num_workers = 2  # 1 worker per GPU for 4GPU training
+dataloader.train.num_workers = 4  # 1 worker per GPU for 4GPU training
 
 # please notice that this is total batch size.
 # surpose you're using 4 gpus for training and the batch size for
 # each gpu is 16/4 = 4
 # Note: Using Option 3 (averaged embeddings), batch_size can remain at 4
 # If using Option 2 (6015 queries), reduce to batch_size=1
-dataloader.train.total_batch_size = 8  # Can use 4 with Option 3
+dataloader.train.total_batch_size = 16  # Can use 4 with Option 3
 # Enable long-tail sampling (RepeatFactorTrainingSampler)
 dataloader.train.sampler = "RepeatFactorTrainingSampler"
 dataloader.train.repeat_threshold = 0.002
@@ -146,8 +146,8 @@ dataloader.test.dataset.names = "ovdcoco65_2017_val_all"
 
 # Enable TPA (Text Prototype Aggregator) by modifying the classifier
 model.classifier.use_tpa = True
-model.classifier.text_embed_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl2.npy"
-model.classifier.eval_text_embed_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl2.npy"
+model.classifier.text_embed_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl.npy"
+model.classifier.eval_text_embed_path = "dataset/metadata/vodcoco_tpa_prompts_convnextl.npy"
 model.classifier.tpa_num_prototypes = 5  # 8 prompts -> 5 prototypes (better utilization)
 model.classifier.tpa_hidden_dim = 256
 model.classifier.tpa_dropout = 0.05  # Add dropout for regularization
