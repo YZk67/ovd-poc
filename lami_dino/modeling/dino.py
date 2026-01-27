@@ -97,6 +97,11 @@ class DINO(nn.Module):
         beta: float =0.7,
         novel_scale: float =5.0,
         novel_logit_scale: float = 1.0,
+        seen_logit_scale: float = 1.0,
+        freq_reweight: bool = False,
+        freq_scale_rare: float = 1.5,
+        freq_scale_common: float = 1.2,
+        freq_scale_frequent: float = 0.9,
         test_score_thresh: float = 0.0,
         clip_head_path=None,
         use_soft_attention: bool = True,
@@ -108,6 +113,11 @@ class DINO(nn.Module):
         self.beta = beta
         self.novel_scale = novel_scale
         self.novel_logit_scale = novel_logit_scale
+        self.seen_logit_scale = seen_logit_scale
+        self.freq_reweight = freq_reweight
+        self.freq_scale_rare = freq_scale_rare
+        self.freq_scale_common = freq_scale_common
+        self.freq_scale_frequent = freq_scale_frequent
         self.test_score_thresh = test_score_thresh
         self.use_soft_attention = use_soft_attention
         self.soft_attention_tau = soft_attention_tau
@@ -239,7 +249,7 @@ class DINO(nn.Module):
                 self.novel_idx[idx_novel] = True
             else:
                 self.novel_idx = self.base_idx == False
-        elif all_classes and seen_classes and self.novel_logit_scale != 1.0:
+        elif all_classes and seen_classes and (self.novel_logit_scale != 1.0 or self.seen_logit_scale != 1.0):
             # Build novel indices for logit scaling without enabling score ensemble
             self.seen_classes = json.load(open(seen_classes))
             self.all_classes = json.load(open(all_classes))
@@ -247,6 +257,13 @@ class DINO(nn.Module):
             self.base_idx = torch.zeros(len(self.all_classes), dtype=bool)
             self.base_idx[idx] = True
             self.novel_idx = self.base_idx == False
+        elif all_classes and seen_classes:
+            # Still load class lists for freq-based reweighting
+            self.seen_classes = json.load(open(seen_classes))
+            self.all_classes = json.load(open(all_classes))
+
+        if self.freq_reweight and cat_freq_path:
+            self._init_freq_score_scale(cat_freq_path, device)
         self.save_dir = save_dir
         if self.save_dir:
             os.makedirs(self.save_dir, exist_ok=True)
@@ -272,7 +289,44 @@ class DINO(nn.Module):
         """
         if method == 'mean':
             # Simple averaging: mathematically equivalent to pre-averaging before indexing
-            return embeddings.mean(dim=1)
+        return embeddings.mean(dim=1)
+
+    def _init_freq_score_scale(self, cat_freq_path, device):
+        with open(cat_freq_path, "r") as f:
+            data = json.load(f)
+        cats = data if isinstance(data, list) else data.get("categories", [])
+        name_to_freq = {}
+        id_to_freq = {}
+        for c in cats:
+            if "name" in c and "frequency" in c:
+                name_to_freq[c["name"].replace("_", " ")] = c["frequency"]
+            if "id" in c and "frequency" in c:
+                id_to_freq[int(c["id"])] = c["frequency"]
+
+        freq_scale = torch.ones(self.num_classes, dtype=torch.float32, device=device)
+        if hasattr(self, "all_classes"):
+            for idx, name in enumerate(self.all_classes):
+                freq = name_to_freq.get(name, None)
+                if freq is None:
+                    continue
+                if freq == "r":
+                    freq_scale[idx] = self.freq_scale_rare
+                elif freq == "c":
+                    freq_scale[idx] = self.freq_scale_common
+                elif freq == "f":
+                    freq_scale[idx] = self.freq_scale_frequent
+        else:
+            for idx, freq in id_to_freq.items():
+                if 0 <= idx < self.num_classes:
+                    if freq == "r":
+                        freq_scale[idx] = self.freq_scale_rare
+                    elif freq == "c":
+                        freq_scale[idx] = self.freq_scale_common
+                    elif freq == "f":
+                        freq_scale[idx] = self.freq_scale_frequent
+
+        self.register_buffer("freq_score_scale", freq_scale)
+        self.register_buffer("freq_log_scale", torch.log(freq_scale.clamp_min(1e-6)))
         
         elif method == 'max':
             # Max pooling: select strongest feature per dimension
@@ -637,12 +691,23 @@ class DINO(nn.Module):
                 cls_score[:, :, self.novel_idx] = cls_score[:, :, self.novel_idx] ** (
                         1 - self.beta) * vlm_score[:, :, self.novel_idx] ** self.beta 
                 cls_score[:, :, self.novel_idx] = cls_score[:, :, self.novel_idx] * self.novel_scale
+                if self.seen_logit_scale != 1.0 and hasattr(self, "base_idx"):
+                    cls_score[:, :, self.base_idx] = cls_score[:, :, self.base_idx] * self.seen_logit_scale
+                if self.freq_reweight and hasattr(self, "freq_score_scale"):
+                    cls_score = cls_score * self.freq_score_scale
                 box_cls = cls_score
                 results = self.inference(box_cls, box_pred, images.image_sizes, wo_sigmoid=True)
             else:
-                if self.novel_logit_scale != 1.0 and hasattr(self, "novel_idx"):
+                if (self.novel_logit_scale != 1.0 or self.seen_logit_scale != 1.0) and (
+                    hasattr(self, "novel_idx") or hasattr(self, "base_idx")
+                ):
                     box_cls = box_cls.clone()
-                    box_cls[:, :, self.novel_idx] = box_cls[:, :, self.novel_idx] * self.novel_logit_scale
+                    if self.novel_logit_scale != 1.0 and hasattr(self, "novel_idx"):
+                        box_cls[:, :, self.novel_idx] = box_cls[:, :, self.novel_idx] * self.novel_logit_scale
+                    if self.seen_logit_scale != 1.0 and hasattr(self, "base_idx"):
+                        box_cls[:, :, self.base_idx] = box_cls[:, :, self.base_idx] * self.seen_logit_scale
+                if self.freq_reweight and hasattr(self, "freq_log_scale"):
+                    box_cls = box_cls + self.freq_log_scale
                 results = self.inference(box_cls, box_pred, images.image_sizes)
             processed_results = []
             for results_per_image, input_per_image, image_size in zip(

@@ -20,6 +20,11 @@ model.alpha = 0.0
 model.beta = 0.4
 model.novel_scale = 5.0
 model.novel_logit_scale = 1.3  # moderate novel boost
+model.seen_logit_scale = 0.9   # dampen seen scores
+model.freq_reweight = True
+model.freq_scale_rare = 1.5
+model.freq_scale_common = 1.2
+model.freq_scale_frequent = 0.9
 model.label_noise_ratio = 0.4  # stronger regularization for base overfitting
 model.test_score_thresh = 0.01  # filter low-confidence noise
 
