@@ -25,6 +25,14 @@ model.freq_reweight = True
 model.freq_scale_rare = 1.5
 model.freq_scale_common = 1.2
 model.freq_scale_frequent = 0.9
+model.topk_novel_boost = 1.3
+model.topk_seen_scale = 1.0
+model.score_floor_novel = 0.05
+model.score_floor_seen = 0.0
+model.per_class_nms = True
+model.nms_iou_novel = 0.7
+model.nms_iou_seen = 0.5
+model.nms_iou_default = 0.5
 model.label_noise_ratio = 0.4  # stronger regularization for base overfitting
 model.test_score_thresh = 0.01  # filter low-confidence noise
 

@@ -102,6 +102,14 @@ class DINO(nn.Module):
         freq_scale_rare: float = 1.5,
         freq_scale_common: float = 1.2,
         freq_scale_frequent: float = 0.9,
+        topk_novel_boost: float = 1.0,
+        topk_seen_scale: float = 1.0,
+        score_floor_novel: float = 0.0,
+        score_floor_seen: float = 0.0,
+        per_class_nms: bool = False,
+        nms_iou_novel: float = 0.7,
+        nms_iou_seen: float = 0.5,
+        nms_iou_default: float = 0.5,
         test_score_thresh: float = 0.0,
         clip_head_path=None,
         use_soft_attention: bool = True,
@@ -118,6 +126,14 @@ class DINO(nn.Module):
         self.freq_scale_rare = freq_scale_rare
         self.freq_scale_common = freq_scale_common
         self.freq_scale_frequent = freq_scale_frequent
+        self.topk_novel_boost = topk_novel_boost
+        self.topk_seen_scale = topk_seen_scale
+        self.score_floor_novel = score_floor_novel
+        self.score_floor_seen = score_floor_seen
+        self.per_class_nms = per_class_nms
+        self.nms_iou_novel = nms_iou_novel
+        self.nms_iou_seen = nms_iou_seen
+        self.nms_iou_default = nms_iou_default
         self.test_score_thresh = test_score_thresh
         self.use_soft_attention = use_soft_attention
         self.soft_attention_tau = soft_attention_tau
@@ -988,10 +1004,19 @@ class DINO(nn.Module):
             prob = box_cls
         else:
             prob = box_cls.sigmoid()
-        topk_values, topk_indexes = torch.topk(
-            prob.view(box_cls.shape[0], -1), self.select_box_nums_for_evaluation, dim=1
+        prob_for_topk = prob
+        if (self.topk_novel_boost != 1.0 or self.topk_seen_scale != 1.0) and hasattr(self, "novel_idx"):
+            prob_for_topk = prob.clone()
+            if self.topk_novel_boost != 1.0:
+                prob_for_topk[:, :, self.novel_idx] = prob_for_topk[:, :, self.novel_idx] * self.topk_novel_boost
+            if self.topk_seen_scale != 1.0 and hasattr(self, "base_idx"):
+                prob_for_topk[:, :, self.base_idx] = prob_for_topk[:, :, self.base_idx] * self.topk_seen_scale
+        flat_prob_for_topk = prob_for_topk.view(box_cls.shape[0], -1)
+        flat_prob = prob.view(box_cls.shape[0], -1)
+        _, topk_indexes = torch.topk(
+            flat_prob_for_topk, self.select_box_nums_for_evaluation, dim=1
         )
-        scores = topk_values
+        scores = torch.gather(flat_prob, 1, topk_indexes)
         topk_boxes = torch.div(topk_indexes, box_cls.shape[2], rounding_mode="floor")
         labels = topk_indexes % box_cls.shape[2]
 
@@ -1003,10 +1028,39 @@ class DINO(nn.Module):
         for i, (scores_per_image, labels_per_image, box_pred_per_image, image_size) in enumerate(
             zip(scores, labels, boxes, image_sizes)
         ):
-            result = Instances(image_size)
-            result.pred_boxes = Boxes(box_cxcywh_to_xyxy(box_pred_per_image))
+            if (self.score_floor_novel > 0 or self.score_floor_seen > 0) and hasattr(self, "novel_idx"):
+                score_floor = torch.zeros_like(scores_per_image)
+                if self.score_floor_novel > 0:
+                    score_floor[self.novel_idx[labels_per_image]] = self.score_floor_novel
+                if self.score_floor_seen > 0 and hasattr(self, "base_idx"):
+                    score_floor[self.base_idx[labels_per_image]] = self.score_floor_seen
+                scores_per_image = torch.maximum(scores_per_image, score_floor)
 
-            result.pred_boxes.scale(scale_x=image_size[1], scale_y=image_size[0])
+            result = Instances(image_size)
+            pred_boxes = Boxes(box_cxcywh_to_xyxy(box_pred_per_image))
+            pred_boxes.scale(scale_x=image_size[1], scale_y=image_size[0])
+
+            if self.per_class_nms:
+                keep_all = []
+                for cls in labels_per_image.unique().tolist():
+                    cls_mask = labels_per_image == cls
+                    if hasattr(self, "novel_idx") and self.novel_idx[cls]:
+                        iou_thr = self.nms_iou_novel
+                    elif hasattr(self, "base_idx") and self.base_idx[cls]:
+                        iou_thr = self.nms_iou_seen
+                    else:
+                        iou_thr = self.nms_iou_default
+                    keep = torchvision.ops.nms(
+                        pred_boxes.tensor[cls_mask], scores_per_image[cls_mask], iou_thr
+                    )
+                    keep_all.append(torch.nonzero(cls_mask, as_tuple=False).squeeze(1)[keep])
+                if keep_all:
+                    keep_all = torch.cat(keep_all)
+                    pred_boxes = pred_boxes[keep_all]
+                    scores_per_image = scores_per_image[keep_all]
+                    labels_per_image = labels_per_image[keep_all]
+
+            result.pred_boxes = pred_boxes
             result.scores = scores_per_image
             result.pred_classes = labels_per_image
             if self.test_score_thresh > 0:
