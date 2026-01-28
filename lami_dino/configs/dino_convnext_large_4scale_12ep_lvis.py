@@ -33,6 +33,7 @@ model.per_class_nms = True
 model.nms_iou_novel = 0.7
 model.nms_iou_seen = 0.5
 model.nms_iou_default = 0.5
+model.class_logit_bias = {"airplane": 0.8}
 model.label_noise_ratio = 0.4  # stronger regularization for base overfitting
 model.test_score_thresh = 0.01  # filter low-confidence noise
 

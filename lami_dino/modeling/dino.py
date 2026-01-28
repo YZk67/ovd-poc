@@ -110,6 +110,7 @@ class DINO(nn.Module):
         nms_iou_novel: float = 0.7,
         nms_iou_seen: float = 0.5,
         nms_iou_default: float = 0.5,
+        class_logit_bias: dict = None,
         test_score_thresh: float = 0.0,
         clip_head_path=None,
         use_soft_attention: bool = True,
@@ -134,6 +135,7 @@ class DINO(nn.Module):
         self.nms_iou_novel = nms_iou_novel
         self.nms_iou_seen = nms_iou_seen
         self.nms_iou_default = nms_iou_default
+        self.class_logit_bias = class_logit_bias
         self.test_score_thresh = test_score_thresh
         self.use_soft_attention = use_soft_attention
         self.soft_attention_tau = soft_attention_tau
@@ -277,6 +279,16 @@ class DINO(nn.Module):
             # Still load class lists for freq-based reweighting
             self.seen_classes = json.load(open(seen_classes))
             self.all_classes = json.load(open(all_classes))
+
+        if self.class_logit_bias and all_classes:
+            # build per-class logit bias tensor from class names
+            if not hasattr(self, "all_classes"):
+                self.all_classes = json.load(open(all_classes))
+            bias = torch.zeros(self.num_classes, dtype=torch.float32, device=device)
+            for name, val in self.class_logit_bias.items():
+                if name in self.all_classes:
+                    bias[self.all_classes.index(name)] = float(val)
+            self.register_buffer("class_logit_bias_tensor", bias)
 
         if self.freq_reweight and cat_freq_path:
             self._init_freq_score_scale(cat_freq_path, device)
@@ -680,6 +692,8 @@ class DINO(nn.Module):
         else:
             box_cls = output["pred_logits"]
             box_pred = output["pred_boxes"]
+            if hasattr(self, "class_logit_bias_tensor"):
+                box_cls = box_cls + self.class_logit_bias_tensor
             if self.save_dir and not self.score_ensemble:
                 save_output = {}
                 save_output["pred_logits"] = copy.deepcopy(output["pred_logits"]).cpu()
