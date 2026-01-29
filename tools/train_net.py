@@ -42,6 +42,7 @@ from detectron2.engine import (
 from detectron2.engine.defaults import create_ddp_model
 from detectron2.evaluation import inference_on_dataset, print_csv_format
 from detectron2.utils import comm
+from detectron2.data import MetadataCatalog
 
 # ==== Added by ChatGPT ====
 import torch.distributed as dist
@@ -178,6 +179,8 @@ def do_test(cfg, model):
             ret = inference_on_dataset(
                 model, instantiate(cfg.dataloader.test), instantiate(cfg.dataloader.evaluator), cfg.DDEBUG
             )
+            if comm.is_main_process():
+                _maybe_add_ap50_seen_novel(cfg, ret)
             print_csv_format(ret)
 
             # Restore original num_workers
@@ -199,6 +202,82 @@ def do_test(cfg, model):
             return {}
         finally:
             model.train(training_mode)  # CHANGE: ensure training mode is restored
+
+
+def _maybe_add_ap50_seen_novel(cfg, ret):
+    try:
+        seen_path = getattr(cfg.model, "seen_classes", None)
+        all_path = getattr(cfg.model, "all_classes", None)
+        if not seen_path or not all_path:
+            return
+        dataset_name = cfg.dataloader.test.dataset.names
+        if isinstance(dataset_name, (list, tuple)):
+            dataset_name = dataset_name[0]
+        meta = MetadataCatalog.get(dataset_name)
+        gt_json = getattr(meta, "json_file", None)
+        if not gt_json:
+            return
+        output_dir = getattr(cfg.dataloader.evaluator, "output_dir", None)
+        if not output_dir:
+            return
+        results_json = os.path.join(output_dir, "coco_instances_results.json")
+        if not os.path.exists(results_json):
+            return
+
+        ap50_seen, ap50_novel = _compute_seen_novel_ap50(
+            gt_json, results_json, seen_path, all_path, iou_type="bbox"
+        )
+        if "bbox" in ret:
+            ret["bbox"]["AP50_base"] = ap50_seen
+            ret["bbox"]["AP50_novel"] = ap50_novel
+        else:
+            ret["AP50_base"] = ap50_seen
+            ret["AP50_novel"] = ap50_novel
+        logger.info(f"[AP50 split] base: {ap50_seen:.3f}, novel: {ap50_novel:.3f}")
+    except Exception as e:
+        logger.warning(f"[AP50 split] failed to compute: {e}")
+
+
+def _compute_seen_novel_ap50(gt_json, results_json, seen_path, all_path, iou_type="bbox"):
+    from pycocotools.coco import COCO
+    from pycocotools.cocoeval import COCOeval
+    import json
+    import numpy as np
+
+    def load_list(p):
+        with open(p, "r") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            raise ValueError(f"Expected list in {p}")
+        return data
+
+    seen = load_list(seen_path)
+    all_classes = load_list(all_path)
+    novel = [c for c in all_classes if c not in seen]
+
+    coco_gt = COCO(gt_json)
+    coco_dt = coco_gt.loadRes(results_json)
+    coco_eval = COCOeval(coco_gt, coco_dt, iou_type)
+    coco_eval.evaluate()
+    coco_eval.accumulate()
+
+    cat_ids = coco_gt.getCatIds()
+    cats = coco_gt.loadCats(cat_ids)
+    cat_names = [c["name"] for c in cats]
+
+    precision = coco_eval.eval["precision"]  # T x R x K x A x M
+    iou_idx = 0  # IoU=0.50
+    ap = {}
+    for k, name in enumerate(cat_names):
+        p = precision[iou_idx, :, k, 0, 2]  # area=all, maxDets=100
+        p = p[p > -1]
+        ap[name] = float(np.mean(p)) if p.size else 0.0
+
+    seen_vals = [ap[c] for c in seen if c in ap]
+    novel_vals = [ap[c] for c in novel if c in ap]
+    ap50_seen = float(np.mean(seen_vals)) if seen_vals else 0.0
+    ap50_novel = float(np.mean(novel_vals)) if novel_vals else 0.0
+    return ap50_seen, ap50_novel
 
 
 # ==== Added by ChatGPT ====
