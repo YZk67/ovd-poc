@@ -141,25 +141,32 @@ class TextPrototypeAggregator(nn.Module):
             self._step += 1
             # Direct orthogonalization: if prototypes are too similar, force orthogonality
             # This is necessary because gradient-based methods alone are not sufficient
-            # We use it conservatively: only when really needed (high similarity) and infrequently
+            # We use it more aggressively to ensure diversity is maintained
             step_value = int(self._step.item()) if isinstance(self._step, torch.Tensor) else self._step
-            # Check periodically (every 100 steps) throughout training, not just warmup
-            # This ensures diversity is maintained even when gradients are weak
-            if step_value > 0 and step_value % 100 == 0:  # Every 100 steps
+            # Check more frequently (every 50 steps) and with lower threshold to catch similarity earlier
+            if step_value > 0 and step_value % 50 == 0:  # Every 50 steps (more frequent)
                 with torch.no_grad():
                     queries_norm = F.normalize(self.prototype_queries, p=2, dim=1)
                     similarity_matrix = torch.mm(queries_norm, queries_norm.t())
                     off_diag_mask = ~torch.eye(self.num_prototypes, dtype=bool, device=similarity_matrix.device)
-                    max_similarity = similarity_matrix[off_diag_mask].max()
-                    # High threshold (0.95) - only trigger when prototypes are very similar
-                    # This minimizes interference with normal gradient-based learning
-                    if max_similarity > 0.95:
+                    max_similarity = similarity_matrix[off_diag_mask].max().item()
+                    mean_similarity = similarity_matrix[off_diag_mask].mean().item()
+                    # Lower threshold (0.90) to catch similarity earlier and trigger more often
+                    # This is necessary because loss_div is not decreasing
+                    if max_similarity > 0.90:
                         # Use QR decomposition for stable orthogonalization
                         Q, R = torch.linalg.qr(self.prototype_queries.t())
                         orthogonal_queries = Q.t()[:self.num_prototypes]
                         # Preserve magnitude to avoid disrupting training dynamics
                         orig_norms = self.prototype_queries.norm(p=2, dim=1, keepdim=True)
                         self.prototype_queries.data = F.normalize(orthogonal_queries, p=2, dim=1) * orig_norms
+                        # Log when orthogonalization is triggered
+                        if self._logger and _is_main_process():
+                            self._logger.info(
+                                f"[TPA Orthogonalization] step={step_value:06d} "
+                                f"max_sim={max_similarity:.4f} mean_sim={mean_similarity:.4f} "
+                                f"→ forced orthogonality"
+                            )
 
         apr_loss = None
         if with_loss:
