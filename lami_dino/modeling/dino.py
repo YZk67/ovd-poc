@@ -17,6 +17,7 @@ import os
 import copy
 import math
 import json
+import logging
 from typing import List
 import numpy as np
 import torch
@@ -295,6 +296,13 @@ class DINO(nn.Module):
         self.save_dir = save_dir
         if self.save_dir:
             os.makedirs(self.save_dir, exist_ok=True)
+
+        # Debug counters for FedLoss sampling behavior.
+        self._fed_sampling_log_interval = 100
+        self._fed_sampling_step = 0
+        self._fed_sampling_total = 0
+        self._fed_sampling_extra = 0
+        self._fed_sampling_logger = logging.getLogger("detectron2")
     
     def _aggregate_prototypes(self, embeddings, method='mean', region_feats=None, tau=0.1):
         """
@@ -429,7 +437,10 @@ class DINO(nn.Module):
 
         # 仅在 rank 0 进行采样；其它 rank 准备占位
         need_sample = (not is_dist_avail_and_initialized()) or (dist.get_rank() == 0)
-        desired_len = max(self.fed_loss_num_cat, int(all_gt.numel()))
+        all_gt_num = int(all_gt.numel())
+        desired_len = max(self.fed_loss_num_cat, all_gt_num)
+        need_extra_sampling = all_gt_num < desired_len
+        sampler_name = "cluster" if self.cluster_fed_loss else "fed"
 
         if need_sample:
             # Do sampling on CPU to avoid device-side index asserts
@@ -479,6 +490,29 @@ class DINO(nn.Module):
                 if candidates.numel() >= needed:
                     extra = candidates[torch.randperm(candidates.numel(), device=device)[:needed]]
                     content_inds = torch.cat([content_inds, extra])
+
+        content_inds_num = int(content_inds.numel())
+
+        # FedLoss sampling observability: print every N steps for A/B diagnosis.
+        self._fed_sampling_step += 1
+        self._fed_sampling_total += 1
+        if need_extra_sampling:
+            self._fed_sampling_extra += 1
+
+        is_main = (not is_dist_avail_and_initialized()) or dist.get_rank() == 0
+        if is_main and self._fed_sampling_step % self._fed_sampling_log_interval == 0:
+            extra_ratio = 100.0 * self._fed_sampling_extra / max(self._fed_sampling_total, 1)
+            self._fed_sampling_logger.info(
+                "[FedSampling] step=%d sampler=%s all_gt_num=%d desired_len=%d "
+                "need_extra_sampling=%s content_inds_num=%d extra_ratio=%.2f%%",
+                self._fed_sampling_step,
+                sampler_name,
+                all_gt_num,
+                desired_len,
+                str(need_extra_sampling),
+                content_inds_num,
+                extra_ratio,
+            )
 
         # === 之后保持你原有的映射逻辑：将 gt_classes 映射到 [0..M-1] ===
         convert_map = torch.ones(self.num_classes, dtype=torch.int64, device=device) * -1
