@@ -139,6 +139,7 @@ detrex/version.py
 retina+dino_1x/
 
 *jpg
+!vis_single/*.jpg
 *pt
 *pth
 *json
