@@ -107,7 +107,7 @@ model.use_fed_loss = True
 model.cluster_fed_loss = True
 model.cluster_label_path = 'dataset/cluster/ovd_cluster_128.npy'
 model.cat_freq_path = "dataset/coco/ovd_ins_train2017_all_cat_info.json"
-model.fed_loss_num_cat = 30
+model.fed_loss_num_cat = 80
 model.select_box_nums_for_evaluation = 2000  # balance recall vs noise
 
 # modify optimizer config
@@ -123,7 +123,6 @@ optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in modul
 # modify dataloader config
 # Start with conservative setting, can be increased if stable
 dataloader.train.num_workers = 4  # 1 worker per GPU for 4GPU training
-
 # please notice that this is total batch size.
 # surpose you're using 4 gpus for training and the batch size for
 # each gpu is 16/4 = 4
