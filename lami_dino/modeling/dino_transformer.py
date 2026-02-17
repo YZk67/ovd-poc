@@ -442,13 +442,32 @@ class DINOTransformer(nn.Module):
             output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, output_memory.shape[-1])
         )
 
+        content_ids = torch.gather(max_labels, 1, topk_proposals)  # [B, topk], local class ids
+        if content_inds is not None:
+            # max_labels are indices in sampled-class space during training; map them back
+            # to global class ids before indexing full content_query_embeds.
+            content_ids = content_inds[content_ids]
+
+        # Guard against silent CUDA index asserts; fail with actionable context.
+        if content_query_embeds.ndim >= 2:
+            num_proto_classes = int(content_query_embeds.shape[0])
+            if content_ids.numel() > 0:
+                cid_min = int(content_ids.min().item())
+                cid_max = int(content_ids.max().item())
+                if cid_min < 0 or cid_max >= num_proto_classes:
+                    raise ValueError(
+                        f"[Transformer] content_ids out of range: min={cid_min}, max={cid_max}, "
+                        f"proto_classes={num_proto_classes}, "
+                        f"content_inds_len={0 if content_inds is None else int(content_inds.numel())}, "
+                        f"enc_cls_dim={int(enc_outputs_class.shape[-1])}"
+                    )
+
         # Check if we have multi-prototype embeddings and should use soft-attention
         if getattr(self, 'use_soft_attention', False) and content_query_embeds.ndim == 3:
             # logger.info(f"[Soft-Attention] Using soft-attention aggregation with {content_query_embeds.shape[1]} prototypes per class")
             # === Vectorized multi-prototype soft-attention aggregation ===
             tau = getattr(self, 'soft_attention_tau', 0.07)
-            # Gather selected visual features and class ids
-            content_ids = torch.gather(max_labels, 1, topk_proposals)  # [B, topk]
+            # Gather selected visual features
             target_unact = torch.gather(output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, output_memory.shape[-1]))  # [B, topk, D]
 
             # Prototypes per region: [B, topk, K, D]
@@ -461,13 +480,11 @@ class DINOTransformer(nn.Module):
             content_query = torch.einsum('bqk,bqkd->bqd', attn, proto_per_region)  # [B, topk, D]
         elif content_query_embeds.ndim == 3:
             # === Mean aggregation fallback over K prototypes ===
-            content_ids = torch.gather(max_labels, 1, topk_proposals)
             # [B, topk, K, D]
             proto_per_region = content_query_embeds[content_ids]
             content_query = proto_per_region.mean(dim=2)  # [B, topk, D]
         else:
             # === Standard single-prototype mode ===
-            content_ids = torch.gather(max_labels, 1, topk_proposals)
             embed_dim = content_query_embeds.shape[-1]
             content_query = torch.gather(
                 content_query_embeds.unsqueeze(0).repeat(bs, 1, 1), 1,

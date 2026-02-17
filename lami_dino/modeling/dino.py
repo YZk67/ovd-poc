@@ -438,7 +438,9 @@ class DINO(nn.Module):
         # 仅在 rank 0 进行采样；其它 rank 准备占位
         need_sample = (not is_dist_avail_and_initialized()) or (dist.get_rank() == 0)
         all_gt_num = int(all_gt.numel())
-        desired_len = max(self.fed_loss_num_cat, all_gt_num)
+        desired_raw_len = max(self.fed_loss_num_cat, all_gt_num)
+        # Cannot sample more classes than model class space.
+        desired_len = min(self.num_classes, desired_raw_len)
         need_extra_sampling = all_gt_num < desired_len
         sampler_name = "cluster" if self.cluster_fed_loss else "fed"
 
@@ -504,11 +506,12 @@ class DINO(nn.Module):
             extra_ratio = 100.0 * self._fed_sampling_extra / max(self._fed_sampling_total, 1)
             self._fed_sampling_logger.info(
                 "[FedSampling] step=%d sampler=%s all_gt_num=%d desired_len=%d "
-                "need_extra_sampling=%s content_inds_num=%d extra_ratio=%.2f%%",
+                "desired_raw_len=%d need_extra_sampling=%s content_inds_num=%d extra_ratio=%.2f%%",
                 self._fed_sampling_step,
                 sampler_name,
                 all_gt_num,
                 desired_len,
+                desired_raw_len,
                 str(need_extra_sampling),
                 content_inds_num,
                 extra_ratio,
