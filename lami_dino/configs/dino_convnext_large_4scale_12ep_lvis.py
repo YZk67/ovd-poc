@@ -107,7 +107,7 @@ model.use_fed_loss = True
 model.cluster_fed_loss = True
 model.cluster_label_path = 'dataset/cluster/ovd_cluster_128.npy'
 model.cat_freq_path = "dataset/coco/ovd_ins_train2017_all_cat_info.json"
-model.fed_loss_num_cat = 80
+model.fed_loss_num_cat = 30
 model.select_box_nums_for_evaluation = 2000  # balance recall vs noise
 
 # modify optimizer config
@@ -153,7 +153,7 @@ dataloader.test.dataset.names = "ovdcoco65_2017_val_all"
 #model.select_box_nums_for_evaluation = 300
 
 # Enable TPA (Text Prototype Aggregator) by modifying the classifier
-model.classifier.use_tpa = True
+model.classifier.use_tpa = False
 model.classifier.text_embed_path = "dataset/metadata/ovdcoco_prompts_list8_v2.npy"
 model.classifier.eval_text_embed_path = "dataset/metadata/ovdcoco_prompts_list8_v2.npy"
 model.classifier.tpa_num_prototypes = 5  # 8 prompts -> 5 prototypes (better utilization)
@@ -164,7 +164,7 @@ model.classifier.tpa_log_interval = 200
 
 
 # Soft-attention aggregation parameters for multi-prototype query initialization
-model.use_soft_attention = True  # Enable soft-attention aggregation in query initialization
+model.use_soft_attention = False  # Enable soft-attention aggregation in query initialization
 model.soft_attention_tau = 0.08  # Temperature parameter for soft-attention (τ ≈ 0.05–0.1 recommended)
 
 # Enable Automatic Mixed Precision (AMP) for faster training
