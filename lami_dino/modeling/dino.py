@@ -116,7 +116,6 @@ class DINO(nn.Module):
         clip_head_path=None,
         use_soft_attention: bool = True,
         soft_attention_tau: float = 0.1,
-        class_dropout_prob: float = 0.0,
     ):
         super().__init__()
         self.vlm_temperature = vlm_temperature
@@ -141,7 +140,6 @@ class DINO(nn.Module):
         self.test_score_thresh = test_score_thresh
         self.use_soft_attention = use_soft_attention
         self.soft_attention_tau = soft_attention_tau
-        self.class_dropout_prob = float(class_dropout_prob)
         # define backbone and position embedding module
         self.backbone = backbone
         self.position_embedding = position_embedding
@@ -305,48 +303,6 @@ class DINO(nn.Module):
         self._fed_sampling_total = 0
         self._fed_sampling_extra = 0
         self._fed_sampling_logger = logging.getLogger("detectron2")
-
-    def _apply_class_dropout(self, content_inds, all_gt, desired_len, device):
-        """Randomly drop a subset of sampled classes while always keeping GT classes."""
-        p = self.class_dropout_prob
-        if p <= 0.0 or content_inds.numel() == 0:
-            return content_inds
-
-        gt_classes = all_gt.to(device=device, dtype=torch.long)
-        gt_classes = gt_classes[(gt_classes >= 0) & (gt_classes < self.num_classes)]
-        if gt_classes.numel() > 0:
-            gt_classes = torch.unique(gt_classes)
-            gt_mask = torch.isin(content_inds, gt_classes)
-            keep_fixed = content_inds[gt_mask]
-            optional = content_inds[~gt_mask]
-        else:
-            keep_fixed = torch.empty(0, device=device, dtype=torch.long)
-            optional = content_inds
-
-        if optional.numel() == 0:
-            return torch.unique(keep_fixed)
-
-        keep_mask = torch.rand(optional.numel(), device=device) > p
-        kept_optional = optional[keep_mask]
-
-        # Keep at least one optional class when possible to avoid degenerate subsets.
-        if kept_optional.numel() == 0 and optional.numel() > 0:
-            rand_idx = torch.randint(0, optional.numel(), (1,), device=device)
-            kept_optional = optional[rand_idx]
-
-        merged = torch.unique(torch.cat([keep_fixed, kept_optional], dim=0))
-
-        # Guardrail: do not let subset become too small.
-        min_keep = max(1, min(desired_len, int(gt_classes.numel()) + 1))
-        if merged.numel() < min_keep:
-            pool = torch.ones(self.num_classes, device=device, dtype=torch.bool)
-            pool[merged] = False
-            candidates = torch.nonzero(pool).flatten()
-            need = min_keep - int(merged.numel())
-            if candidates.numel() > 0 and need > 0:
-                extra = candidates[torch.randperm(candidates.numel(), device=device)[:need]]
-                merged = torch.unique(torch.cat([merged, extra], dim=0))
-        return merged
     
     def _aggregate_prototypes(self, embeddings, method='mean', region_feats=None, tau=0.1):
         """
@@ -539,11 +495,6 @@ class DINO(nn.Module):
 
         content_inds_num = int(content_inds.numel())
 
-        # Explicit class dropout to reduce reliance on a fixed base class universe.
-        before_dropout_num = content_inds_num
-        content_inds = self._apply_class_dropout(content_inds, all_gt, desired_len, device)
-        content_inds_num = int(content_inds.numel())
-
         # FedLoss sampling observability: print every N steps for A/B diagnosis.
         self._fed_sampling_step += 1
         self._fed_sampling_total += 1
@@ -555,8 +506,7 @@ class DINO(nn.Module):
             extra_ratio = 100.0 * self._fed_sampling_extra / max(self._fed_sampling_total, 1)
             self._fed_sampling_logger.info(
                 "[FedSampling] step=%d sampler=%s all_gt_num=%d desired_len=%d "
-                "desired_raw_len=%d need_extra_sampling=%s content_inds_num=%d "
-                "class_dropout_prob=%.3f before_dropout_num=%d extra_ratio=%.2f%%",
+                "desired_raw_len=%d need_extra_sampling=%s content_inds_num=%d extra_ratio=%.2f%%",
                 self._fed_sampling_step,
                 sampler_name,
                 all_gt_num,
@@ -564,8 +514,6 @@ class DINO(nn.Module):
                 desired_raw_len,
                 str(need_extra_sampling),
                 content_inds_num,
-                self.class_dropout_prob,
-                before_dropout_num,
                 extra_ratio,
             )
 

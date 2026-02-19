@@ -35,7 +35,6 @@ model.nms_iou_default = 0.5
 model.class_logit_bias = None
 model.label_noise_ratio = 0.5
 model.test_score_thresh = 0.0
-model.class_dropout_prob = 0.3
 
 # get default config
 dataloader = get_config("common/data/coco_detr.py").dataloader
@@ -55,8 +54,6 @@ train = get_config("common/train.py").train
 
 # Set random seed for reproducibility
 train.seed = 42  # Fixed seed for fair comparison
-# CORA-style small-capacity adaptation: only train prompt-like parameters.
-train.trainable_param_keywords = ["prototype_queries"]
 
 
 # modify training config

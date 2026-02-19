@@ -168,40 +168,6 @@ class Trainer(SimpleTrainer):
             )
 
 
-def _apply_trainable_param_keywords(model, keywords):
-    """
-    Freeze all parameters except those whose names contain any of the given keywords.
-    """
-    if not keywords:
-        return
-    keywords = [k for k in keywords if isinstance(k, str) and k]
-    if not keywords:
-        return
-
-    d2_logger = logging.getLogger("detectron2")
-    total, trainable = 0, 0
-    trainable_names = []
-    for name, param in model.named_parameters():
-        total += param.numel()
-        keep = any(k in name for k in keywords)
-        param.requires_grad = bool(keep)
-        if keep:
-            trainable += param.numel()
-            trainable_names.append(name)
-
-    pct = 100.0 * trainable / max(total, 1)
-    d2_logger.info(
-        "[FreezePolicy] trainable keywords=%s | trainable params=%d/%d (%.4f%%)",
-        keywords,
-        trainable,
-        total,
-        pct,
-    )
-    preview = trainable_names[:20]
-    if preview:
-        d2_logger.info("[FreezePolicy] first trainable params: %s", preview)
-
-
 def do_test(cfg, model):
     if "evaluator" in cfg.dataloader:
         training_mode = model.training  # CHANGE: remember current mode to restore after eval
@@ -416,10 +382,6 @@ def do_train(args, cfg):
                 logger.info("[Debug] decoder class_embed[0] has no _maybe_move_text_feats")
     except Exception as e:
         logger.warning(f"[Debug] failed to report class/embed info: {e}")
-
-    trainable_keywords = getattr(cfg.train, "trainable_param_keywords", [])
-    _apply_trainable_param_keywords(model, trainable_keywords)
-
     model.to(cfg.train.device)
 
     # ==== Added by ChatGPT ====
