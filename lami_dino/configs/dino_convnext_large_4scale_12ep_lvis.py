@@ -1,5 +1,6 @@
 from detrex.config import get_config
 from .models.dino_convnextl import model
+from datetime import datetime
 from fvcore.common.param_scheduler import MultiStepParamScheduler
 from detectron2.solver import WarmupParamScheduler
 from detectron2.config import LazyCall as L
@@ -9,32 +10,32 @@ from detectron2.config import LazyCall as L
 if "language" in model:
     del model["language"]
 
-model.vlm_query_path = None
-model.score_ensemble = False
+model.vlm_query_path = "dataset/metadata/ovdcoco_vlm_query_convnextl.npy"
+model.score_ensemble = True
 model.backbone.score_ensemble = model.score_ensemble
 model.seen_classes = 'dataset/metadata/ovcoco_seen_classes.json'
 model.all_classes = 'dataset/metadata/ovcoco_all_classes.json'
 model.vlm_temperature = 100.0 # keep same with f-vlm
 model.alpha = 0.0
-model.beta = 0.0
-model.novel_scale = 1.0
-model.novel_logit_scale = 1.0
-model.seen_logit_scale = 1.0
-model.freq_reweight = False
+model.beta = 0.4
+model.novel_scale = 5.0
+model.novel_logit_scale = 1.8  # stronger novel boost
+model.seen_logit_scale = 0.75  # stronger seen suppression
+model.freq_reweight = True
 model.freq_scale_rare = 1.5
 model.freq_scale_common = 1.2
 model.freq_scale_frequent = 0.9
-model.topk_novel_boost = 1.0
-model.topk_seen_scale = 1.0
-model.score_floor_novel = 0.0
+model.topk_novel_boost = 1.8
+model.topk_seen_scale = 0.85
+model.score_floor_novel = 0.08
 model.score_floor_seen = 0.0
-model.per_class_nms = False
+model.per_class_nms = True
 model.nms_iou_novel = 0.7
 model.nms_iou_seen = 0.45
 model.nms_iou_default = 0.5
-model.class_logit_bias = None
-model.label_noise_ratio = 0.5
-model.test_score_thresh = 0.0
+model.class_logit_bias = {"airplane": 0.8}
+model.label_noise_ratio = 0.4  # stronger regularization for base overfitting
+model.test_score_thresh = 0.01  # filter low-confidence noise
 
 # get default config
 dataloader = get_config("common/data/coco_detr.py").dataloader
@@ -59,8 +60,10 @@ train.seed = 42  # Fixed seed for fair comparison
 # modify training config
 # train.init_checkpoint = "clip_convnext_large_trans.pth"
 train.init_checkpoint = "./pretrained_models/clip_convnext_large_trans.pth"
-# Fixed output directory for reproducible baseline runs
-train.output_dir = "./output/dino_convnext_large_ovcoco65_baseline"
+# Add timestamp to output directory
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+# resume training from the last checkpoint
+train.output_dir = f"/root/dino_convnext_large_ovcoco65_{timestamp}"
 
 # max training iterations
 # - Original COCO dataset: 113600 images
@@ -104,11 +107,14 @@ model.use_fed_loss = True
 model.cluster_fed_loss = True
 model.cluster_label_path = 'dataset/cluster/ovd_cluster_128.npy'
 model.cat_freq_path = "dataset/coco/ovd_ins_train2017_all_cat_info.json"
-model.fed_loss_num_cat = 32
+model.fed_loss_num_cat = 80
 model.select_box_nums_for_evaluation = 2000  # balance recall vs noise
 
 # modify optimizer config
-optimizer.lr = 1e-4
+# 假设你单卡用 1e-4 (1GPU); 1e-4 使用原来成功的学习率
+base_lr = 1e-4
+world_size = 1.5  # GPU 数
+optimizer.lr = base_lr * world_size
 optimizer.betas = (0.9, 0.999)
 optimizer.weight_decay = 1e-4
 #optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 1
@@ -152,7 +158,7 @@ model.classifier.text_embed_path = "dataset/metadata/ovdcoco_prompts_list8_v2.np
 model.classifier.eval_text_embed_path = "dataset/metadata/ovdcoco_prompts_list8_v2.npy"
 model.classifier.tpa_num_prototypes = 5  # 8 prompts -> 5 prototypes (better utilization)
 model.classifier.tpa_hidden_dim = 256
-model.classifier.tpa_dropout = 0.1
+model.classifier.tpa_dropout = 0.05  # Add dropout for regularization
 model.classifier.tpa_tau = 0.07  # Optimal temperature for attention aggregation (τ ≈ 0.05–0.1 recommended) 0.1 is original
 model.classifier.tpa_log_interval = 200
 
