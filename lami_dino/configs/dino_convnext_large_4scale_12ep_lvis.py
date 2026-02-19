@@ -122,13 +122,13 @@ optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in modul
 
 # modify dataloader config
 # Start with conservative setting, can be increased if stable
-dataloader.train.num_workers = 2  # 1 worker per GPU for 4GPU training
+dataloader.train.num_workers = 4  # 1 worker per GPU for 4GPU training
 # please notice that this is total batch size.
 # surpose you're using 4 gpus for training and the batch size for
 # each gpu is 16/4 = 4
 # Note: Using Option 3 (averaged embeddings), batch_size can remain at 4
 # If using Option 2 (6015 queries), reduce to batch_size=1
-dataloader.train.total_batch_size = 8  # Can use 4 with Option 3
+dataloader.train.total_batch_size = 16  # Can use 4 with Option 3
 # Enable long-tail sampling (RepeatFactorTrainingSampler)
 dataloader.train.sampler = "RepeatFactorTrainingSampler"
 dataloader.train.repeat_threshold = 0.002
