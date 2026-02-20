@@ -729,6 +729,10 @@ class DINO(nn.Module):
         else:
             box_cls = output["pred_logits"]
             box_pred = output["pred_boxes"]
+            base_idx = getattr(self, "base_idx", None)
+            novel_idx = getattr(self, "novel_idx", None)
+            base_idx_dev = base_idx.to(box_cls.device) if torch.is_tensor(base_idx) else None
+            novel_idx_dev = novel_idx.to(box_cls.device) if torch.is_tensor(novel_idx) else None
             if hasattr(self, "class_logit_bias_tensor"):
                 box_cls = box_cls + self.class_logit_bias_tensor
             if self.save_dir and not self.score_ensemble:
@@ -749,13 +753,15 @@ class DINO(nn.Module):
                 cls_score = box_cls.sigmoid()
                 vlm_score = roi_features_ori @ self.vlm_content_query_embedding.t() * self.vlm_temperature
                 vlm_score = vlm_score.softmax(dim=-1)
-                cls_score[:, :, self.base_idx] = cls_score[:, :, self.base_idx] ** (
-                        1 - self.alpha) * vlm_score[:, :, self.base_idx] ** self.alpha
-                cls_score[:, :, self.novel_idx] = cls_score[:, :, self.novel_idx] ** (
-                        1 - self.beta) * vlm_score[:, :, self.novel_idx] ** self.beta 
-                cls_score[:, :, self.novel_idx] = cls_score[:, :, self.novel_idx] * self.novel_scale
-                if self.seen_logit_scale != 1.0 and hasattr(self, "base_idx"):
-                    cls_score[:, :, self.base_idx] = cls_score[:, :, self.base_idx] * self.seen_logit_scale
+                if base_idx_dev is not None:
+                    cls_score[:, :, base_idx_dev] = cls_score[:, :, base_idx_dev] ** (
+                        1 - self.alpha) * vlm_score[:, :, base_idx_dev] ** self.alpha
+                if novel_idx_dev is not None:
+                    cls_score[:, :, novel_idx_dev] = cls_score[:, :, novel_idx_dev] ** (
+                        1 - self.beta) * vlm_score[:, :, novel_idx_dev] ** self.beta
+                    cls_score[:, :, novel_idx_dev] = cls_score[:, :, novel_idx_dev] * self.novel_scale
+                if self.seen_logit_scale != 1.0 and base_idx_dev is not None:
+                    cls_score[:, :, base_idx_dev] = cls_score[:, :, base_idx_dev] * self.seen_logit_scale
                 if self.freq_reweight and hasattr(self, "freq_score_scale"):
                     cls_score = cls_score * self.freq_score_scale
                 box_cls = cls_score
@@ -765,10 +771,10 @@ class DINO(nn.Module):
                     hasattr(self, "novel_idx") or hasattr(self, "base_idx")
                 ):
                     box_cls = box_cls.clone()
-                    if self.novel_logit_scale != 1.0 and hasattr(self, "novel_idx"):
-                        box_cls[:, :, self.novel_idx] = box_cls[:, :, self.novel_idx] * self.novel_logit_scale
-                    if self.seen_logit_scale != 1.0 and hasattr(self, "base_idx"):
-                        box_cls[:, :, self.base_idx] = box_cls[:, :, self.base_idx] * self.seen_logit_scale
+                    if self.novel_logit_scale != 1.0 and novel_idx_dev is not None:
+                        box_cls[:, :, novel_idx_dev] = box_cls[:, :, novel_idx_dev] * self.novel_logit_scale
+                    if self.seen_logit_scale != 1.0 and base_idx_dev is not None:
+                        box_cls[:, :, base_idx_dev] = box_cls[:, :, base_idx_dev] * self.seen_logit_scale
                 if self.freq_reweight and hasattr(self, "freq_log_scale"):
                     box_cls = box_cls + self.freq_log_scale
                 results = self.inference(box_cls, box_pred, images.image_sizes)
@@ -1048,6 +1054,10 @@ class DINO(nn.Module):
         """
         assert len(box_cls) == len(image_sizes)
         results = []
+        base_idx_cpu = getattr(self, "base_idx", None)
+        novel_idx_cpu = getattr(self, "novel_idx", None)
+        base_idx_dev = base_idx_cpu.to(box_cls.device) if torch.is_tensor(base_idx_cpu) else None
+        novel_idx_dev = novel_idx_cpu.to(box_cls.device) if torch.is_tensor(novel_idx_cpu) else None
 
         # box_cls.shape: 1, 300, 80
         # box_pred.shape: 1, 300, 4
@@ -1056,12 +1066,12 @@ class DINO(nn.Module):
         else:
             prob = box_cls.sigmoid()
         prob_for_topk = prob
-        if (self.topk_novel_boost != 1.0 or self.topk_seen_scale != 1.0) and hasattr(self, "novel_idx"):
+        if (self.topk_novel_boost != 1.0 or self.topk_seen_scale != 1.0) and novel_idx_dev is not None:
             prob_for_topk = prob.clone()
             if self.topk_novel_boost != 1.0:
-                prob_for_topk[:, :, self.novel_idx] = prob_for_topk[:, :, self.novel_idx] * self.topk_novel_boost
-            if self.topk_seen_scale != 1.0 and hasattr(self, "base_idx"):
-                prob_for_topk[:, :, self.base_idx] = prob_for_topk[:, :, self.base_idx] * self.topk_seen_scale
+                prob_for_topk[:, :, novel_idx_dev] = prob_for_topk[:, :, novel_idx_dev] * self.topk_novel_boost
+            if self.topk_seen_scale != 1.0 and base_idx_dev is not None:
+                prob_for_topk[:, :, base_idx_dev] = prob_for_topk[:, :, base_idx_dev] * self.topk_seen_scale
         flat_prob_for_topk = prob_for_topk.view(box_cls.shape[0], -1)
         flat_prob = prob.view(box_cls.shape[0], -1)
         _, topk_indexes = torch.topk(
@@ -1079,12 +1089,12 @@ class DINO(nn.Module):
         for i, (scores_per_image, labels_per_image, box_pred_per_image, image_size) in enumerate(
             zip(scores, labels, boxes, image_sizes)
         ):
-            if (self.score_floor_novel > 0 or self.score_floor_seen > 0) and hasattr(self, "novel_idx"):
+            if (self.score_floor_novel > 0 or self.score_floor_seen > 0) and novel_idx_dev is not None:
                 score_floor = torch.zeros_like(scores_per_image)
                 if self.score_floor_novel > 0:
-                    score_floor[self.novel_idx[labels_per_image]] = self.score_floor_novel
-                if self.score_floor_seen > 0 and hasattr(self, "base_idx"):
-                    score_floor[self.base_idx[labels_per_image]] = self.score_floor_seen
+                    score_floor[novel_idx_dev[labels_per_image]] = self.score_floor_novel
+                if self.score_floor_seen > 0 and base_idx_dev is not None:
+                    score_floor[base_idx_dev[labels_per_image]] = self.score_floor_seen
                 scores_per_image = torch.maximum(scores_per_image, score_floor)
 
             result = Instances(image_size)
@@ -1095,9 +1105,9 @@ class DINO(nn.Module):
                 keep_all = []
                 for cls in labels_per_image.unique().tolist():
                     cls_mask = labels_per_image == cls
-                    if hasattr(self, "novel_idx") and self.novel_idx[cls]:
+                    if torch.is_tensor(novel_idx_cpu) and bool(novel_idx_cpu[cls].item()):
                         iou_thr = self.nms_iou_novel
-                    elif hasattr(self, "base_idx") and self.base_idx[cls]:
+                    elif torch.is_tensor(base_idx_cpu) and bool(base_idx_cpu[cls].item()):
                         iou_thr = self.nms_iou_seen
                     else:
                         iou_thr = self.nms_iou_default
