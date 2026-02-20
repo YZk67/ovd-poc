@@ -593,10 +593,14 @@ class DINO(nn.Module):
             img_masks = images.tensor.new_zeros(batch_size, H, W)
 
         # original features
-        if self.score_ensemble:
-            features, features_wonorm = self.backbone(images.tensor)  # output feature dict
+        # Be robust to config override order:
+        # backbone may return either dict or (dict, no-norm-features).
+        backbone_out = self.backbone(images.tensor)
+        if isinstance(backbone_out, tuple):
+            features, features_wonorm = backbone_out
         else:
-            features = self.backbone(images.tensor)  # output feature dict
+            features = backbone_out
+            features_wonorm = None
 
         # project backbone features to the reuired dimension of transformer
         # we use multi-scale features in DINO
@@ -741,6 +745,11 @@ class DINO(nn.Module):
                 save_output["pred_boxes"] = copy.deepcopy(output["pred_boxes"]).cpu()
                 torch.save(save_output, os.path.join(self.save_dir, filename))
             if self.score_ensemble:
+                if features_wonorm is None:
+                    raise ValueError(
+                        "score_ensemble=True but backbone did not return no-norm features. "
+                        "Please also set model.backbone.score_ensemble=True."
+                    )
                 roi_features_ori = self.extract_region_feature(features_wonorm, box_pred, 'p3')
 
                 if self.save_dir:
