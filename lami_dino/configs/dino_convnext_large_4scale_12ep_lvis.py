@@ -105,7 +105,7 @@ model.eval_query_path = "dataset/metadata/ovdcoco_prompts_list8_v2.npy"
 
 model.use_fed_loss = True
 model.cluster_fed_loss = True
-model.cluster_label_path = 'dataset/cluster/ovdcoco_cluster_16.npy'
+model.cluster_label_path = 'dataset/cluster/ovdcoco_cluster_161.npy'
 model.cat_freq_path = "dataset/coco/ovd_ins_train2017_all_cat_info.json"
 model.fed_loss_num_cat = 20
 model.select_box_nums_for_evaluation = 2000  # balance recall vs noise
