@@ -195,7 +195,7 @@ def do_test(cfg, model):
             return {}
         except Exception as e:
             logger = logging.getLogger("detectron2")
-            logger.warning(f"Error during evaluation: {e}")
+            logger.exception(f"Error during evaluation: {e}")
             logger.warning("Skipping evaluation - training will continue")
             # Restore original num_workers
             cfg.dataloader.test.num_workers = original_num_workers
