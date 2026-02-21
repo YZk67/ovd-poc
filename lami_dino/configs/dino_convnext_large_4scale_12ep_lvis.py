@@ -160,8 +160,8 @@ model.classifier.tpa_num_prototypes = 4  # reduce prototype collapse risk
 model.classifier.tpa_hidden_dim = 256
 model.classifier.tpa_dropout = 0.0  # remove noise until TPA is stable
 model.classifier.tpa_tau = 0.04  # sharper attention to break uniform prototype usage
-model.classifier.tpa_lambda_orth = 0.5  # stronger anti-collapse orthogonality pressure
-model.classifier.tpa_lambda_div = 0.1
+# model.classifier.tpa_lambda_orth = 0.5  # unsupported in current runtime TextClassifier
+# model.classifier.tpa_lambda_div = 0.1
 model.classifier.tpa_warmup_steps = 2000
 model.classifier.tpa_log_interval = 200
 
