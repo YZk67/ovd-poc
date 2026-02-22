@@ -279,6 +279,7 @@ class DINOTransformer(nn.Module):
             grid_y, grid_x = torch.meshgrid(
                 torch.linspace(0, H - 1, H, dtype=torch.float32, device=memory.device),
                 torch.linspace(0, W - 1, W, dtype=torch.float32, device=memory.device),
+                indexing="ij",
             )
             grid = torch.cat([grid_x.unsqueeze(-1), grid_y.unsqueeze(-1)], -1)
 
@@ -328,6 +329,7 @@ class DINOTransformer(nn.Module):
             ref_y, ref_x = torch.meshgrid(
                 torch.linspace(0.5, H - 0.5, H, dtype=torch.float32, device=device),
                 torch.linspace(0.5, W - 0.5, W, dtype=torch.float32, device=device),
+                indexing="ij",
             )
             ref_y = ref_y.reshape(-1)[None] / (valid_ratios[:, None, lvl, 1] * H)
             ref_x = ref_x.reshape(-1)[None] / (valid_ratios[:, None, lvl, 0] * W)
