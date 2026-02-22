@@ -95,6 +95,7 @@ class COCOEvaluator(DatasetEvaluator):
                 Defaults to True.
         """
         self._logger = logging.getLogger(__name__)
+        self._dataset_name = dataset_name
         self._distributed = distributed
         self._output_dir = output_dir
 
@@ -367,6 +368,15 @@ class COCOEvaluator(DatasetEvaluator):
         assert len(class_names) == precisions.shape[2]
 
         results_per_category = []
+        results_per_category_ap50 = []
+        ap50_iou_idx = None
+        if coco_eval is not None and coco_eval.eval is not None and "precision" in coco_eval.eval:
+            iou_thrs = getattr(coco_eval.params, "iouThrs", None)
+            if iou_thrs is not None:
+                # COCO default starts at 0.50, but find it explicitly for robustness.
+                matches = np.where(np.isclose(iou_thrs, 0.5))[0]
+                if len(matches) > 0:
+                    ap50_iou_idx = int(matches[0])
         for idx, name in enumerate(class_names):
             # area range index 0: all area ranges
             # max dets index -1: typically 100 per image
@@ -374,6 +384,14 @@ class COCOEvaluator(DatasetEvaluator):
             precision = precision[precision > -1]
             ap = np.mean(precision) if precision.size else float("nan")
             results_per_category.append(("{}".format(name), float(ap * 100)))
+
+            if ap50_iou_idx is not None:
+                precision_50 = precisions[ap50_iou_idx, :, idx, 0, -1]
+                precision_50 = precision_50[precision_50 > -1]
+                ap50 = np.mean(precision_50) if precision_50.size else float("nan")
+            else:
+                ap50 = float("nan")
+            results_per_category_ap50.append(("{}".format(name), float(ap50 * 100)))
 
         # tabulate it
         N_COLS = min(6, len(results_per_category) * 2)
@@ -389,7 +407,92 @@ class COCOEvaluator(DatasetEvaluator):
         self._logger.info("Per-category {} AP: \n".format(iou_type) + table)
 
         results.update({"AP-" + name: ap for name, ap in results_per_category})
+        grouped_ap50 = self._derive_grouped_ap50_results(results_per_category_ap50)
+        if grouped_ap50:
+            results.update(grouped_ap50)
+            self._logger.info(
+                "Grouped {} AP50: \n".format(iou_type) + create_small_table(grouped_ap50)
+            )
         return results
+
+    def _derive_grouped_ap50_results(self, results_per_category_ap50):
+        """
+        Compute grouped AP50 metrics such as AP50-base/AP50-novel when dataset metadata
+        (or dataset naming convention) provides a base/novel split.
+        """
+        split = self._get_base_novel_split()
+        if not split:
+            return {}
+
+        base_classes, novel_classes = split
+        if not base_classes and not novel_classes:
+            return {}
+
+        ap50_map = dict(results_per_category_ap50)
+        ret = {}
+
+        def _mean_for(names):
+            vals = [ap50_map[n] for n in names if n in ap50_map and np.isfinite(ap50_map[n])]
+            return float(np.mean(vals)) if len(vals) else float("nan")
+
+        if base_classes:
+            ret["AP50-base"] = _mean_for(base_classes)
+        if novel_classes:
+            ret["AP50-novel"] = _mean_for(novel_classes)
+        return ret
+
+    def _get_base_novel_split(self):
+        """
+        Return (base_classes, novel_classes) if available.
+        Priority:
+        1) metadata.base_classes / metadata.novel_classes
+        2) infer for OVD-COCO *_val_all by reading sibling *_val_b annotation json
+        """
+        base_classes = getattr(self._metadata, "base_classes", None)
+        novel_classes = getattr(self._metadata, "novel_classes", None)
+        if base_classes is not None or novel_classes is not None:
+            return list(base_classes or []), list(novel_classes or [])
+
+        class_names = list(getattr(self._metadata, "thing_classes", []) or [])
+        if not class_names:
+            return None
+
+        if not (
+            isinstance(self._dataset_name, str)
+            and ("ovdcoco" in self._dataset_name or "ovcoco" in self._dataset_name)
+            and self._dataset_name.endswith("_val_all")
+        ):
+            return None
+
+        json_file = getattr(self._metadata, "json_file", None)
+        if not json_file:
+            return None
+
+        candidate_paths = []
+        if "_val_all.json" in json_file:
+            candidate_paths.append(json_file.replace("_val_all.json", "_val_b.json"))
+        if "_all.json" in json_file:
+            candidate_paths.append(json_file.replace("_all.json", "_b.json"))
+
+        for p in candidate_paths:
+            try:
+                local_p = PathManager.get_local_path(p)
+                with PathManager.open(local_p, "r") as f:
+                    data = json.load(f)
+                cats = data.get("categories", [])
+                if not cats:
+                    continue
+                base_set = {c["name"] for c in cats if "name" in c}
+                if not base_set:
+                    continue
+                base_classes = [n for n in class_names if n in base_set]
+                novel_classes = [n for n in class_names if n not in base_set]
+                if base_classes:
+                    return base_classes, novel_classes
+            except Exception as e:
+                self._logger.debug(f"Failed to infer base/novel split from {p}: {e}")
+
+        return None
 
 
 def instances_to_coco_json(instances, img_id):
