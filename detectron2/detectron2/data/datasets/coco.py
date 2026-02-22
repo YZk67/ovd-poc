@@ -77,7 +77,24 @@ def load_coco_json(json_file, image_root, dataset_name=None, extra_annotation_ke
         cats = coco_api.loadCats(cat_ids)
         # The categories in a custom json file may not be sorted.
         thing_classes = [c["name"] for c in sorted(cats, key=lambda x: x["id"])]
-        meta.thing_classes = thing_classes
+
+        preset_thing_classes = getattr(meta, "thing_classes", None)
+        if preset_thing_classes is None:
+            meta.thing_classes = thing_classes
+        elif list(preset_thing_classes) != list(thing_classes):
+            # Respect pre-registered class space (e.g. fixed open-vocabulary label space)
+            # when the JSON only contains a subset of categories.
+            if set(thing_classes).issubset(set(preset_thing_classes)):
+                logger.warning(
+                    "Dataset '%s' json classes are a subset of pre-registered metadata; "
+                    "keeping pre-registered thing_classes.",
+                    dataset_name,
+                )
+            else:
+                raise ValueError(
+                    f"Dataset '{dataset_name}' has incompatible class definitions between "
+                    "metadata and json categories."
+                )
 
         # In COCO, certain category ids are artificially removed,
         # and by convention they are always ignored.
@@ -94,8 +111,18 @@ def load_coco_json(json_file, image_root, dataset_name=None, extra_annotation_ke
                     Category ids in annotations are not in [1, #categories]! We'll apply a mapping for you.
                     """
                 )
-        id_map = {v: i for i, v in enumerate(cat_ids)}
-        meta.thing_dataset_id_to_contiguous_id = id_map
+        preset_id_map = getattr(meta, "thing_dataset_id_to_contiguous_id", None)
+        if preset_id_map is not None:
+            missing_ids = [cid for cid in cat_ids if cid not in preset_id_map]
+            if missing_ids:
+                raise KeyError(
+                    f"Dataset '{dataset_name}' has category ids in json not covered by "
+                    f"pre-registered id map: {missing_ids}"
+                )
+            id_map = preset_id_map
+        else:
+            id_map = {v: i for i, v in enumerate(cat_ids)}
+            meta.thing_dataset_id_to_contiguous_id = id_map
 
     # sort indices for reproducible results
     img_ids = sorted(coco_api.imgs.keys())
