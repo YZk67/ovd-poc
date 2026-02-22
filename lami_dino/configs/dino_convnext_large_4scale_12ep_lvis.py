@@ -16,6 +16,7 @@ dataloader = get_config("common/data/coco_detr.py").dataloader
 optimizer = get_config("common/optim.py").AdamW
 lr_multiplier = get_config("common/coco_schedule.py").lr_multiplier_12ep_warmup
 train = get_config("common/train.py").train
+train.ddp.find_unused_parameters = True
 
 
 # modify training config
