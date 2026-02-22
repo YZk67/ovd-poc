@@ -50,7 +50,7 @@ model.eval_query_path = "dataset/metadata/ovdcoco_visual_desc_convnextl.npy"
 
 model.use_fed_loss = True
 model.cluster_fed_loss = True
-model.cluster_label_path = 'dataset/cluster/ovd_cluster_128.npy'
+model.cluster_label_path = 'dataset/cluster/ovdcoco_cluster4_16.npy'
 model.cat_freq_path = "dataset/coco/ovd_ins_train2017_all_cat_info.json"
 model.fed_loss_num_cat=32
 model.select_box_nums_for_evaluation = 2000
@@ -62,12 +62,12 @@ optimizer.weight_decay = 1e-4
 optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 1
 
 # modify dataloader config
-dataloader.train.num_workers = 1
+dataloader.train.num_workers = 4
 
 # please notice that this is total batch size.
 # surpose you're using 4 gpus for training and the batch size for
 # each gpu is 16/4 = 4
-dataloader.train.total_batch_size = 4
+dataloader.train.total_batch_size = 16
 
 # dump the testing results into output_dir for visualization
 dataloader.evaluator.output_dir = train.output_dir
