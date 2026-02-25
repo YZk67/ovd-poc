@@ -31,6 +31,8 @@ from detrex.utils import (inverse_sigmoid, is_dist_avail_and_initialized,
 from detectron2.modeling import detector_postprocess
 from detectron2.structures import Boxes, ImageList, Instances
 
+from .unknown_proposals import get_unknown_proposal_match_info, select_unknown_proposals
+
 
 class DINO(nn.Module):
     """Implement DAB-Deformable-DETR in `DAB-DETR: Dynamic Anchor Boxes are Better Queries for DETR
@@ -209,6 +211,12 @@ class DINO(nn.Module):
         self.save_dir = save_dir
         if self.save_dir:
             os.makedirs(self.save_dir, exist_ok=True)
+        self.unknown_vis_dir = None
+        self.unknown_vis_max_images = 8
+        self.unknown_vis_saved = 0
+        if self.save_dir:
+            self.unknown_vis_dir = os.path.join(self.save_dir, "unknown_proposals")
+            os.makedirs(self.unknown_vis_dir, exist_ok=True)
 
     def filter_content_info(self, batched_inputs):
         freq_weight = self.freq_weight if self.freq_weight is not None else torch.ones(self.num_classes, device=self.device)
@@ -391,7 +399,44 @@ class DINO(nn.Module):
         output["enc_outputs"] = {"pred_logits": interm_class, "pred_boxes": interm_coord}
 
         if self.training:
+            proposal_unknown_mask, proposal_max_iou = get_unknown_proposal_match_info(
+                enc_reference, targets
+            )
+            unknown_encoder_proposals = [enc_reference[i][proposal_unknown_mask[i]] for i in range(enc_reference.shape[0])]
+            output["proposal_unknown_mask"] = proposal_unknown_mask
+            output["proposal_unknown_max_iou"] = proposal_max_iou
+            output["unknown_encoder_proposals"] = unknown_encoder_proposals
+            self._save_unknown_proposal_visuals(
+                batched_inputs,
+                targets,
+                enc_reference,
+                proposal_unknown_mask,
+                proposal_max_iou,
+            )
+            if self.aux_loss:
+                for aux_output in output["aux_outputs"]:
+                    aux_output["proposal_unknown_mask"] = proposal_unknown_mask
+            output["enc_outputs"]["proposal_unknown_mask"] = proposal_unknown_mask
+
+        if self.training:
             loss_dict = self.criterion(output, targets, dn_meta)
+            if "proposal_unknown_mask" in output:
+                unknown_mask = output["proposal_unknown_mask"]
+                unknown_counts = unknown_mask.sum(dim=1).float()
+                pseudo_counts = torch.stack(
+                    [t["pseudo_mask"].sum() for t in targets], dim=0
+                ).to(unknown_counts.device).float()
+                selected_iou = output["proposal_unknown_max_iou"][unknown_mask]
+                loss_dict["debug_unknown_prop_count_mean"] = unknown_counts.mean().detach()
+                loss_dict["debug_unknown_prop_ratio_mean"] = (
+                    unknown_counts / unknown_mask.shape[1]
+                ).mean().detach()
+                loss_dict["debug_pseudo_gt_count_mean"] = pseudo_counts.mean().detach()
+                loss_dict["debug_unknown_prop_iou_mean"] = (
+                    selected_iou.mean().detach()
+                    if selected_iou.numel() > 0
+                    else unknown_counts.new_tensor(0.0)
+                )
             weight_dict = self.criterion.weight_dict
             for k in loss_dict.keys():
                 if k in weight_dict:
@@ -436,6 +481,87 @@ class DINO(nn.Module):
                 r = detector_postprocess(results_per_image, height, width)
                 processed_results.append({"instances": r})
             return processed_results
+
+    @torch.no_grad()
+    def select_unknown_encoder_proposals(self, enc_reference, targets, thr=0.5):
+        """Select encoder top-k proposals overlapping pseudo/unknown targets."""
+        return select_unknown_proposals(enc_reference, targets, thr=thr)
+
+    @torch.no_grad()
+    def _save_unknown_proposal_visuals(
+        self,
+        batched_inputs,
+        targets,
+        enc_reference,
+        proposal_unknown_mask,
+        proposal_unknown_max_iou,
+        max_draw_per_image=50,
+    ):
+        if not self.unknown_vis_dir or self.unknown_vis_saved >= self.unknown_vis_max_images:
+            return
+
+        for img_idx, (sample, target) in enumerate(zip(batched_inputs, targets)):
+            if self.unknown_vis_saved >= self.unknown_vis_max_images:
+                break
+
+            img = sample["image"].detach().cpu()
+            if img.dtype != torch.uint8:
+                img = img.clamp(0, 255).to(torch.uint8)
+            if img.dim() != 3:
+                continue
+            if img.shape[0] == 1:
+                img = img.repeat(3, 1, 1)
+            if img.shape[0] != 3:
+                continue
+
+            h, w = img.shape[-2:]
+            pseudo_mask = target["pseudo_mask"].to(torch.bool)
+            pseudo_boxes = target["boxes"][pseudo_mask]
+            if pseudo_boxes.numel() > 0:
+                pseudo_boxes = box_cxcywh_to_xyxy(pseudo_boxes)
+                pseudo_boxes = pseudo_boxes * pseudo_boxes.new_tensor([w, h, w, h])
+                pseudo_boxes = pseudo_boxes.clamp(min=0)
+            else:
+                pseudo_boxes = torch.zeros((0, 4), dtype=torch.float32)
+
+            unk_mask = proposal_unknown_mask[img_idx]
+            unk_boxes = enc_reference[img_idx][unk_mask]
+            unk_ious = proposal_unknown_max_iou[img_idx][unk_mask]
+            if unk_boxes.numel() > 0:
+                if unk_boxes.shape[0] > max_draw_per_image:
+                    top_idx = torch.topk(unk_ious, k=max_draw_per_image).indices
+                    unk_boxes = unk_boxes[top_idx]
+                    unk_ious = unk_ious[top_idx]
+                unk_boxes = box_cxcywh_to_xyxy(unk_boxes)
+                unk_boxes = unk_boxes * unk_boxes.new_tensor([w, h, w, h])
+                unk_boxes = unk_boxes.clamp(min=0)
+                unk_labels = [f"u:{float(v):.2f}" for v in unk_ious.detach().cpu()]
+            else:
+                unk_boxes = torch.zeros((0, 4), dtype=torch.float32)
+                unk_labels = None
+
+            canvas = img
+            if pseudo_boxes.numel() > 0:
+                canvas = torchvision.utils.draw_bounding_boxes(
+                    canvas,
+                    pseudo_boxes.cpu(),
+                    colors="red",
+                    width=3,
+                    labels=["pseudo"] * pseudo_boxes.shape[0],
+                )
+            if unk_boxes.numel() > 0:
+                canvas = torchvision.utils.draw_bounding_boxes(
+                    canvas,
+                    unk_boxes.cpu(),
+                    colors="cyan",
+                    width=2,
+                    labels=unk_labels,
+                )
+
+            stem = os.path.splitext(os.path.basename(sample.get("file_name", f"img_{img_idx}.jpg")))[0]
+            out_path = os.path.join(self.unknown_vis_dir, f"{self.unknown_vis_saved:03d}_{stem}.png")
+            torchvision.io.write_png(canvas.cpu(), out_path)
+            self.unknown_vis_saved += 1
     
     def extract_region_feature(self, features, bbox, layer_name):
         if layer_name == 'p2':
@@ -706,5 +832,12 @@ class DINO(nn.Module):
             gt_scores = targets_per_image.gt_scores
             gt_boxes = targets_per_image.gt_boxes.tensor / image_size_xyxy
             gt_boxes = box_xyxy_to_cxcywh(gt_boxes)
-            new_targets.append({"labels": gt_classes, "boxes": gt_boxes, "scores": gt_scores})
+            new_targets.append(
+                {
+                    "labels": gt_classes,
+                    "boxes": gt_boxes,
+                    "scores": gt_scores,
+                    "pseudo_mask": gt_scores < 1,
+                }
+            )
         return new_targets

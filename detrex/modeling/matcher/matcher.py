@@ -34,6 +34,14 @@ from scipy.optimize import linear_sum_assignment
 from detrex.layers.box_ops import box_cxcywh_to_xyxy, generalized_box_iou
 
 
+def _get_target_pseudo_mask(target):
+    if "pseudo_mask" in target:
+        return target["pseudo_mask"].to(torch.bool)
+    if "scores" in target:
+        return (target["scores"] < 1).to(torch.bool)
+    return None
+
+
 class HungarianMatcher(nn.Module):
     """HungarianMatcher which computes an assignment between targets and predictions.
 
@@ -141,13 +149,36 @@ class HungarianMatcher(nn.Module):
 
         # Final cost matrix
         C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
-        C = C.view(bs, num_queries, -1).cpu()
+        C = C.view(bs, num_queries, -1)
+
+        if "proposal_unknown_mask" in outputs:
+            proposal_unknown_mask = outputs["proposal_unknown_mask"].to(torch.bool)
+            if proposal_unknown_mask.dim() == 2 and proposal_unknown_mask.shape[:2] == (bs, num_queries):
+                tgt_pseudo_masks = [_get_target_pseudo_mask(t) for t in targets]
+                if all(mask is not None for mask in tgt_pseudo_masks):
+                    tgt_pseudo = torch.cat(tgt_pseudo_masks)
+                    batch_idx = torch.cat(
+                        [torch.full_like(mask, i, dtype=torch.long) for i, mask in enumerate(tgt_pseudo_masks)]
+                    )
+                    batched_tgt_pseudo = torch.zeros(
+                        bs, tgt_pseudo.numel(), dtype=torch.bool, device=C.device
+                    )
+                    batched_tgt_pseudo.scatter_(0, batch_idx.unsqueeze(0), tgt_pseudo.unsqueeze(0))
+                    valid_mask = proposal_unknown_mask.unsqueeze(-1) == batched_tgt_pseudo.unsqueeze(1)
+                    C = C.masked_fill(~valid_mask, 1e6)
+
+        C = C.cpu()
 
         sizes = [len(v["boxes"]) for v in targets]
-        indices = [linear_sum_assignment(c[i]) for i, c in enumerate(C.split(sizes, -1))]
+        cost_splits = [c[i] for i, c in enumerate(C.split(sizes, -1))]
+        indices = [linear_sum_assignment(c) for c in cost_splits]
+        filtered = []
+        for cost_i, (src_idx, tgt_idx) in zip(cost_splits, indices):
+            keep = cost_i[src_idx, tgt_idx] < 1e6
+            filtered.append((src_idx[keep], tgt_idx[keep]))
         return [
             (torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64))
-            for i, j in indices
+            for i, j in filtered
         ]
 
     def __repr__(self, _repr_indent=4):

@@ -20,3 +20,4 @@ from .dino_transformer import (
 )
 from .dino import DINO
 from .dn_criterion import DINOCriterion
+from .unknown_proposals import get_unknown_proposal_mask, select_unknown_proposals
