@@ -174,7 +174,7 @@ class HungarianMatcher(nn.Module):
         indices = [linear_sum_assignment(c) for c in cost_splits]
         filtered = []
         for cost_i, (src_idx, tgt_idx) in zip(cost_splits, indices):
-            keep = cost_i[src_idx, tgt_idx] < 1e6
+            keep = (cost_i[src_idx, tgt_idx] < 1e6).cpu().numpy()
             filtered.append((src_idx[keep], tgt_idx[keep]))
         return [
             (torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64))
