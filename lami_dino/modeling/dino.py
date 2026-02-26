@@ -527,6 +527,10 @@ class DINO(nn.Module):
             unk_mask = proposal_unknown_mask[img_idx]
             unk_boxes = enc_reference[img_idx][unk_mask]
             unk_ious = proposal_unknown_max_iou[img_idx][unk_mask]
+            print(
+                f"[unknown_vis] img_idx={img_idx} pseudo={int(pseudo_mask.sum().item())} "
+                f"unk={int(unk_mask.sum().item())}"
+            )
             if unk_boxes.numel() > 0:
                 if unk_boxes.shape[0] > max_draw_per_image:
                     top_idx = torch.topk(unk_ious, k=max_draw_per_image).indices
