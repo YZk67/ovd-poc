@@ -258,7 +258,7 @@ def register_all_coco(root):
             jf = os.path.join(root, json_file) if "://" not in json_file else json_file
             ir = os.path.join(root, image_root)
 
-            if key.startswith("ovdcoco65_2017_"):
+            if key.startswith("ovdcoco65_2017_") or key == "ovd_coco_train_with_pseudo":
                 register_coco_instances(
                     key, {}, jf, ir, extra_annotation_keys=pseudo_extra_annotation_keys
                 )
@@ -268,7 +268,7 @@ def register_all_coco(root):
                 meta.thing_dataset_id_to_contiguous_id = OVDCOCO65_IDMAP
                 continue
 
-            if key.startswith("ovcoco_2017_") or key == "ovd_coco_train_with_pseudo":
+            if key.startswith("ovcoco_2017_"):
                 register_coco_instances(
                     key, {}, jf, ir, extra_annotation_keys=pseudo_extra_annotation_keys
                 )
