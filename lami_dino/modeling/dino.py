@@ -537,6 +537,11 @@ class DINO(nn.Module):
                 int(pseudo_mask.sum().item()),
                 int(unk_mask.sum().item()),
             )
+            with open(os.path.join(self.unknown_vis_dir, "debug_counts.txt"), "a") as f:
+                f.write(
+                    f"img_idx={img_idx} pseudo={int(pseudo_mask.sum().item())} "
+                    f"unk={int(unk_mask.sum().item())}\n"
+                )
             if unk_boxes.numel() > 0:
                 if unk_boxes.shape[0] > max_draw_per_image:
                     top_idx = torch.topk(unk_ious, k=max_draw_per_image).indices
