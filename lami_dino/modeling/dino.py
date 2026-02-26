@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
 import copy
 import math
@@ -32,6 +33,8 @@ from detectron2.modeling import detector_postprocess
 from detectron2.structures import Boxes, ImageList, Instances
 
 from .unknown_proposals import get_unknown_proposal_match_info, select_unknown_proposals
+
+logger = logging.getLogger(__name__)
 
 
 class DINO(nn.Module):
@@ -527,9 +530,11 @@ class DINO(nn.Module):
             unk_mask = proposal_unknown_mask[img_idx]
             unk_boxes = enc_reference[img_idx][unk_mask]
             unk_ious = proposal_unknown_max_iou[img_idx][unk_mask]
-            print(
-                f"[unknown_vis] img_idx={img_idx} pseudo={int(pseudo_mask.sum().item())} "
-                f"unk={int(unk_mask.sum().item())}"
+            logger.info(
+                "[unknown_vis] img_idx=%d pseudo=%d unk=%d",
+                img_idx,
+                int(pseudo_mask.sum().item()),
+                int(unk_mask.sum().item()),
             )
             if unk_boxes.numel() > 0:
                 if unk_boxes.shape[0] > max_draw_per_image:
