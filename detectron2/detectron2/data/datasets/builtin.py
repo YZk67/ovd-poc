@@ -245,21 +245,33 @@ def _ovcoco_build_id_map(_json_path=None):
 
 
 def register_all_coco(root):
+    pseudo_extra_annotation_keys = [
+        "score",
+        "is_pseudo",
+        "pseudo",
+        "unknown",
+        "pseudo_weight",
+        "weight",
+    ]
     for dataset_name, splits_per_dataset in _PREDEFINED_SPLITS_COCO.items():
         for key, (image_root, json_file) in splits_per_dataset.items():
             jf = os.path.join(root, json_file) if "://" not in json_file else json_file
             ir = os.path.join(root, image_root)
 
             if key.startswith("ovdcoco65_2017_"):
-                register_coco_instances(key, {}, jf, ir)
+                register_coco_instances(
+                    key, {}, jf, ir, extra_annotation_keys=pseudo_extra_annotation_keys
+                )
                 meta = MetadataCatalog.get(key)
                 meta.evaluator_type = "coco"
                 meta.thing_classes = OVDCOCO65
                 meta.thing_dataset_id_to_contiguous_id = OVDCOCO65_IDMAP
                 continue
 
-            if key.startswith("ovcoco_2017_"):
-                register_coco_instances(key, {}, jf, ir)
+            if key.startswith("ovcoco_2017_") or key == "ovd_coco_train_with_pseudo":
+                register_coco_instances(
+                    key, {}, jf, ir, extra_annotation_keys=pseudo_extra_annotation_keys
+                )
                 meta = MetadataCatalog.get(key)
                 meta.evaluator_type = "coco"
 
