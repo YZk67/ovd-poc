@@ -35,6 +35,7 @@ from detectron2.structures import Boxes, ImageList, Instances
 from .unknown_proposals import get_unknown_proposal_match_info, select_unknown_proposals
 
 logger = logging.getLogger(__name__)
+d2_logger = logging.getLogger("detectron2")
 
 
 class DINO(nn.Module):
@@ -530,7 +531,7 @@ class DINO(nn.Module):
             unk_mask = proposal_unknown_mask[img_idx]
             unk_boxes = enc_reference[img_idx][unk_mask]
             unk_ious = proposal_unknown_max_iou[img_idx][unk_mask]
-            logger.info(
+            d2_logger.warning(
                 "[unknown_vis] img_idx=%d pseudo=%d unk=%d",
                 img_idx,
                 int(pseudo_mask.sum().item()),
