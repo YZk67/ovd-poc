@@ -146,7 +146,7 @@ def main():
         # 1) score threshold on s_i
         cands = []
         for det in candidates:
-            score = float(det.get("score", 0.0))
+            score = float(det.get("score", det.get("weight", 0.0)))
             bbox = det.get("bbox")
             if bbox is None or len(bbox) != 4:
                 continue
@@ -187,7 +187,7 @@ def main():
             else:
                 category_id = int(det.get("category_id", args.pseudo_category_id))
 
-            score = float(det.get("score", 0.0))  # s_i
+            score = float(det.get("score", det.get("weight", 0.0)))  # s_i
             weight = float(det.get(args.weight_key, score))  # w_i (fallback to s_i)
 
             pseudo_ann = {
