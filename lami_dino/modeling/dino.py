@@ -832,12 +832,25 @@ class DINO(nn.Module):
             gt_scores = targets_per_image.gt_scores
             gt_boxes = targets_per_image.gt_boxes.tensor / image_size_xyxy
             gt_boxes = box_xyxy_to_cxcywh(gt_boxes)
+            if targets_per_image.has("gt_is_pseudo"):
+                pseudo_mask = targets_per_image.gt_is_pseudo.to(torch.bool)
+            elif targets_per_image.has("gt_pseudo"):
+                pseudo_mask = targets_per_image.gt_pseudo.to(torch.bool)
+            elif targets_per_image.has("gt_unknown"):
+                pseudo_mask = targets_per_image.gt_unknown.to(torch.bool)
+            else:
+                pseudo_mask = gt_scores < 1
+            target_dict = {
+                "labels": gt_classes,
+                "boxes": gt_boxes,
+                "scores": gt_scores,
+                "pseudo_mask": pseudo_mask,
+            }
+            if targets_per_image.has("gt_pseudo_weight"):
+                target_dict["pseudo_weight"] = targets_per_image.gt_pseudo_weight.to(
+                    device=self.device, dtype=torch.float32
+                )
             new_targets.append(
-                {
-                    "labels": gt_classes,
-                    "boxes": gt_boxes,
-                    "scores": gt_scores,
-                    "pseudo_mask": gt_scores < 1,
-                }
+                target_dict
             )
         return new_targets

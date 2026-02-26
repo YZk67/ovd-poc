@@ -458,6 +458,34 @@ def annotations_to_instances(annos, image_size, mask_format="polygon"):
         scores = torch.ones(len(annos))
     target.gt_scores= scores
 
+    # Optional pseudo/unknown metadata used by open-world training pipelines.
+    pseudo_flags = []
+    has_pseudo_flag = False
+    pseudo_weights = []
+    has_pseudo_weight = False
+    for obj in annos:
+        pseudo_flag = None
+        for key in ("is_pseudo", "pseudo", "unknown"):
+            if key in obj:
+                pseudo_flag = bool(obj[key])
+                has_pseudo_flag = True
+                break
+        pseudo_flags.append(False if pseudo_flag is None else pseudo_flag)
+
+        if "pseudo_weight" in obj:
+            pseudo_weights.append(obj["pseudo_weight"])
+            has_pseudo_weight = True
+        elif "weight" in obj:
+            pseudo_weights.append(obj["weight"])
+            has_pseudo_weight = True
+        else:
+            pseudo_weights.append(1.0)
+
+    if has_pseudo_flag:
+        target.gt_is_pseudo = torch.tensor(pseudo_flags, dtype=torch.bool)
+    if has_pseudo_weight:
+        target.gt_pseudo_weight = torch.tensor(pseudo_weights, dtype=torch.float32)
+
     if len(annos) and "segmentation" in annos[0]:
         segms = [obj["segmentation"] for obj in annos]
         if mask_format == "polygon":
