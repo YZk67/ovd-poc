@@ -185,7 +185,9 @@ def main():
             if args.keep_det_category and "category_id" in det:
                 category_id = int(det["category_id"])
             else:
-                category_id = int(det.get("category_id", args.pseudo_category_id))
+                # Class-agnostic pseudo unknowns should use a valid placeholder category id
+                # from the target dataset label space, instead of reusing detector category_id.
+                category_id = int(args.pseudo_category_id)
 
             score = float(det.get("score", det.get("weight", 0.0)))  # s_i
             weight = float(det.get(args.weight_key, score))  # w_i (fallback to s_i)
