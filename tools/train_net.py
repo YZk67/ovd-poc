@@ -33,6 +33,7 @@ from detectron2.engine import (
 from detectron2.engine.defaults import create_ddp_model
 from detectron2.evaluation import inference_on_dataset, print_csv_format
 from detectron2.utils import comm
+from detectron2.utils.events import get_event_storage
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 
@@ -97,7 +98,10 @@ class Trainer(SimpleTrainer):
                 losses = loss_dict
                 loss_dict = {"total_loss": loss_dict}
             else:
-                losses = sum(loss_dict.values())
+                opt_loss_dict = {
+                    k: v for k, v in loss_dict.items() if not k.startswith("debug_")
+                }
+                losses = sum(opt_loss_dict.values())
 
         """
         If you need to accumulate gradients or do something similar, you can
@@ -119,6 +123,38 @@ class Trainer(SimpleTrainer):
             self.optimizer.step()
 
         self._write_metrics(loss_dict, data_time)
+
+    @staticmethod
+    def write_metrics(loss_dict, data_time: float, prefix: str = "") -> None:
+        metrics_dict = {k: v.detach().cpu().item() for k, v in loss_dict.items()}
+        metrics_dict["data_time"] = data_time
+
+        all_metrics_dict = comm.gather(metrics_dict)
+
+        if comm.is_main_process():
+            storage = get_event_storage()
+
+            data_time = np.max([x.pop("data_time") for x in all_metrics_dict])
+            storage.put_scalar("data_time", data_time)
+
+            metrics_dict = {
+                k: np.mean([x[k] for x in all_metrics_dict]) for k in all_metrics_dict[0].keys()
+            }
+
+            total_loss_keys = [k for k in metrics_dict.keys() if not k.startswith("debug_")]
+            total_losses_reduced = sum(metrics_dict[k] for k in total_loss_keys)
+            if not np.isfinite(total_losses_reduced):
+                raise FloatingPointError(
+                    f"Loss became infinite or NaN at iteration={storage.iter}!\n"
+                    f"loss_dict = {metrics_dict}"
+                )
+
+            storage.put_scalar(f"{prefix}total_loss", total_losses_reduced)
+            if len(metrics_dict) > 0:
+                storage.put_scalars(**metrics_dict)
+
+    def _write_metrics(self, loss_dict, data_time: float, prefix: str = "") -> None:
+        self.write_metrics(loss_dict, data_time, prefix)
 
     def clip_grads(self, params):
         params = list(filter(lambda p: p.requires_grad and p.grad is not None, params))
