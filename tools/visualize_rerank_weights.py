@@ -28,7 +28,10 @@ def build_image_map(coco_json_path, image_root):
     root = Path(image_root)
     by_id = {}
     for img in coco.get("images", []):
-        by_id[int(img["id"])] = root / img["file_name"]
+        file_name = img["file_name"]
+        p1 = root / file_name
+        p2 = root / Path(file_name).name
+        by_id[int(img["id"])] = (p1, p2)
     return by_id
 
 
@@ -135,26 +138,40 @@ def main():
         rng = random.Random(args.seed)
         rng.shuffle(scored)
 
-    selected = scored[: args.max_images]
     image_map = build_image_map(args.coco_json, args.image_root)
 
     summary = {
         "num_annotations": len(anns),
         "num_images_grouped": len(grouped),
-        "num_images_selected": len(selected),
+        "num_images_selected": 0,
         "num_written": 0,
+        "num_checked": 0,
         "num_missing_images": 0,
         "selected_by": args.select_by,
     }
     summary_rows = []
 
-    for rank, (image_id, st) in enumerate(selected):
-        img_path = image_map.get(image_id)
-        if img_path is None or not img_path.exists():
+    rank = 0
+    for image_id, st in scored:
+        if summary["num_written"] >= args.max_images:
+            break
+        summary["num_checked"] += 1
+        candidates = image_map.get(image_id)
+        if candidates is None:
             summary["num_missing_images"] += 1
             if args.skip_missing_images:
                 continue
-            raise FileNotFoundError(f"Missing image for image_id={image_id}: {img_path}")
+            raise FileNotFoundError(f"Missing image mapping for image_id={image_id}")
+        img_path = None
+        for p in candidates:
+            if p.exists():
+                img_path = p
+                break
+        if img_path is None:
+            summary["num_missing_images"] += 1
+            if args.skip_missing_images:
+                continue
+            raise FileNotFoundError(f"Missing image for image_id={image_id}: tried {candidates[0]} and {candidates[1]}")
 
         base = Image.open(img_path).convert("RGB")
         image_anns = grouped[image_id]
@@ -165,6 +182,7 @@ def main():
         out_path = out_dir / f"{rank:03d}_{image_id}.jpg"
         canvas.save(out_path, quality=92)
         summary["num_written"] += 1
+        summary["num_images_selected"] += 1
         summary_rows.append(
             {
                 "rank": rank,
@@ -177,14 +195,16 @@ def main():
                 "file": out_path.name,
             }
         )
+        rank += 1
 
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     (out_dir / "rows.json").write_text(json.dumps(summary_rows, indent=2))
 
     print(f"Saved visualizations to: {out_dir}")
     print(json.dumps(summary, indent=2))
+    if summary["num_written"] == 0:
+        print("No visualization images were written. Check image-root/coco-json alignment and missing-image count.")
 
 
 if __name__ == "__main__":
     main()
-
