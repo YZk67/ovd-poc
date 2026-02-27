@@ -97,6 +97,9 @@ model = L(DINO)(
         alpha=0.25,
         gamma=2.0,
         two_stage_binary_cls=False,
+        use_pseudo_weight=True,
+        min_pseudo_weight=0.0,
+        pseudo_weight_power=1.0,
     ),
     classifier=L(ZeroShotClassifier)( 
         input_shape=256,

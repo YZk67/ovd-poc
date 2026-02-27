@@ -14,8 +14,10 @@
 # limitations under the License.
 
 import torch
+import torch.nn.functional as F
 
 from detrex.modeling.criterion import SetCriterion
+from detrex.layers import box_cxcywh_to_xyxy, generalized_box_iou
 from detrex.utils import get_world_size, is_dist_avail_and_initialized
 
 
@@ -31,11 +33,123 @@ class TwoStageCriterion(SetCriterion):
         alpha: float = 0.25,
         gamma: float = 2,
         two_stage_binary_cls=False,
+        use_pseudo_weight: bool = True,
+        min_pseudo_weight: float = 0.0,
+        pseudo_weight_power: float = 1.0,
     ):
         super().__init__(
             num_classes, matcher, weight_dict, losses, eos_coef, loss_class_type, alpha, gamma,
         )
         self.two_stage_binary_cls = two_stage_binary_cls
+        self.use_pseudo_weight = use_pseudo_weight
+        self.min_pseudo_weight = min_pseudo_weight
+        self.pseudo_weight_power = pseudo_weight_power
+
+    def _get_matched_weights(self, targets, indices, device):
+        matched_weights = []
+        for target, (_, tgt_idx) in zip(targets, indices):
+            if tgt_idx.numel() == 0:
+                continue
+            weights = torch.ones_like(tgt_idx, dtype=torch.float32, device=device)
+            if not self.use_pseudo_weight:
+                matched_weights.append(weights)
+                continue
+
+            if "pseudo_mask" in target:
+                pseudo_mask = target["pseudo_mask"].to(torch.bool).to(device)
+            elif "scores" in target:
+                pseudo_mask = target["scores"].to(device=device, dtype=torch.float32) < 1
+            else:
+                pseudo_mask = torch.zeros_like(target["labels"], dtype=torch.bool, device=device)
+
+            if "pseudo_weight" in target:
+                pseudo_weight = target["pseudo_weight"].to(device=device, dtype=torch.float32)
+            elif "scores" in target:
+                pseudo_weight = target["scores"].to(device=device, dtype=torch.float32)
+            else:
+                pseudo_weight = torch.ones_like(target["labels"], dtype=torch.float32, device=device)
+
+            pseudo_weight = pseudo_weight.clamp(min=self.min_pseudo_weight, max=1.0)
+            if self.pseudo_weight_power != 1.0:
+                pseudo_weight = pseudo_weight.pow(self.pseudo_weight_power)
+
+            pseudo_on_matched = pseudo_mask[tgt_idx]
+            weights[pseudo_on_matched] = pseudo_weight[tgt_idx][pseudo_on_matched]
+            matched_weights.append(weights)
+
+        if len(matched_weights) == 0:
+            return torch.zeros(0, device=device, dtype=torch.float32)
+        return torch.cat(matched_weights, dim=0)
+
+    def loss_labels(self, outputs, targets, indices, num_boxes):
+        assert "pred_logits" in outputs
+        src_logits = outputs["pred_logits"]
+        num_classes = src_logits.shape[2]
+        idx = self._get_src_permutation_idx(indices)
+        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        target_classes = torch.full(
+            src_logits.shape[:2],
+            num_classes,
+            dtype=torch.int64,
+            device=src_logits.device,
+        )
+        target_classes[idx] = target_classes_o
+
+        if self.loss_class_type == "ce_loss":
+            loss_class = F.cross_entropy(
+                src_logits.transpose(1, 2), target_classes, self.empty_weight
+            )
+            return {"loss_class": loss_class}
+        elif self.loss_class_type == "contrastive_loss":
+            raise NotImplementedError("contrastive_loss is not implemented in TwoStageCriterion")
+
+        target_classes_onehot = torch.zeros(
+            [src_logits.shape[0], src_logits.shape[1], src_logits.shape[2] + 1],
+            dtype=src_logits.dtype,
+            layout=src_logits.layout,
+            device=src_logits.device,
+        )
+        target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
+        target_classes_onehot = target_classes_onehot[:, :, :-1]
+
+        prob = src_logits.sigmoid()
+        ce_loss = F.binary_cross_entropy_with_logits(src_logits, target_classes_onehot, reduction="none")
+        p_t = prob * target_classes_onehot + (1 - prob) * (1 - target_classes_onehot)
+        loss = ce_loss * ((1 - p_t) ** self.gamma)
+        if self.alpha >= 0:
+            alpha_t = self.alpha * target_classes_onehot + (1 - self.alpha) * (1 - target_classes_onehot)
+            loss = alpha_t * loss
+
+        query_weights = torch.ones(
+            src_logits.shape[:2], dtype=src_logits.dtype, device=src_logits.device
+        )
+        matched_weights = self._get_matched_weights(targets, indices, src_logits.device).to(src_logits.dtype)
+        if matched_weights.numel() > 0:
+            query_weights[idx] = matched_weights
+
+        loss_class = (loss * query_weights.unsqueeze(-1)).sum() / num_boxes
+        return {"loss_class": loss_class}
+
+    def loss_boxes(self, outputs, targets, indices, num_boxes):
+        assert "pred_boxes" in outputs
+        idx = self._get_src_permutation_idx(indices)
+        src_boxes = outputs["pred_boxes"][idx]
+        target_boxes = torch.cat([t["boxes"][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        matched_weights = self._get_matched_weights(targets, indices, src_boxes.device).to(src_boxes.dtype)
+        if matched_weights.numel() == 0:
+            matched_weights = torch.ones((0,), dtype=src_boxes.dtype, device=src_boxes.device)
+
+        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction="none")
+        loss_bbox = (loss_bbox.sum(dim=-1) * matched_weights).sum() / num_boxes
+
+        loss_giou = 1 - torch.diag(
+            generalized_box_iou(
+                box_cxcywh_to_xyxy(src_boxes),
+                box_cxcywh_to_xyxy(target_boxes),
+            )
+        )
+        loss_giou = (loss_giou * matched_weights).sum() / num_boxes
+        return {"loss_bbox": loss_bbox, "loss_giou": loss_giou}
 
     def forward(self, outputs, targets):
         """This performs the loss computation.
