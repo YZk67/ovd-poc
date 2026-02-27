@@ -212,6 +212,12 @@ class DINO(nn.Module):
                 self.novel_idx[idx_novel] = True
             else:
                 self.novel_idx = self.base_idx == False
+        if isinstance(save_dir, str):
+            normalized_save_dir = save_dir.strip()
+            if normalized_save_dir.lower() in {"", "none", "null"}:
+                save_dir = None
+            else:
+                save_dir = normalized_save_dir
         self.save_dir = save_dir
         if self.save_dir:
             os.makedirs(self.save_dir, exist_ok=True)
@@ -453,7 +459,9 @@ class DINO(nn.Module):
                 save_output = {}
                 save_output["pred_logits"] = copy.deepcopy(output["pred_logits"]).cpu()
                 save_output["pred_boxes"] = copy.deepcopy(output["pred_boxes"]).cpu()
-                torch.save(save_output, os.path.join(self.save_dir, filename))
+                save_path = os.path.join(self.save_dir, filename)
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                torch.save(save_output, save_path)
             if self.score_ensemble:
                 roi_features_ori = self.extract_region_feature(features_wonorm, box_pred, 'p3')
 
@@ -462,7 +470,9 @@ class DINO(nn.Module):
                     save_output["pred_logits"] = copy.deepcopy(output["pred_logits"]).cpu()
                     save_output["roi_features_ori"] = copy.deepcopy(roi_features_ori).cpu()# [1, 900, 768]
                     save_output["pred_boxes"] = copy.deepcopy(output["pred_boxes"]).cpu()
-                    torch.save(save_output, os.path.join(self.save_dir, filename))
+                    save_path = os.path.join(self.save_dir, filename)
+                    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                    torch.save(save_output, save_path)
 
                 cls_score = box_cls.sigmoid()
                 vlm_score = roi_features_ori @ self.vlm_content_query_embedding.t() * self.vlm_temperature
