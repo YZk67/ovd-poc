@@ -4,7 +4,8 @@
 Use CLIP as a box-level quality scorer:
   - s_obj : object-vs-background margin score
   - s_conf: multi-scale consistency score
-  - w_new = clip(w_old * s_obj * s_conf, 0, 1)
+  - fusion=mul (legacy): w_new = clip(w_old * s_obj * s_conf, 0, 1)
+  - fusion=residual:     w_new = clip((1-a)*w_old + a*(s_obj*s_conf), 0, 1)
 
 Typical use:
 python tools/rerank_unknowns_with_clip.py \
@@ -187,6 +188,18 @@ def parse_args():
     p.add_argument("--obj-thr", type=float, default=0.0, help="Drop if s_obj < obj-thr.")
     p.add_argument("--weight-thr", type=float, default=0.0, help="Drop if w_new < weight-thr.")
     p.add_argument("--topk-per-image", type=int, default=0, help="Keep top-K per image after rerank (0 disables).")
+    p.add_argument(
+        "--fusion-mode",
+        choices=["mul", "residual"],
+        default="mul",
+        help="Weight fusion mode. 'mul' is legacy; 'residual' is less conservative.",
+    )
+    p.add_argument(
+        "--residual-alpha",
+        type=float,
+        default=0.5,
+        help="Used when fusion-mode=residual: w_new=(1-a)*w_old + a*(s_obj*s_conf).",
+    )
     p.add_argument("--keep-all-fields", action="store_true", help="Keep all original fields (default true behavior).")
     p.add_argument("--skip-missing-images", action="store_true", help="Skip missing images instead of raising.")
     p.add_argument("--save-meta", action="store_true", help="Write rerank settings under output['info'].")
@@ -212,6 +225,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if not (0.0 <= args.residual_alpha <= 1.0):
+        raise ValueError("--residual-alpha must be in [0, 1]")
     scales = parse_scales(args.scales)
     if not scales:
         raise ValueError("--scales must contain at least one value")
@@ -250,6 +265,9 @@ def main():
         "num_missing_images": 0,
         "num_processed_images": 0,
         "num_kept": 0,
+        "num_weight_increase": 0,
+        "num_weight_decrease": 0,
+        "num_weight_equal": 0,
         "num_dropped_obj_thr": 0,
         "num_dropped_weight_thr": 0,
         "num_dropped_topk": 0,
@@ -281,12 +299,31 @@ def main():
         reranked = []
         for local_i, (ann_idx, ann) in enumerate(items):
             w_old = float(ann.get(args.weight_key, args.fallback_weight))
-            w_new = float(np.clip(w_old * float(s_obj[local_i]) * float(s_conf[local_i]), 0.0, 1.0))
+            q_score = float(s_obj[local_i]) * float(s_conf[local_i])
+            if args.fusion_mode == "mul":
+                w_new = float(np.clip(w_old * q_score, 0.0, 1.0))
+            else:
+                w_new = float(
+                    np.clip(
+                        (1.0 - args.residual_alpha) * w_old + args.residual_alpha * q_score,
+                        0.0,
+                        1.0,
+                    )
+                )
 
             ann["weight_old"] = w_old
             ann["vlm_s_obj"] = float(s_obj[local_i])
             ann["vlm_s_conf"] = float(s_conf[local_i])
+            ann["vlm_q_score"] = q_score
             ann["weight"] = w_new
+            ann["weight_fusion_mode"] = args.fusion_mode
+
+            if w_new > w_old:
+                stats["num_weight_increase"] += 1
+            elif w_new < w_old:
+                stats["num_weight_decrease"] += 1
+            else:
+                stats["num_weight_equal"] += 1
 
             if ann.get("score") is not None:
                 try:
@@ -332,6 +369,8 @@ def main():
                 "scales": list(scales),
                 "tau": args.tau,
                 "gamma": args.gamma,
+                "fusion_mode": args.fusion_mode,
+                "residual_alpha": args.residual_alpha,
                 "obj_thr": args.obj_thr,
                 "weight_thr": args.weight_thr,
                 "topk_per_image": args.topk_per_image,
