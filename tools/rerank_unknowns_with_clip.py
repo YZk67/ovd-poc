@@ -6,6 +6,7 @@ Use CLIP as a box-level quality scorer:
   - s_conf: multi-scale consistency score
   - fusion=mul (legacy): w_new = clip(w_old * s_obj * s_conf, 0, 1)
   - fusion=residual:     w_new = clip((1-a)*w_old + a*(s_obj*s_conf), 0, 1)
+  - fusion=boost:        w_new = clip(w_old + b*((s_obj*s_conf)-c), 0, 1)
 
 Typical use:
 python tools/rerank_unknowns_with_clip.py \
@@ -190,15 +191,27 @@ def parse_args():
     p.add_argument("--topk-per-image", type=int, default=0, help="Keep top-K per image after rerank (0 disables).")
     p.add_argument(
         "--fusion-mode",
-        choices=["mul", "residual"],
+        choices=["mul", "residual", "boost"],
         default="mul",
-        help="Weight fusion mode. 'mul' is legacy; 'residual' is less conservative.",
+        help="Weight fusion mode. 'boost' can increase high-quality boxes.",
     )
     p.add_argument(
         "--residual-alpha",
         type=float,
         default=0.5,
         help="Used when fusion-mode=residual: w_new=(1-a)*w_old + a*(s_obj*s_conf).",
+    )
+    p.add_argument(
+        "--boost-alpha",
+        type=float,
+        default=0.5,
+        help="Used when fusion-mode=boost: w_new=w_old+b*((s_obj*s_conf)-c).",
+    )
+    p.add_argument(
+        "--boost-center",
+        type=float,
+        default=0.45,
+        help="Used when fusion-mode=boost: center c in w_old+b*(q-c).",
     )
     p.add_argument("--keep-all-fields", action="store_true", help="Keep all original fields (default true behavior).")
     p.add_argument("--skip-missing-images", action="store_true", help="Skip missing images instead of raising.")
@@ -227,6 +240,10 @@ def main():
     args = parse_args()
     if not (0.0 <= args.residual_alpha <= 1.0):
         raise ValueError("--residual-alpha must be in [0, 1]")
+    if args.boost_alpha < 0.0:
+        raise ValueError("--boost-alpha must be >= 0")
+    if not (0.0 <= args.boost_center <= 1.0):
+        raise ValueError("--boost-center must be in [0, 1]")
     scales = parse_scales(args.scales)
     if not scales:
         raise ValueError("--scales must contain at least one value")
@@ -302,10 +319,18 @@ def main():
             q_score = float(s_obj[local_i]) * float(s_conf[local_i])
             if args.fusion_mode == "mul":
                 w_new = float(np.clip(w_old * q_score, 0.0, 1.0))
-            else:
+            elif args.fusion_mode == "residual":
                 w_new = float(
                     np.clip(
                         (1.0 - args.residual_alpha) * w_old + args.residual_alpha * q_score,
+                        0.0,
+                        1.0,
+                    )
+                )
+            else:
+                w_new = float(
+                    np.clip(
+                        w_old + args.boost_alpha * (q_score - args.boost_center),
                         0.0,
                         1.0,
                     )
@@ -371,6 +396,8 @@ def main():
                 "gamma": args.gamma,
                 "fusion_mode": args.fusion_mode,
                 "residual_alpha": args.residual_alpha,
+                "boost_alpha": args.boost_alpha,
+                "boost_center": args.boost_center,
                 "obj_thr": args.obj_thr,
                 "weight_thr": args.weight_thr,
                 "topk_per_image": args.topk_per_image,
