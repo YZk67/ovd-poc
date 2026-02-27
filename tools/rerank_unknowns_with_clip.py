@@ -190,6 +190,23 @@ def parse_args():
     p.add_argument("--keep-all-fields", action="store_true", help="Keep all original fields (default true behavior).")
     p.add_argument("--skip-missing-images", action="store_true", help="Skip missing images instead of raising.")
     p.add_argument("--save-meta", action="store_true", help="Write rerank settings under output['info'].")
+    p.add_argument(
+        "--max-images",
+        type=int,
+        default=0,
+        help="Process at most this many image_ids from the R3 annotations (0 disables).",
+    )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=3407,
+        help="Random seed used when --max-images > 0.",
+    )
+    p.add_argument(
+        "--image-ids-file",
+        default="",
+        help="Optional text file with one image_id per line. If set, only these image_ids are processed.",
+    )
     return p.parse_args()
 
 
@@ -209,10 +226,27 @@ def main():
             continue
         grouped[int(ann["image_id"])].append((idx, ann))
 
+    selected_image_ids = set(grouped.keys())
+    if args.image_ids_file:
+        keep_ids = set()
+        for line in Path(args.image_ids_file).read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            keep_ids.add(int(line))
+        selected_image_ids &= keep_ids
+
+    if args.max_images > 0 and len(selected_image_ids) > args.max_images:
+        rng = np.random.default_rng(args.seed)
+        selected_image_ids = set(
+            rng.choice(list(selected_image_ids), size=args.max_images, replace=False).tolist()
+        )
+
     kept_indices = set()
     stats = {
         "num_input": len(anns),
         "num_images_grouped": len(grouped),
+        "num_images_selected": len(selected_image_ids),
         "num_missing_images": 0,
         "num_processed_images": 0,
         "num_kept": 0,
@@ -222,6 +256,8 @@ def main():
     }
 
     for image_id, items in grouped.items():
+        if image_id not in selected_image_ids:
+            continue
         img_path = image_map.get(image_id)
         if img_path is None or not img_path.exists():
             stats["num_missing_images"] += 1
