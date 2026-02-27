@@ -112,6 +112,7 @@ model = L(DINO)(
     eval_query_path="dataset/metadata/coco_clip_convnextl_a+cname.npy",
     vlm_query_path = None,
     save_dir = None,
+    save_predictions = False,
     score_ensemble = False,
     unseen_classes = None,
     seen_classes = None,

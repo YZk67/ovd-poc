@@ -97,6 +97,7 @@ class DINO(nn.Module):
         seen_classes=None,
         all_classes=None,
         save_dir=None,
+        save_predictions: bool = False,
         vlm_temperature: float =100.0,
         alpha: float =0.3,
         beta: float =0.7,
@@ -218,13 +219,14 @@ class DINO(nn.Module):
                 save_dir = None
             else:
                 save_dir = normalized_save_dir
+        self.save_predictions = save_predictions
         self.save_dir = save_dir
-        if self.save_dir:
+        if self.save_predictions and self.save_dir:
             os.makedirs(self.save_dir, exist_ok=True)
         self.unknown_vis_dir = None
         self.unknown_vis_max_images = 8
         self.unknown_vis_saved = 0
-        if self.save_dir:
+        if self.save_predictions and self.save_dir:
             self.unknown_vis_dir = os.path.join(self.save_dir, "unknown_proposals")
             os.makedirs(self.unknown_vis_dir, exist_ok=True)
 
@@ -284,7 +286,7 @@ class DINO(nn.Module):
                 - dict["aux_outputs"]: Optional, only returned when auxilary losses are activated. It is a list of
                             dictionnaries containing the two above keys for each decoder layer.
         """
-        if self.save_dir:
+        if self.save_predictions and self.save_dir:
             filename = batched_inputs[0]['file_name'].split('/')[-1].replace('jpg', 'pth')
 
         images = self.preprocess_image(batched_inputs)
@@ -455,7 +457,7 @@ class DINO(nn.Module):
         else:
             box_cls = output["pred_logits"]
             box_pred = output["pred_boxes"]
-            if self.save_dir and not self.score_ensemble:
+            if self.save_predictions and self.save_dir and not self.score_ensemble:
                 save_output = {}
                 save_output["pred_logits"] = copy.deepcopy(output["pred_logits"]).cpu()
                 save_output["pred_boxes"] = copy.deepcopy(output["pred_boxes"]).cpu()
@@ -465,7 +467,7 @@ class DINO(nn.Module):
             if self.score_ensemble:
                 roi_features_ori = self.extract_region_feature(features_wonorm, box_pred, 'p3')
 
-                if self.save_dir:
+                if self.save_predictions and self.save_dir:
                     save_output = {}
                     save_output["pred_logits"] = copy.deepcopy(output["pred_logits"]).cpu()
                     save_output["roi_features_ori"] = copy.deepcopy(roi_features_ori).cpu()# [1, 900, 768]
