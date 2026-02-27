@@ -10,6 +10,12 @@ model.vlm_temperature = 100.0 # keep same with f-vlm
 model.alpha = 0.0
 model.beta = 0.4
 model.novel_scale = 5.0
+model.unknown_match_mode = "soft"
+model.unknown_match_cost = 1.5
+model.unknown_iou_thr_start = 0.2
+model.unknown_iou_thr = 0.4
+model.unknown_warmup_iters = 4000
+model.pseudo_score_thr = 0.9
 
 # get default config
 dataloader = get_config("common/data/coco_detr.py").dataloader

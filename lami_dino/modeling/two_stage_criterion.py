@@ -58,7 +58,8 @@ class TwoStageCriterion(SetCriterion):
             if "pseudo_mask" in target:
                 pseudo_mask = target["pseudo_mask"].to(torch.bool).to(device)
             elif "scores" in target:
-                pseudo_mask = target["scores"].to(device=device, dtype=torch.float32) < 1
+                pseudo_thr = float(target.get("pseudo_score_thr", 1.0))
+                pseudo_mask = target["scores"].to(device=device, dtype=torch.float32) < pseudo_thr
             else:
                 pseudo_mask = torch.zeros_like(target["labels"], dtype=torch.bool, device=device)
 

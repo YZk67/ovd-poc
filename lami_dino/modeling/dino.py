@@ -98,6 +98,12 @@ class DINO(nn.Module):
         all_classes=None,
         save_dir=None,
         save_predictions: bool = False,
+        unknown_iou_thr: float = 0.5,
+        unknown_iou_thr_start: float = 0.3,
+        unknown_warmup_iters: int = 2000,
+        unknown_match_mode: str = "soft",
+        unknown_match_cost: float = 2.0,
+        pseudo_score_thr: float = 0.95,
         vlm_temperature: float =100.0,
         alpha: float =0.3,
         beta: float =0.7,
@@ -109,6 +115,13 @@ class DINO(nn.Module):
         self.alpha = alpha
         self.beta = beta
         self.novel_scale = novel_scale
+        self.unknown_iou_thr = float(unknown_iou_thr)
+        self.unknown_iou_thr_start = float(unknown_iou_thr_start)
+        self.unknown_warmup_iters = int(unknown_warmup_iters)
+        self.unknown_match_mode = str(unknown_match_mode)
+        self.unknown_match_cost = float(unknown_match_cost)
+        self.pseudo_score_thr = float(pseudo_score_thr)
+        self._train_forward_count = 0
         # define backbone and position embedding module
         self.backbone = backbone
         self.position_embedding = position_embedding
@@ -411,13 +424,29 @@ class DINO(nn.Module):
         output["enc_outputs"] = {"pred_logits": interm_class, "pred_boxes": interm_coord}
 
         if self.training:
+            self._train_forward_count += 1
+            warmup_scale = 1.0
+            if self.unknown_warmup_iters > 0:
+                warmup_scale = min(1.0, self._train_forward_count / self.unknown_warmup_iters)
+
+            cur_iou_thr = self.unknown_iou_thr_start + (
+                self.unknown_iou_thr - self.unknown_iou_thr_start
+            ) * warmup_scale
+            cur_match_cost = self.unknown_match_cost * warmup_scale
+            cur_match_mode = self.unknown_match_mode
+            if cur_match_mode == "hard" and warmup_scale < 1.0:
+                # During warmup use soft constraint to avoid over-pruning early matches.
+                cur_match_mode = "soft"
+
             proposal_unknown_mask, proposal_max_iou = get_unknown_proposal_match_info(
-                enc_reference, targets
+                enc_reference, targets, thr=cur_iou_thr, pseudo_score_thr=self.pseudo_score_thr
             )
             unknown_encoder_proposals = [enc_reference[i][proposal_unknown_mask[i]] for i in range(enc_reference.shape[0])]
             output["proposal_unknown_mask"] = proposal_unknown_mask
             output["proposal_unknown_max_iou"] = proposal_max_iou
             output["unknown_encoder_proposals"] = unknown_encoder_proposals
+            output["unknown_match_mode"] = cur_match_mode
+            output["unknown_match_cost"] = cur_match_cost
             self._save_unknown_proposal_visuals(
                 batched_inputs,
                 targets,
@@ -428,7 +457,11 @@ class DINO(nn.Module):
             if self.aux_loss:
                 for aux_output in output["aux_outputs"]:
                     aux_output["proposal_unknown_mask"] = proposal_unknown_mask
+                    aux_output["unknown_match_mode"] = cur_match_mode
+                    aux_output["unknown_match_cost"] = cur_match_cost
             output["enc_outputs"]["proposal_unknown_mask"] = proposal_unknown_mask
+            output["enc_outputs"]["unknown_match_mode"] = cur_match_mode
+            output["enc_outputs"]["unknown_match_cost"] = cur_match_cost
 
         if self.training:
             loss_dict = self.criterion(output, targets, dn_meta)
@@ -449,6 +482,8 @@ class DINO(nn.Module):
                     if selected_iou.numel() > 0
                     else unknown_counts.new_tensor(0.0)
                 )
+                loss_dict["debug_unknown_iou_thr"] = unknown_counts.new_tensor(cur_iou_thr)
+                loss_dict["debug_unknown_match_cost"] = unknown_counts.new_tensor(cur_match_cost)
             weight_dict = self.criterion.weight_dict
             for k in loss_dict.keys():
                 if k in weight_dict:
@@ -501,7 +536,9 @@ class DINO(nn.Module):
     @torch.no_grad()
     def select_unknown_encoder_proposals(self, enc_reference, targets, thr=0.5):
         """Select encoder top-k proposals overlapping pseudo/unknown targets."""
-        return select_unknown_proposals(enc_reference, targets, thr=thr)
+        return select_unknown_proposals(
+            enc_reference, targets, thr=thr, pseudo_score_thr=self.pseudo_score_thr
+        )
 
     @torch.no_grad()
     def _save_unknown_proposal_visuals(
@@ -866,12 +903,13 @@ class DINO(nn.Module):
             elif targets_per_image.has("gt_unknown"):
                 pseudo_mask = targets_per_image.gt_unknown.to(torch.bool)
             else:
-                pseudo_mask = gt_scores < 1
+                pseudo_mask = gt_scores < self.pseudo_score_thr
             target_dict = {
                 "labels": gt_classes,
                 "boxes": gt_boxes,
                 "scores": gt_scores,
                 "pseudo_mask": pseudo_mask,
+                "pseudo_score_thr": self.pseudo_score_thr,
             }
             if targets_per_image.has("gt_pseudo_weight"):
                 target_dict["pseudo_weight"] = targets_per_image.gt_pseudo_weight.to(

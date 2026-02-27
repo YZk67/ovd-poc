@@ -165,7 +165,19 @@ class HungarianMatcher(nn.Module):
                     )
                     batched_tgt_pseudo.scatter_(0, batch_idx.unsqueeze(0), tgt_pseudo.unsqueeze(0))
                     valid_mask = proposal_unknown_mask.unsqueeze(-1) == batched_tgt_pseudo.unsqueeze(1)
-                    C = C.masked_fill(~valid_mask, 1e6)
+                    match_mode = str(outputs.get("unknown_match_mode", "soft")).lower()
+                    match_cost = float(outputs.get("unknown_match_cost", 2.0))
+                    if match_mode == "hard":
+                        C = C.masked_fill(~valid_mask, 1e6)
+                    elif match_mode == "soft":
+                        C = C + (~valid_mask).to(C.dtype) * match_cost
+                    elif match_mode == "off":
+                        pass
+                    else:
+                        raise ValueError(
+                            f"Unsupported unknown_match_mode={match_mode}. "
+                            "Use one of ['off', 'soft', 'hard']."
+                        )
 
         C = C.cpu()
 
