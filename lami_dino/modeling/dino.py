@@ -255,16 +255,25 @@ class DINO(nn.Module):
             inner_gt.append(target)
         inner_gt = torch.cat(inner_gt)
 
+        # Exclude pseudo-label class (-1) from federated class sampling.
+        # Pseudo labels are class-agnostic and should not influence which base classes
+        # are sampled for the federated loss. Including -1 corrupts content_inds via
+        # PyTorch's negative-index wraparound (cluster_label[-1] = last element).
+        inner_gt_real = inner_gt[inner_gt >= 0]
+        if inner_gt_real.numel() == 0:
+            # Edge case: all annotations in the batch are pseudo — fall back to zeros
+            inner_gt_real = inner_gt.new_zeros(1)
+
         if self.cluster_fed_loss:
             content_inds = get_cluster_fed_loss_inds(
-                inner_gt,
+                inner_gt_real,
                 num_sample_cats=self.fed_loss_num_cat,
                 C=self.num_classes,
                 weight=freq_weight,
                 cluster_label=self.cluster_label)
         else:
             content_inds = get_fed_loss_inds(
-                inner_gt,
+                inner_gt_real,
                 num_sample_cats=self.fed_loss_num_cat,
                 C=self.num_classes,
                 weight=freq_weight)
@@ -273,8 +282,13 @@ class DINO(nn.Module):
         for idx, content_id in enumerate(content_inds):
             convert_map[content_id.item()] = idx
         for idx, target in enumerate(batched_inputs):
-            cats = target['instances'].gt_classes
-            batched_inputs[idx]['instances'].gt_classes = convert_map[batched_inputs[idx]['instances'].gt_classes]
+            orig_classes = batched_inputs[idx]['instances'].gt_classes
+            # Clamp to [0, num_classes-1] before indexing to avoid negative-index wraparound.
+            # Pseudo labels (class=-1) are restored to -1 after the mapping so they
+            # remain distinguishable as class-agnostic in the criterion.
+            mapped = convert_map[orig_classes.clamp(min=0)]
+            mapped[orig_classes < 0] = -1
+            batched_inputs[idx]['instances'].gt_classes = mapped
 
         return content_inds, batched_inputs
  
@@ -782,9 +796,12 @@ class DINO(nn.Module):
 
         m = known_labels_expaned.long().to("cuda")
         # input_label_embed = label_enc(m)
-        
+
         if content_query_embeds is not None:
-            input_label_content = content_query_embeds[m]
+            # Clamp to avoid negative-index wraparound for pseudo labels (class=-1).
+            # Their DN loss is zeroed by pseudo_weight=0.0, so the embedding choice
+            # doesn't affect the gradient — we just need a valid index.
+            input_label_content = content_query_embeds[m.clamp(min=0)]
             input_label_embed = input_label_content
 
         input_bbox_embed = inverse_sigmoid(known_bbox_expand)
