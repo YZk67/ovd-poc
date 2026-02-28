@@ -32,7 +32,7 @@ from detrex.utils import (inverse_sigmoid, is_dist_avail_and_initialized,
 from detectron2.modeling import detector_postprocess
 from detectron2.structures import Boxes, ImageList, Instances
 
-from .unknown_proposals import get_unknown_proposal_match_info, select_unknown_proposals
+from .unknown_proposals import select_unknown_proposals
 
 logger = logging.getLogger(__name__)
 d2_logger = logging.getLogger("detectron2")
@@ -185,6 +185,10 @@ class DINO(nn.Module):
 
         # set topk boxes selected for inference
         self.select_box_nums_for_evaluation = select_box_nums_for_evaluation
+
+        # OV-DQUO Eq. 6 — learnable wildcard query embedding q* (in decoder embed space).
+        # Initialized to the projected mean of all class embeddings (a neutral "any object" prior).
+        self.wildcard_query_embed = nn.Parameter(torch.zeros(embed_dim))
 
         content_query_embedding = torch.tensor(np.load(query_path), dtype=torch.float32, device=device).contiguous()
         self.content_query_embedding = F.normalize(content_query_embedding, p=2, dim=1)
@@ -360,8 +364,30 @@ class DINO(nn.Module):
                 content_query_embeds=content_query_embeds,
             )
         else:
+            targets = None
             input_query_label, input_query_bbox, attn_mask, dn_meta = None, None, None, None
         query_embeds = (input_query_label, input_query_bbox)
+
+        # Compute warmup parameters before transformer so we can pass cur_iou_thr
+        # into the transformer for wildcard query injection (OV-DQUO Eq. 6).
+        if self.training:
+            self._train_forward_count += 1
+            warmup_scale = (
+                min(1.0, self._train_forward_count / self.unknown_warmup_iters)
+                if self.unknown_warmup_iters > 0
+                else 1.0
+            )
+            cur_iou_thr = self.unknown_iou_thr_start + (
+                self.unknown_iou_thr - self.unknown_iou_thr_start
+            ) * warmup_scale
+            cur_match_cost = self.unknown_match_cost * warmup_scale
+            cur_match_mode = self.unknown_match_mode
+            if cur_match_mode == "hard" and warmup_scale < 1.0:
+                cur_match_mode = "soft"
+        else:
+            cur_iou_thr = self.unknown_iou_thr
+            cur_match_cost = self.unknown_match_cost
+            cur_match_mode = self.unknown_match_mode
 
         # feed into transformer
         (
@@ -370,6 +396,8 @@ class DINO(nn.Module):
             inter_references,
             enc_state,
             enc_reference,  # [0..1]
+            proposal_unknown_mask,
+            proposal_max_iou,
         ) = self.transformer(
             multi_level_feats,
             multi_level_masks,
@@ -377,11 +405,16 @@ class DINO(nn.Module):
             query_embeds,
             attn_masks=[attn_mask, None],
             content_query_embeds=content_query_embeds,
-            content_inds=content_inds, 
+            content_inds=content_inds,
+            wildcard_content=self.wildcard_query_embed if self.training else None,
+            targets=targets,
+            unknown_iou_thr=cur_iou_thr,
+            pseudo_score_thr=self.pseudo_score_thr,
         )
         # hack implementation for distributed training
         # inter_states[0] += self.label_enc.weight[0, 0] * 0.0
         inter_states[0] += self.content_layer.weight[0, 0] * 0.0
+        inter_states[0] += self.wildcard_query_embed[0] * 0.0
 
         # Calculate output coordinates and classes.
         outputs_classes = []
@@ -424,23 +457,6 @@ class DINO(nn.Module):
         output["enc_outputs"] = {"pred_logits": interm_class, "pred_boxes": interm_coord}
 
         if self.training:
-            self._train_forward_count += 1
-            warmup_scale = 1.0
-            if self.unknown_warmup_iters > 0:
-                warmup_scale = min(1.0, self._train_forward_count / self.unknown_warmup_iters)
-
-            cur_iou_thr = self.unknown_iou_thr_start + (
-                self.unknown_iou_thr - self.unknown_iou_thr_start
-            ) * warmup_scale
-            cur_match_cost = self.unknown_match_cost * warmup_scale
-            cur_match_mode = self.unknown_match_mode
-            if cur_match_mode == "hard" and warmup_scale < 1.0:
-                # During warmup use soft constraint to avoid over-pruning early matches.
-                cur_match_mode = "soft"
-
-            proposal_unknown_mask, proposal_max_iou = get_unknown_proposal_match_info(
-                enc_reference, targets, thr=cur_iou_thr, pseudo_score_thr=self.pseudo_score_thr
-            )
             unknown_encoder_proposals = [enc_reference[i][proposal_unknown_mask[i]] for i in range(enc_reference.shape[0])]
             output["proposal_unknown_mask"] = proposal_unknown_mask
             output["proposal_unknown_max_iou"] = proposal_max_iou

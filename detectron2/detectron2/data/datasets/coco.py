@@ -234,13 +234,18 @@ def load_coco_json(json_file, image_root, dataset_name=None, extra_annotation_ke
             obj["bbox_mode"] = BoxMode.XYWH_ABS
             if id_map:
                 annotation_category_id = obj["category_id"]
-                try:
-                    obj["category_id"] = id_map[annotation_category_id]
-                except KeyError as e:
-                    raise KeyError(
-                        f"Encountered category_id={annotation_category_id} "
-                        "but this id does not exist in 'categories' of the json file."
-                    ) from e
+                # category_id=-1 is used for class-agnostic pseudo/unknown labels.
+                # Keep as -1 so the criterion treats them as background (wildcard matching).
+                if annotation_category_id == -1:
+                    pass
+                else:
+                    try:
+                        obj["category_id"] = id_map[annotation_category_id]
+                    except KeyError as e:
+                        raise KeyError(
+                            f"Encountered category_id={annotation_category_id} "
+                            "but this id does not exist in 'categories' of the json file."
+                        ) from e
             objs.append(obj)
         record["annotations"] = objs
         dataset_dicts.append(record)

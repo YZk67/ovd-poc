@@ -69,6 +69,7 @@ optimizer.weight_decay = 1e-4
 optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 1
 
 # modify dataloader config
+dataloader.train.dataset.names = "ovd_coco_train_with_pseudo"
 dataloader.train.num_workers = 4
 
 # please notice that this is total batch size.

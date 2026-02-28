@@ -27,6 +27,8 @@ from detrex.layers import (
 )
 from detrex.utils import inverse_sigmoid
 
+from .unknown_proposals import get_unknown_proposal_match_info
+
 
 class DINOTransformerEncoder(TransformerLayerSequence):
     def __init__(
@@ -358,6 +360,10 @@ class DINOTransformer(nn.Module):
         attn_masks,
         content_query_embeds,
         content_inds=None,
+        wildcard_content=None,
+        targets=None,
+        unknown_iou_thr=0.5,
+        pseudo_score_thr=1.0,
         **kwargs,
     ):
         feat_flatten = []
@@ -426,7 +432,8 @@ class DINOTransformer(nn.Module):
         topk_coords_unact = torch.gather(
             enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4)
         )  # unsigmoided.
-        reference_points = topk_coords_unact.detach().sigmoid()
+        topk_reference = topk_coords_unact.detach().sigmoid()  # [bs, topk, 4] — matching queries only
+        reference_points = topk_reference
         if query_embed[1] is not None:
             reference_points = torch.cat([query_embed[1].sigmoid(), reference_points], 1)
         init_reference_out = reference_points
@@ -439,7 +446,24 @@ class DINOTransformer(nn.Module):
         content_ids = torch.gather(max_labels, 1, topk_proposals)
         content_query = torch.gather(
             content_query_embeds.unsqueeze(0).repeat(bs, 1, 1), 1,
-            content_ids.unsqueeze(-1).repeat(1, 1, 256)) 
+            content_ids.unsqueeze(-1).repeat(1, 1, 256))
+
+        # OV-DQUO Eq. 6 — wildcard query injection for unknown proposals.
+        # For encoder proposals that overlap pseudo/unknown GT, replace the
+        # base-class content embedding with the learned wildcard embedding q*.
+        proposal_unknown_mask = None
+        proposal_max_iou = None
+        if wildcard_content is not None and targets is not None:
+            proposal_unknown_mask, proposal_max_iou = get_unknown_proposal_match_info(
+                topk_reference, targets, thr=unknown_iou_thr, pseudo_score_thr=pseudo_score_thr
+            )
+            if proposal_unknown_mask.any():
+                # [bs, topk, 1] bool mask; [1, 1, embed_dim] wildcard
+                unk_mask_3d = proposal_unknown_mask.unsqueeze(-1)  # [bs, topk, 1]
+                wildcard = wildcard_content.view(1, 1, -1)          # [1, 1, embed_dim]
+                content_query = torch.where(
+                    unk_mask_3d, wildcard.expand_as(content_query), content_query
+                )
 
         target = target_unact.detach() + content_query
 
@@ -468,4 +492,6 @@ class DINOTransformer(nn.Module):
             inter_references_out,
             target_unact,
             topk_coords_unact.sigmoid(),
+            proposal_unknown_mask,
+            proposal_max_iou,
         )
