@@ -213,8 +213,8 @@ class DINO(nn.Module):
         self.text_query_embedding = None
         if text_query_path:
             text_emb = torch.tensor(
-                np.load(text_query_path), dtype=torch.float32, device=device
-            ).contiguous()
+                np.load(text_query_path), dtype=torch.float32
+            ).contiguous()  # keep on CPU; content_layer is on CPU during __init__
             text_emb = F.normalize(text_emb, p=2, dim=1)  # [num_classes, feat_dim]
             with torch.no_grad():
                 text_emb_proj = self.content_layer(text_emb)  # [num_classes, embed_dim]
