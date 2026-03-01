@@ -210,7 +210,8 @@ class DINO(nn.Module):
 
         # OV-DQUO DTQ: CLIP text embeddings for denoising groups.
         # Projected through the shared content_layer to keep the same embedding space.
-        self.text_query_embedding = None
+        # register_buffer(None) first so PyTorch 2.x doesn't complain about duplicate attrs.
+        self.register_buffer("text_query_embedding", None)
         if text_query_path:
             text_emb = torch.tensor(
                 np.load(text_query_path), dtype=torch.float32
@@ -219,7 +220,7 @@ class DINO(nn.Module):
             with torch.no_grad():
                 text_emb_proj = self.content_layer(text_emb)  # [num_classes, embed_dim]
                 text_emb_proj = F.normalize(text_emb_proj, p=2, dim=1)
-            self.register_buffer("text_query_embedding", text_emb_proj)
+            self.text_query_embedding = text_emb_proj  # assign into the registered buffer slot
 
         self.use_fed_loss = use_fed_loss
         self.cluster_fed_loss = cluster_fed_loss
