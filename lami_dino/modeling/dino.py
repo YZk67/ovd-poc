@@ -233,7 +233,7 @@ class DINO(nn.Module):
 
         self.score_ensemble = score_ensemble
         if self.score_ensemble:
-            clip_head = torch.load(clip_head_path)
+            clip_head = torch.load(clip_head_path, weights_only=False)
             self.identical, self.thead = clip_head[0]
             self.head = clip_head[1]
 
