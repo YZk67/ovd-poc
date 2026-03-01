@@ -80,8 +80,6 @@ class Trainer(SimpleTrainer):
         """
         assert self.model.training, "[Trainer] model was changed to eval mode!"
         assert torch.cuda.is_available(), "[Trainer] CUDA is required for AMP training!"
-        from torch.cuda.amp import autocast
-
         start = time.perf_counter()
         """
         If you want to do something with the data, you can wrap the dataloader.
@@ -93,7 +91,7 @@ class Trainer(SimpleTrainer):
         If you want to do something with the losses, you can wrap the model.
         """
         loss_dict = self.model(data)
-        with autocast(enabled=self.amp):
+        with torch.amp.autocast('cuda', enabled=self.amp):
             if isinstance(loss_dict, torch.Tensor):
                 losses = loss_dict
                 loss_dict = {"total_loss": loss_dict}
