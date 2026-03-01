@@ -1,4 +1,4 @@
-from .dino_convnext_large_4scale_12ep_lvis import *  # noqa: F401, F403
+from .dino_convnext_large_4scale_12ep_lvis import model, optimizer, lr_multiplier, train, dataloader
 
 # Freeze backbone: set lr factor to 0 so backbone params are excluded from optimizer.
 # This preserves the CLIP feature space and prevents base-class overfitting from
