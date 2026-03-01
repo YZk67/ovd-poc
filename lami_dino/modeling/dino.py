@@ -109,6 +109,7 @@ class DINO(nn.Module):
         beta: float =0.7,
         novel_scale: float =5.0,
         clip_head_path=None,
+        freeze_backbone: bool = False,
     ):
         super().__init__()
         self.vlm_temperature = vlm_temperature
@@ -124,6 +125,9 @@ class DINO(nn.Module):
         self._train_forward_count = 0
         # define backbone and position embedding module
         self.backbone = backbone
+        if freeze_backbone:
+            for param in self.backbone.parameters():
+                param.requires_grad_(False)
         self.position_embedding = position_embedding
 
         # define neck module
