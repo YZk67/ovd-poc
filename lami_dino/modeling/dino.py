@@ -110,6 +110,7 @@ class DINO(nn.Module):
         novel_scale: float =5.0,
         clip_head_path=None,
         freeze_backbone: bool = False,
+        text_query_path=None,
     ):
         super().__init__()
         self.vlm_temperature = vlm_temperature
@@ -206,6 +207,19 @@ class DINO(nn.Module):
         
         _, feat_dim = self.content_query_embedding.shape
         self.content_layer = nn.Linear(feat_dim, embed_dim)
+
+        # OV-DQUO DTQ: CLIP text embeddings for denoising groups.
+        # Projected through the shared content_layer to keep the same embedding space.
+        self.text_query_embedding = None
+        if text_query_path:
+            text_emb = torch.tensor(
+                np.load(text_query_path), dtype=torch.float32, device=device
+            ).contiguous()
+            text_emb = F.normalize(text_emb, p=2, dim=1)  # [num_classes, feat_dim]
+            with torch.no_grad():
+                text_emb_proj = self.content_layer(text_emb)  # [num_classes, embed_dim]
+                text_emb_proj = F.normalize(text_emb_proj, p=2, dim=1)
+            self.register_buffer("text_query_embedding", text_emb_proj)
 
         self.use_fed_loss = use_fed_loss
         self.cluster_fed_loss = cluster_fed_loss
@@ -370,6 +384,13 @@ class DINO(nn.Module):
             gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
             targets = self.prepare_targets(gt_instances)
             cdn_num_classes = self.fed_loss_num_cat if self.use_fed_loss else self.num_classes
+            # OV-DQUO DTQ: select text embeddings for the currently sampled classes.
+            text_query_embeds = None
+            if self.text_query_embedding is not None:
+                if content_inds is not None:
+                    text_query_embeds = self.text_query_embedding[content_inds]
+                else:
+                    text_query_embeds = self.text_query_embedding
             input_query_label, input_query_bbox, attn_mask, dn_meta = self.prepare_for_cdn(
                 targets,
                 dn_number=self.dn_number,
@@ -380,6 +401,7 @@ class DINO(nn.Module):
                 hidden_dim=self.embed_dim,
                 # label_enc=self.label_enc,
                 content_query_embeds=content_query_embeds,
+                text_query_embeds=text_query_embeds,
             )
         else:
             targets = None
@@ -715,6 +737,7 @@ class DINO(nn.Module):
         hidden_dim,
         label_enc=None,
         content_query_embeds=None,
+        text_query_embeds=None,
         convert_map=None,
     ):
         """
@@ -801,12 +824,13 @@ class DINO(nn.Module):
         m = known_labels_expaned.long().to("cuda")
         # input_label_embed = label_enc(m)
 
-        if content_query_embeds is not None:
-            # Clamp to avoid negative-index wraparound for pseudo labels (class=-1).
-            # Their DN loss is zeroed by pseudo_weight=0.0, so the embedding choice
-            # doesn't affect the gradient — we just need a valid index.
-            input_label_content = content_query_embeds[m.clamp(min=0)]
-            input_label_embed = input_label_content
+        # OV-DQUO DTQ: prefer CLIP text embeddings for DN groups (cross-modal denoising).
+        # Fallback to visual embeddings if text embeddings are not available.
+        # Clamp to avoid negative-index wraparound for pseudo labels (class=-1);
+        # their DN loss is zeroed by pseudo_weight=0.0 so embedding choice is harmless.
+        dn_embeds = text_query_embeds if text_query_embeds is not None else content_query_embeds
+        if dn_embeds is not None:
+            input_label_embed = dn_embeds[m.clamp(min=0)]
 
         input_bbox_embed = inverse_sigmoid(known_bbox_expand)
 

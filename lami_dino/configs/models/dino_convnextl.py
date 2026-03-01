@@ -70,6 +70,7 @@ model = L(DINO)(
         ),
         num_feature_levels=4,
         two_stage_num_proposals="${..num_queries}",
+        roqi_selection=False,
     ),
     embed_dim=256,
     num_classes=80,

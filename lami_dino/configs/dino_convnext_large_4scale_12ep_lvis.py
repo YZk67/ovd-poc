@@ -55,6 +55,12 @@ model.num_classes = 65
 model.query_path = "dataset/metadata/ovdcoco_visual_desc_convnextl.npy"
 model.eval_query_path = "dataset/metadata/ovdcoco_visual_desc_convnextl.npy"
 
+# OV-DQUO: RoQI Selection — objectness × CLIP-sim for encoder proposal ranking
+model.transformer.roqi_selection = True
+
+# OV-DQUO: Denoising Text Query — CLIP text embeddings for CDN denoising groups
+model.text_query_path = "dataset/metadata/ovdcoco_text_desc_convnextl.npy"
+
 model.use_fed_loss = True
 model.cluster_fed_loss = True
 model.cluster_label_path = 'dataset/cluster/ovdcoco_cluster4_16.npy'

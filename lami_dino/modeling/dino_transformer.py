@@ -15,6 +15,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from detrex.layers import (
     FFN,
@@ -241,6 +242,7 @@ class DINOTransformer(nn.Module):
         decoder=None,
         num_feature_levels=4,
         two_stage_num_proposals=900,
+        roqi_selection: bool = False,
         # learnt_init_query=False,
     ):
         super(DINOTransformer, self).__init__()
@@ -248,6 +250,8 @@ class DINOTransformer(nn.Module):
         self.decoder = decoder
         self.num_feature_levels = num_feature_levels
         self.two_stage_num_proposals = two_stage_num_proposals
+        # OV-DQUO: RoQI selection — rank encoder proposals by objectness × CLIP-sim
+        self.roqi_selection = roqi_selection
 
         self.embed_dim = self.encoder.embed_dim
 
@@ -426,7 +430,20 @@ class DINOTransformer(nn.Module):
         max_scores, max_labels = torch.max(enc_outputs_class, dim=-1)
 
         topk = self.two_stage_num_proposals
-        topk_proposals = torch.topk(max_scores, topk, dim=1)[1]
+        # OV-DQUO RoQI: rank encoder proposals by objectness × max-CLIP-similarity.
+        # objectness = max sigmoid class score (foreground prior).
+        # clip_sim   = max cosine similarity to any content class embedding.
+        # This biases selection toward semantically meaningful regions.
+        if self.roqi_selection and content_query_embeds is not None:
+            objectness = enc_outputs_class.sigmoid().max(dim=-1).values  # [bs, hw]
+            region_norm = F.normalize(output_memory, p=2, dim=-1)        # [bs, hw, 256]
+            # content_query_embeds is already L2-normalised [num_classes, 256]
+            clip_sim = (region_norm @ content_query_embeds.t()).max(dim=-1).values  # [bs, hw]
+            clip_sim = clip_sim.clamp(min=0)
+            roqi_score = objectness * clip_sim
+            topk_proposals = torch.topk(roqi_score, topk, dim=1)[1]
+        else:
+            topk_proposals = torch.topk(max_scores, topk, dim=1)[1]
 
         # extract region proposal boxes
         topk_coords_unact = torch.gather(
