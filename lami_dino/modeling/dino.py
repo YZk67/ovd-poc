@@ -249,6 +249,14 @@ class DINO(nn.Module):
                 self.novel_idx[idx_novel] = True
             else:
                 self.novel_idx = self.base_idx == False
+
+            # Class-specific WQI: store raw 768-dim novel class embeddings as a buffer so
+            # they get moved to device with the model. We project through content_layer each
+            # forward pass (weights change during training) to get 256-dim embeddings.
+            novel_raw = self.eval_content_query_embedding[self.novel_idx.to(self.eval_content_query_embedding.device)]  # [n_novel, 768]
+            self.register_buffer("novel_raw_embeds", novel_raw.clone())
+        else:
+            self.register_buffer("novel_raw_embeds", None)
         if isinstance(save_dir, str):
             normalized_save_dir = save_dir.strip()
             if normalized_save_dir.lower() in {"", "none", "null"}:
@@ -409,6 +417,15 @@ class DINO(nn.Module):
             input_query_label, input_query_bbox, attn_mask, dn_meta = None, None, None, None
         query_embeds = (input_query_label, input_query_bbox)
 
+        # Class-specific WQI: project novel class raw embeddings through the current
+        # content_layer (weights evolve during training) to get 256-dim representations.
+        # Each unknown encoder proposal will be assigned its best-matching novel class
+        # embedding instead of the generic wildcard.
+        novel_content_embeds = None
+        if self.training and self.novel_raw_embeds is not None:
+            novel_content_embeds = self.content_layer(self.novel_raw_embeds)  # [n_novel, 256]
+            novel_content_embeds = F.normalize(novel_content_embeds, p=2, dim=1)
+
         # Compute warmup parameters before transformer so we can pass cur_iou_thr
         # into the transformer for wildcard query injection (OV-DQUO Eq. 6).
         if self.training:
@@ -448,6 +465,7 @@ class DINO(nn.Module):
             content_query_embeds=content_query_embeds,
             content_inds=content_inds,
             wildcard_content=self.wildcard_query_embed if self.training else None,
+            novel_content_embeds=novel_content_embeds,
             targets=targets,
             unknown_iou_thr=cur_iou_thr,
             pseudo_score_thr=self.pseudo_score_thr,

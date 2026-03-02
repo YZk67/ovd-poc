@@ -365,6 +365,7 @@ class DINOTransformer(nn.Module):
         content_query_embeds,
         content_inds=None,
         wildcard_content=None,
+        novel_content_embeds=None,
         targets=None,
         unknown_iou_thr=0.5,
         pseudo_score_thr=1.0,
@@ -467,7 +468,9 @@ class DINOTransformer(nn.Module):
 
         # OV-DQUO Eq. 6 — wildcard query injection for unknown proposals.
         # For encoder proposals that overlap pseudo/unknown GT, replace the
-        # base-class content embedding with the learned wildcard embedding q*.
+        # base-class content embedding with either:
+        #   (a) the best-matching novel class embedding (class-specific WQI), or
+        #   (b) the learned wildcard embedding q* as fallback.
         proposal_unknown_mask = None
         proposal_max_iou = None
         if wildcard_content is not None and targets is not None:
@@ -475,12 +478,20 @@ class DINOTransformer(nn.Module):
                 topk_reference, targets, thr=unknown_iou_thr, pseudo_score_thr=pseudo_score_thr
             )
             if proposal_unknown_mask.any():
-                # [bs, topk, 1] bool mask; [1, 1, embed_dim] wildcard
                 unk_mask_3d = proposal_unknown_mask.unsqueeze(-1)  # [bs, topk, 1]
-                wildcard = wildcard_content.view(1, 1, -1)          # [1, 1, embed_dim]
-                content_query = torch.where(
-                    unk_mask_3d, wildcard.expand_as(content_query), content_query
-                )
+                if novel_content_embeds is not None:
+                    # Class-specific WQI: find the novel class whose 256-dim embedding
+                    # best matches each encoder region feature (cosine similarity).
+                    region_feat = F.normalize(target_unact.detach(), p=2, dim=-1)  # [bs, topk, 256]
+                    sim = region_feat @ novel_content_embeds.t()  # [bs, topk, n_novel]
+                    best_idx = sim.argmax(dim=-1)                 # [bs, topk]
+                    class_embed = novel_content_embeds[best_idx]  # [bs, topk, 256]
+                    content_query = torch.where(unk_mask_3d, class_embed, content_query)
+                else:
+                    wildcard = wildcard_content.view(1, 1, -1)    # [1, 1, embed_dim]
+                    content_query = torch.where(
+                        unk_mask_3d, wildcard.expand_as(content_query), content_query
+                    )
 
         target = target_unact.detach() + content_query
 
