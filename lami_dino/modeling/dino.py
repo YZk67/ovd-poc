@@ -573,9 +573,15 @@ class DINO(nn.Module):
                 vlm_score = vlm_score.softmax(dim=-1)
                 cls_score[:, :, self.base_idx] = cls_score[:, :, self.base_idx] ** (
                         1 - self.alpha) * vlm_score[:, :, self.base_idx] ** self.alpha
-                cls_score[:, :, self.novel_idx] = cls_score[:, :, self.novel_idx] ** (
-                        1 - self.beta) * vlm_score[:, :, self.novel_idx] ** self.beta 
-                cls_score[:, :, self.novel_idx] = cls_score[:, :, self.novel_idx] * self.novel_scale
+                # Use class-agnostic objectness (max over all classes) as foreground gate for novel classes.
+                # This prevents novel AP collapse as training progresses: a cat region that the detector
+                # mislabels as "dog" still has high objectness and gets correctly classified by vlm_score.
+                objectness = cls_score.max(dim=-1, keepdim=True).values  # [bs, queries, 1]
+                cls_score[:, :, self.novel_idx] = (
+                    objectness.expand_as(cls_score[:, :, self.novel_idx]) ** (1 - self.beta)
+                    * vlm_score[:, :, self.novel_idx] ** self.beta
+                    * self.novel_scale
+                )
                 box_cls = cls_score
                 results = self.inference(box_cls, box_pred, images.image_sizes, wo_sigmoid=True)
             else:
