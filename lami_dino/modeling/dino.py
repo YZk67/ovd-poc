@@ -573,17 +573,9 @@ class DINO(nn.Module):
                 vlm_score = vlm_score.softmax(dim=-1)
                 cls_score[:, :, self.base_idx] = cls_score[:, :, self.base_idx] ** (
                         1 - self.alpha) * vlm_score[:, :, self.base_idx] ** self.alpha
-                # VLM soft-floor gate for novel classes.
-                # Early epochs: cls_score[novel] is decent → class-specific gate preserves discrimination.
-                # Late epochs: cls_score[novel] → 0 → gate collapses. Fix: take max(cls_score, vlm_floor)
-                # so the gate falls back to a stable, class-specific CLIP-based floor rather than zero.
-                novel_vlm_floor = vlm_score[:, :, self.novel_idx] * getattr(self, 'novel_gate_vlm_factor', 2.0)
-                gate = torch.max(cls_score[:, :, self.novel_idx], novel_vlm_floor)
-                cls_score[:, :, self.novel_idx] = (
-                    gate ** (1 - self.beta)
-                    * vlm_score[:, :, self.novel_idx] ** self.beta
-                    * self.novel_scale
-                )
+                cls_score[:, :, self.novel_idx] = cls_score[:, :, self.novel_idx] ** (
+                        1 - self.beta) * vlm_score[:, :, self.novel_idx] ** self.beta
+                cls_score[:, :, self.novel_idx] = cls_score[:, :, self.novel_idx] * self.novel_scale
                 box_cls = cls_score
                 results = self.inference(box_cls, box_pred, images.image_sizes, wo_sigmoid=True)
             else:
