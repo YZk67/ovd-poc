@@ -96,7 +96,7 @@ class DetectionCheckpointer(Checkpointer):
             }
             return {"model": model_state, "__author__": "pycls", "matching_heuristics": True}
 
-        loaded = super()._load_file(filename)  # load native pth checkpoint
+        loaded = torch.load(filename, map_location=torch.device("cpu"), weights_only=False)  # load native pth checkpoint
         if "model" not in loaded:
             loaded = {"model": loaded}
         assert self._parsed_url_during_load is not None, "`_load_file` must be called inside `load`"
