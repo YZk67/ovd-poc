@@ -573,12 +573,14 @@ class DINO(nn.Module):
                 vlm_score = vlm_score.softmax(dim=-1)
                 cls_score[:, :, self.base_idx] = cls_score[:, :, self.base_idx] ** (
                         1 - self.alpha) * vlm_score[:, :, self.base_idx] ** self.alpha
-                # Use class-agnostic objectness (max over all classes) as foreground gate for novel classes.
-                # This prevents novel AP collapse as training progresses: a cat region that the detector
-                # mislabels as "dog" still has high objectness and gets correctly classified by vlm_score.
-                objectness = cls_score.max(dim=-1, keepdim=True).values  # [bs, queries, 1]
+                # VLM soft-floor gate for novel classes.
+                # Early epochs: cls_score[novel] is decent → class-specific gate preserves discrimination.
+                # Late epochs: cls_score[novel] → 0 → gate collapses. Fix: take max(cls_score, vlm_floor)
+                # so the gate falls back to a stable, class-specific CLIP-based floor rather than zero.
+                novel_vlm_floor = vlm_score[:, :, self.novel_idx] * getattr(self, 'novel_gate_vlm_factor', 2.0)
+                gate = torch.max(cls_score[:, :, self.novel_idx], novel_vlm_floor)
                 cls_score[:, :, self.novel_idx] = (
-                    objectness.expand_as(cls_score[:, :, self.novel_idx]) ** (1 - self.beta)
+                    gate ** (1 - self.beta)
                     * vlm_score[:, :, self.novel_idx] ** self.beta
                     * self.novel_scale
                 )
