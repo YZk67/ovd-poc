@@ -110,6 +110,7 @@ class DINO(nn.Module):
         novel_scale: float =5.0,
         clip_head_path=None,
         freeze_backbone: bool = False,
+        freeze_classifier: bool = False,
         text_query_path=None,
     ):
         super().__init__()
@@ -129,6 +130,7 @@ class DINO(nn.Module):
         if freeze_backbone:
             for param in self.backbone.parameters():
                 param.requires_grad_(False)
+        self.freeze_classifier = freeze_classifier
         self.position_embedding = position_embedding
 
         # define neck module
@@ -187,6 +189,14 @@ class DINO(nn.Module):
         # hack implementation for two-stage
         for bbox_embed_layer in self.bbox_embed:
             nn.init.constant_(bbox_embed_layer.layers[-1].bias.data[2:], 0.0)
+
+        # Freeze classifier (ZeroShotClassifier.linear) to prevent novel class forgetting.
+        # The linear layer projects decoder queries into CLIP space; if it drifts toward
+        # base classes during training, novel class matching degrades at inference.
+        if self.freeze_classifier:
+            for cls_layer in self.class_embed:
+                for param in cls_layer.parameters():
+                    param.requires_grad_(False)
 
         # set topk boxes selected for inference
         self.select_box_nums_for_evaluation = select_box_nums_for_evaluation
@@ -423,8 +433,9 @@ class DINO(nn.Module):
         # embedding instead of the generic wildcard.
         novel_content_embeds = None
         if self.training and self.novel_raw_embeds is not None:
-            novel_content_embeds = self.content_layer(self.novel_raw_embeds)  # [n_novel, 256]
-            novel_content_embeds = F.normalize(novel_content_embeds, p=2, dim=1)
+            with torch.no_grad():
+                novel_content_embeds = self.content_layer(self.novel_raw_embeds)  # [n_novel, 256]
+                novel_content_embeds = F.normalize(novel_content_embeds, p=2, dim=1)
 
         # Compute warmup parameters before transformer so we can pass cur_iou_thr
         # into the transformer for wildcard query injection (OV-DQUO Eq. 6).
