@@ -190,13 +190,16 @@ class DINO(nn.Module):
         for bbox_embed_layer in self.bbox_embed:
             nn.init.constant_(bbox_embed_layer.layers[-1].bias.data[2:], 0.0)
 
-        # Freeze classifier (ZeroShotClassifier.linear) to prevent novel class forgetting.
-        # The linear layer projects decoder queries into CLIP space; if it drifts toward
-        # base classes during training, novel class matching degrades at inference.
+        # Classifier anchor regularization: save initial linear weights as anchor.
+        # During training, a regularization loss penalizes drift from these initial
+        # weights to preserve CLIP-aligned projection for novel classes.
         if self.freeze_classifier:
-            for cls_layer in self.class_embed:
-                for param in cls_layer.parameters():
-                    param.requires_grad_(False)
+            anchor_params = {}
+            for i, cls_layer in enumerate(self.class_embed):
+                if hasattr(cls_layer, 'linear'):
+                    anchor_params[f"{i}.weight"] = cls_layer.linear.weight.data.clone()
+                    anchor_params[f"{i}.bias"] = cls_layer.linear.bias.data.clone()
+            self._cls_anchor_params = anchor_params
 
         # set topk boxes selected for inference
         self.select_box_nums_for_evaluation = select_box_nums_for_evaluation
@@ -570,6 +573,20 @@ class DINO(nn.Module):
                 )
                 loss_dict["debug_unknown_iou_thr"] = unknown_counts.new_tensor(cur_iou_thr)
                 loss_dict["debug_unknown_match_cost"] = unknown_counts.new_tensor(cur_match_cost)
+            # Classifier anchor regularization: penalize drift of linear projection
+            # from initial CLIP-aligned weights to preserve novel class matching.
+            if self.freeze_classifier and hasattr(self, '_cls_anchor_params') and self._cls_anchor_params:
+                reg_loss = torch.tensor(0.0, device=self.device)
+                for i, cls_layer in enumerate(self.class_embed):
+                    if hasattr(cls_layer, 'linear'):
+                        w_key, b_key = f"{i}.weight", f"{i}.bias"
+                        if w_key in self._cls_anchor_params:
+                            anchor_w = self._cls_anchor_params[w_key].to(self.device)
+                            anchor_b = self._cls_anchor_params[b_key].to(self.device)
+                            reg_loss = reg_loss + F.mse_loss(cls_layer.linear.weight, anchor_w)
+                            reg_loss = reg_loss + F.mse_loss(cls_layer.linear.bias, anchor_b)
+                loss_dict["loss_cls_anchor_reg"] = reg_loss
+
             weight_dict = self.criterion.weight_dict
             for k in loss_dict.keys():
                 if k in weight_dict:

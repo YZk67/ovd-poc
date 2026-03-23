@@ -16,7 +16,7 @@ model.unknown_iou_thr_start = 0.2
 model.unknown_iou_thr = 0.4
 model.unknown_warmup_iters = 4000
 model.pseudo_score_thr = 0.9
-# model.freeze_classifier = True  # too aggressive — bbox loss explodes
+model.freeze_classifier = True  # enable classifier anchor regularization
 
 # get default config
 dataloader = get_config("common/data/coco_detr.py").dataloader
@@ -73,7 +73,7 @@ model.select_box_nums_for_evaluation = 2000
 optimizer.lr = 1e-4
 optimizer.betas = (0.9, 0.999)
 optimizer.weight_decay = 1e-4
-optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 0.01 if "class_embed" in module_name else 1
+optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 1
 
 # modify dataloader config
 dataloader.train.dataset.names = "ovd_coco_train_with_pseudo"
