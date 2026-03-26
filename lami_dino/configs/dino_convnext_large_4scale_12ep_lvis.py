@@ -16,7 +16,7 @@ model.unknown_iou_thr_start = 0.2
 model.unknown_iou_thr = 0.4
 model.unknown_warmup_iters = 4000
 model.pseudo_score_thr = 0.9
-model.freeze_classifier = True  # enable classifier anchor regularization
+# model.freeze_classifier = True  # disabled: anchor is random init, hurts training
 
 # get default config
 dataloader = get_config("common/data/coco_detr.py").dataloader
