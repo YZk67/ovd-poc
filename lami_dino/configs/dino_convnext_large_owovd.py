@@ -8,12 +8,10 @@ from detrex.config import get_config
 from .models.dino_convnextl import model
 
 # === OVD settings ===
-# Using ovdcoco VLM embeddings for score_ensemble
-model.vlm_query_path = "dataset/metadata/ovdcoco_confuse_convnextl.npy"
-model.score_ensemble = True
-model.backbone.score_ensemble = model.score_ensemble
-model.seen_classes = 'dataset/metadata/ovcoco_seen_classes.json'
-model.all_classes = 'dataset/metadata/ovcoco_all_classes.json'
+# score_ensemble disabled for OWODB (no fixed base/novel split)
+# HAUF replaces score_ensemble for unknown detection
+model.score_ensemble = False
+model.backbone.score_ensemble = False
 model.vlm_temperature = 100.0
 model.alpha = 0.0
 model.beta = 0.4
@@ -24,7 +22,7 @@ model.hauf_enabled = False  # set True after VSAS attribute selection
 model.hauf_att_path = "dataset/metadata/coco_vsas_selected.pth"
 model.hauf_top_k = 10
 model.hauf_threshold = 0.5
-model.unknown_class_id = 65  # class ID for "unknown"
+model.unknown_class_id = 80  # class ID for "unknown" (= num_classes)
 
 # === OW-OVD: VSAS distribution logging (Phase 1: collect distributions) ===
 model.vsas_log_distributions = True
@@ -53,19 +51,14 @@ train.clip_grad.params.norm_type = 2
 train.device = "cuda"
 model.device = train.device
 
-# === Model settings ===
-# NOTE: using 65-class OV-COCO embeddings for now to validate pipeline.
-# TODO: generate 80-class COCO embeddings for full OWODB training.
-model.num_classes = 65
-model.query_path = "dataset/metadata/ovdcoco_visual_desc_convnextl.npy"
-model.eval_query_path = "dataset/metadata/ovdcoco_visual_desc_convnextl.npy"
+# === Model settings (COCO 80 classes) ===
+model.num_classes = 80
+model.query_path = "dataset/metadata/coco_80_text_convnextl.npy"
+model.eval_query_path = "dataset/metadata/coco_80_text_convnextl.npy"
 
-model.use_fed_loss = True
-model.cluster_fed_loss = True
-model.cluster_label_path = 'dataset/cluster/ovdcoco_cluster4_16.npy'
-model.cat_freq_path = "dataset/coco/ovd_ins_train2017_all_cat_info.json"
-model.fed_loss_num_cat = 32
-model.select_box_nums_for_evaluation = 2000
+model.use_fed_loss = False
+model.cluster_fed_loss = False
+model.select_box_nums_for_evaluation = 300
 
 # === Optimizer ===
 optimizer.lr = 1e-4
@@ -77,6 +70,6 @@ optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in modul
 dataloader.train.num_workers = 4
 dataloader.train.total_batch_size = 16
 dataloader.evaluator.output_dir = train.output_dir
-# Use standard OV-COCO to validate VSAS pipeline first
-# Switch to owodb_m_t1_train after generating 80-class embeddings
-dataloader.test.dataset.names = "ovcoco_2017_val_all"
+# Standard COCO 80-class for VSAS pipeline validation
+dataloader.train.dataset.names = "coco_2017_train"
+dataloader.test.dataset.names = "coco_2017_val"
