@@ -96,6 +96,11 @@ class DINO(nn.Module):
         beta: float =0.7,
         novel_scale: float =5.0,
         clip_head_path=None,
+        hauf_enabled: bool = False,
+        hauf_att_path: str = None,
+        hauf_top_k: int = 10,
+        hauf_threshold: float = 0.5,
+        unknown_class_id: int = 80,
     ):
         super().__init__()
         self.vlm_temperature = vlm_temperature
@@ -209,6 +214,19 @@ class DINO(nn.Module):
         self.save_dir = save_dir
         if self.save_dir:
             os.makedirs(self.save_dir, exist_ok=True)
+
+        # OW-OVD: HAUF for unknown detection at inference
+        self.hauf_enabled = hauf_enabled
+        self.unknown_class_id = unknown_class_id
+        if hauf_enabled and hauf_att_path:
+            from .hauf import HAUF
+            self.hauf_module = HAUF(top_k=hauf_top_k, unknown_threshold=hauf_threshold)
+            att_data = torch.load(hauf_att_path, map_location="cpu")
+            att_emb = att_data["att_embedding"].to(device)
+            self.register_buffer("hauf_att_embeddings", att_emb)
+        else:
+            self.hauf_module = None
+            self.register_buffer("hauf_att_embeddings", None)
 
     def filter_content_info(self, batched_inputs):
         freq_weight = self.freq_weight if self.freq_weight is not None else torch.ones(self.num_classes, device=self.device)
@@ -423,6 +441,14 @@ class DINO(nn.Module):
                 cls_score[:, :, self.novel_idx] = cls_score[:, :, self.novel_idx] ** (
                         1 - self.beta) * vlm_score[:, :, self.novel_idx] ** self.beta 
                 cls_score[:, :, self.novel_idx] = cls_score[:, :, self.novel_idx] * self.novel_scale
+
+                # OW-OVD: HAUF unknown detection
+                if self.hauf_enabled and self.hauf_module is not None and self.hauf_att_embeddings is not None:
+                    unknown_scores, cls_score = self.hauf_module(
+                        cls_score, roi_features_ori, self.hauf_att_embeddings,
+                        temperature=self.vlm_temperature,
+                    )
+
                 box_cls = cls_score
                 results = self.inference(box_cls, box_pred, images.image_sizes, wo_sigmoid=True)
             else:

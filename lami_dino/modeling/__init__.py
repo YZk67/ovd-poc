@@ -20,3 +20,4 @@ from .dino_transformer import (
 )
 from .dino import DINO
 from .dn_criterion import DINOCriterion
+from .hauf import HAUF, VSASDistributionLogger
