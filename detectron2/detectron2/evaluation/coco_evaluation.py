@@ -235,17 +235,15 @@ class COCOEvaluator(DatasetEvaluator):
             assert min(all_contiguous_ids) == 0 and max(all_contiguous_ids) == num_classes - 1
 
             reverse_id_mapping = {v: k for k, v in dataset_id_to_contiguous_id.items()}
+            filtered_results = []
             for result in coco_results:
                 category_id = result["category_id"]
-                try:
-                    assert category_id < num_classes, (
-                        f"A prediction has class={category_id}, "
-                        f"but the dataset only has {num_classes} classes and "
-                        f"predicted class id should be in [0, {num_classes - 1}]."
-                    )
-                except:
-                    import pdb;pdb.set_trace()
+                if category_id not in reverse_id_mapping:
+                    # Skip unknown class predictions (e.g. from HAUF)
+                    continue
                 result["category_id"] = reverse_id_mapping[category_id]
+                filtered_results.append(result)
+            coco_results = filtered_results
 
         if self._output_dir:
             file_path = os.path.join(self._output_dir, "coco_instances_results.json")
