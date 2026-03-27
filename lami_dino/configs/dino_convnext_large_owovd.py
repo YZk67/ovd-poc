@@ -25,7 +25,7 @@ model.hauf_threshold = 0.5
 model.unknown_class_id = 80  # class ID for "unknown" (= num_classes)
 
 # === OW-OVD: VSAS distribution logging (Phase 1: collect distributions) ===
-model.vsas_log_distributions = True
+model.vsas_log_distributions = False  # disable for multi-GPU, collect on single GPU
 model.vsas_all_att_path = "dataset/metadata/coco_att_embeddings.pth"
 model.vsas_dist_save_path = "dataset/metadata/att_distributions.pth"
 
