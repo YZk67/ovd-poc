@@ -117,15 +117,14 @@ class OWOVDEvaluator(DatasetEvaluator):
         u_recall = self._compute_unknown_recall(coco_gt, unknown_cat_ids)
         u_map = self._compute_unknown_map(coco_gt, unknown_cat_ids)
         a_ose = self._compute_a_ose(coco_gt, unknown_cat_ids)
-        known_map = self._compute_known_map(coco_gt)
+        # Skip known_map - already computed by standard COCO evaluator
 
         results["U-Recall"] = u_recall
         results["U-mAP"] = u_map
         results["A-OSE"] = a_ose
-        results["Known-mAP"] = known_map
 
         logger.info(f"OW-OVD Results: U-Recall={u_recall:.4f}, U-mAP={u_map:.4f}, "
-                     f"A-OSE={a_ose}, Known-mAP={known_map:.4f}")
+                     f"A-OSE={a_ose}")
 
         if self.output_dir:
             os.makedirs(self.output_dir, exist_ok=True)
