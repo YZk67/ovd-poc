@@ -337,7 +337,8 @@ class DINO(nn.Module):
             img_masks = images.tensor.new_zeros(batch_size, H, W)
 
         # original features
-        if self.score_ensemble:
+        # HAUF also needs features_wonorm for ROI feature extraction
+        if self.score_ensemble or self.hauf_enabled:
             features, features_wonorm = self.backbone(images.tensor)  # output feature dict
         else:
             features = self.backbone(images.tensor)  # output feature dict
@@ -499,14 +500,16 @@ class DINO(nn.Module):
                 cls_score[:, :, self.novel_idx] = cls_score[:, :, self.novel_idx] ** (
                         1 - self.beta) * vlm_score[:, :, self.novel_idx] ** self.beta 
                 cls_score[:, :, self.novel_idx] = cls_score[:, :, self.novel_idx] * self.novel_scale
-
-                # OW-OVD: HAUF unknown detection
-                if self.hauf_enabled and self.hauf_module is not None and self.hauf_att_embeddings is not None:
-                    unknown_scores, cls_score = self.hauf_module(
-                        cls_score, roi_features_ori, self.hauf_att_embeddings,
-                        temperature=self.vlm_temperature,
-                    )
-
+                box_cls = cls_score
+                results = self.inference(box_cls, box_pred, images.image_sizes, wo_sigmoid=True)
+            elif self.hauf_enabled and self.hauf_module is not None and self.hauf_att_embeddings is not None:
+                # OW-OVD: HAUF unknown detection (standalone, no score_ensemble)
+                roi_features_ori = self.extract_region_feature(features_wonorm, box_pred, 'p3')
+                cls_score = box_cls.sigmoid()
+                unknown_scores, cls_score = self.hauf_module(
+                    cls_score, roi_features_ori, self.hauf_att_embeddings,
+                    temperature=self.vlm_temperature,
+                )
                 box_cls = cls_score
                 results = self.inference(box_cls, box_pred, images.image_sizes, wo_sigmoid=True)
             else:

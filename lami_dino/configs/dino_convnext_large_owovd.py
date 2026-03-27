@@ -9,7 +9,7 @@ from .models.dino_convnextl import model
 
 # === OVD settings ===
 model.score_ensemble = False
-model.backbone.score_ensemble = False
+model.backbone.score_ensemble = True  # needed for HAUF ROI feature extraction
 model.vlm_temperature = 100.0
 model.alpha = 0.0
 model.beta = 0.4
