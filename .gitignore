@@ -145,3 +145,9 @@ retina+dino_1x/
 
 lvis-debug/*
 pretrained_models/*
+# Data files - transfer manually, not via git
+dataset/metadata/*.pth
+dataset/metadata/*.npy
+dataset/metadata/*.json
+dataset/coco/
+tools/owovd/*.json
