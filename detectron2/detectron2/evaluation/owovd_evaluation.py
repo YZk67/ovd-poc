@@ -97,7 +97,17 @@ class OWOVDEvaluator(DatasetEvaluator):
         json_file = metadata.json_file
         coco_gt = COCO(json_file)
 
-        all_cat_ids = set(coco_gt.getCatIds())
+        # Convert GT category IDs to contiguous IDs to match model predictions
+        if hasattr(metadata, "thing_dataset_id_to_contiguous_id"):
+            self._id_map = metadata.thing_dataset_id_to_contiguous_id
+        else:
+            self._id_map = None
+
+        all_cat_ids_orig = set(coco_gt.getCatIds())
+        if self._id_map:
+            all_cat_ids = set(self._id_map.get(cid, cid) for cid in all_cat_ids_orig)
+        else:
+            all_cat_ids = all_cat_ids_orig
         unknown_cat_ids = all_cat_ids - self.known_cat_ids
 
         logger.info(f"Known classes: {len(self.known_cat_ids)}, "
@@ -124,13 +134,23 @@ class OWOVDEvaluator(DatasetEvaluator):
 
         return {"owovd": results}
 
+    def _contiguous_to_coco_ids(self, contiguous_ids):
+        """Convert contiguous IDs back to COCO original IDs for GT queries."""
+        if self._id_map is None:
+            return list(contiguous_ids)
+        reverse_map = {v: k for k, v in self._id_map.items()}
+        return [reverse_map[cid] for cid in contiguous_ids if cid in reverse_map]
+
     def _compute_unknown_recall(self, coco_gt, unknown_cat_ids):
         """Compute recall for unknown objects at IoU threshold."""
         if not unknown_cat_ids:
             return 0.0
 
-        # Get all unknown GT boxes
-        unknown_ann_ids = coco_gt.getAnnIds(catIds=list(unknown_cat_ids))
+        # Get all unknown GT boxes (need COCO original IDs for query)
+        unknown_coco_ids = self._contiguous_to_coco_ids(unknown_cat_ids)
+        if not unknown_coco_ids:
+            return 0.0
+        unknown_ann_ids = coco_gt.getAnnIds(catIds=unknown_coco_ids)
         unknown_anns = coco_gt.loadAnns(unknown_ann_ids)
 
         # Group by image
@@ -182,7 +202,10 @@ class OWOVDEvaluator(DatasetEvaluator):
             return 0.0
 
         # Collect all unknown GT
-        unknown_ann_ids = coco_gt.getAnnIds(catIds=list(unknown_cat_ids))
+        unknown_coco_ids = self._contiguous_to_coco_ids(unknown_cat_ids)
+        if not unknown_coco_ids:
+            return 0.0
+        unknown_ann_ids = coco_gt.getAnnIds(catIds=unknown_coco_ids)
         unknown_anns = coco_gt.loadAnns(unknown_ann_ids)
 
         gt_by_image = defaultdict(list)
@@ -254,7 +277,10 @@ class OWOVDEvaluator(DatasetEvaluator):
         if not unknown_cat_ids:
             return 0
 
-        unknown_ann_ids = coco_gt.getAnnIds(catIds=list(unknown_cat_ids))
+        unknown_coco_ids = self._contiguous_to_coco_ids(unknown_cat_ids)
+        if not unknown_coco_ids:
+            return 0
+        unknown_ann_ids = coco_gt.getAnnIds(catIds=unknown_coco_ids)
         unknown_anns = coco_gt.loadAnns(unknown_ann_ids)
 
         gt_by_image = defaultdict(list)

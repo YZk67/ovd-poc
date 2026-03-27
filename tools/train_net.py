@@ -135,6 +135,46 @@ def do_test(cfg, model):
             model, instantiate(cfg.dataloader.test), instantiate(cfg.dataloader.evaluator), cfg.DDEBUG
         )
         print_csv_format(ret)
+
+        # OW-OVD: run OWOVD evaluator if hauf_enabled
+        raw_model = model.module if hasattr(model, "module") else model
+        if getattr(raw_model, "hauf_enabled", False):
+            try:
+                from detectron2.evaluation.owovd_evaluation import OWOVDEvaluator
+                from detectron2.data import MetadataCatalog
+                test_dataset = cfg.dataloader.test.dataset.names
+                metadata = MetadataCatalog.get(test_dataset)
+                json_file = metadata.json_file
+
+                # Get known class IDs from test JSON info
+                import json as _json
+                with open(json_file) as f:
+                    test_info = _json.load(f).get("info", {})
+                known_cat_ids_orig = test_info.get("known_cat_ids", [])
+
+                # Convert to contiguous IDs (model output uses contiguous)
+                if hasattr(metadata, "thing_dataset_id_to_contiguous_id"):
+                    id_map = metadata.thing_dataset_id_to_contiguous_id
+                    known_cat_ids = [id_map[cid] for cid in known_cat_ids_orig if cid in id_map]
+                else:
+                    known_cat_ids = known_cat_ids_orig
+
+                if known_cat_ids:
+                    unknown_class_id = getattr(raw_model, "unknown_class_id", 80)
+                    owovd_eval = OWOVDEvaluator(
+                        dataset_name=test_dataset,
+                        known_cat_ids=known_cat_ids,
+                        unknown_class_id=unknown_class_id,
+                        output_dir=cfg.train.output_dir,
+                    )
+                    owovd_ret = inference_on_dataset(
+                        model, instantiate(cfg.dataloader.test), owovd_eval
+                    )
+                    logger.info(f"OW-OVD Results: {owovd_ret}")
+                    ret.update(owovd_ret)
+            except Exception as e:
+                logger.warning(f"OWOVDEvaluator failed: {e}")
+
         return ret
 
 
