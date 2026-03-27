@@ -183,6 +183,14 @@ def do_train(args, cfg):
         trainer=trainer,
     )
 
+    # OW-OVD: VSAS distribution logging hook
+    vsas_hook = None
+    raw_model = model.module if hasattr(model, "module") else model
+    if getattr(raw_model, "vsas_log_distributions", False):
+        from lami_dino.modeling.vsas_hook import VSASDistributionHook
+        eval_period = getattr(cfg.train, "eval_period", None)
+        vsas_hook = VSASDistributionHook(save_period=eval_period)
+
     trainer.register_hooks(
         [
             hooks.IterationTimer(),
@@ -197,6 +205,7 @@ def do_train(args, cfg):
             )
             if comm.is_main_process()
             else None,
+            vsas_hook,
         ]
     )
 

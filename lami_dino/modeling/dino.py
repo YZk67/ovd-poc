@@ -101,6 +101,9 @@ class DINO(nn.Module):
         hauf_top_k: int = 10,
         hauf_threshold: float = 0.5,
         unknown_class_id: int = 80,
+        vsas_log_distributions: bool = False,
+        vsas_all_att_path: str = None,
+        vsas_dist_save_path: str = "dataset/metadata/att_distributions.pth",
     ):
         super().__init__()
         self.vlm_temperature = vlm_temperature
@@ -227,6 +230,33 @@ class DINO(nn.Module):
         else:
             self.hauf_module = None
             self.register_buffer("hauf_att_embeddings", None)
+
+        # OW-OVD: VSAS distribution logging during training
+        self.vsas_log_distributions = vsas_log_distributions
+        self.vsas_dist_save_path = vsas_dist_save_path
+        if vsas_log_distributions:
+            from .hauf import VSASDistributionLogger
+            # Load full attribute embeddings for computing scores during training
+            att_path = vsas_all_att_path or hauf_att_path
+            if att_path:
+                att_data = torch.load(att_path, map_location="cpu")
+                all_att_emb = att_data["att_embedding"].to(device)
+                self.register_buffer("vsas_all_att_embeddings", all_att_emb)
+                self.vsas_logger = VSASDistributionLogger(
+                    num_attrs=all_att_emb.shape[0],
+                    thresholds=[0.3, 0.5, 0.7],
+                )
+            else:
+                self.vsas_log_distributions = False
+                self.vsas_logger = None
+        else:
+            self.vsas_logger = None
+            self.register_buffer("vsas_all_att_embeddings", None)
+
+    def save_vsas_distributions(self):
+        """Save accumulated VSAS distributions. Call at end of epoch."""
+        if self.vsas_logger is not None:
+            self.vsas_logger.save(self.vsas_dist_save_path)
 
     def filter_content_info(self, batched_inputs):
         freq_weight = self.freq_weight if self.freq_weight is not None else torch.ones(self.num_classes, device=self.device)
@@ -410,6 +440,30 @@ class DINO(nn.Module):
 
         if self.training:
             loss_dict = self.criterion(output, targets, dn_meta)
+
+            # OW-OVD: log attribute score distributions for VSAS selection
+            if self.vsas_log_distributions and self.vsas_logger is not None:
+                with torch.no_grad():
+                    # Project 768-d attribute embeddings to 256-d via content_layer
+                    att_emb_256 = self.content_layer(self.vsas_all_att_embeddings)
+                    att_emb_256 = F.normalize(att_emb_256, p=2, dim=-1)
+
+                    # Use encoder proposal features (enc_state: [bs, nq, 256])
+                    enc_feat_norm = F.normalize(enc_state, p=2, dim=-1)
+
+                    # Cosine similarity -> sigmoid -> attribute scores [bs, nq, num_attrs]
+                    att_scores = (enc_feat_norm @ att_emb_256.t()).sigmoid()
+
+                    # Use class logits sigmoid as assignment proxy
+                    # Higher class score = more likely matched to known GT
+                    cls_scores = output["pred_logits"].sigmoid()  # [bs, nq, num_classes]
+
+                    # Flatten batch dimension
+                    att_flat = att_scores.reshape(-1, att_scores.shape[-1])
+                    cls_flat = cls_scores.reshape(-1, cls_scores.shape[-1])
+
+                    self.vsas_logger.log(att_flat, cls_flat)
+
             weight_dict = self.criterion.weight_dict
             for k in loss_dict.keys():
                 if k in weight_dict:

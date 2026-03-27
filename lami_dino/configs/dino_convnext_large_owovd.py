@@ -18,12 +18,17 @@ model.alpha = 0.0
 model.beta = 0.4
 model.novel_scale = 5.0
 
-# === OW-OVD: HAUF settings ===
-model.hauf_enabled = True
+# === OW-OVD: HAUF settings (enable after VSAS selection) ===
+model.hauf_enabled = False  # set True after VSAS attribute selection
 model.hauf_att_path = "dataset/metadata/coco_vsas_selected.pth"
 model.hauf_top_k = 10
 model.hauf_threshold = 0.5
 model.unknown_class_id = 80  # class ID for "unknown"
+
+# === OW-OVD: VSAS distribution logging (Phase 1: collect distributions) ===
+model.vsas_log_distributions = True
+model.vsas_all_att_path = "dataset/metadata/coco_att_embeddings.pth"
+model.vsas_dist_save_path = "dataset/metadata/att_distributions.pth"
 
 # === Common configs ===
 dataloader = get_config("common/data/coco_detr.py").dataloader
