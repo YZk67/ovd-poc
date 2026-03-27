@@ -63,9 +63,8 @@ model.cluster_fed_loss = False
 model.select_box_nums_for_evaluation = 300
 
 # === Optimizer ===
-# OW-OVD uses base_lr=5e-5 with batch 128 (8 GPUs x 16)
-# Linear scaling: 5e-5 * (16/128) = 6.25e-6 for our batch 16
-optimizer.lr = 6.25e-6
+# OW-OVD uses base_lr=5e-5 (backbone frozen, only head trains)
+optimizer.lr = 5e-5
 optimizer.betas = (0.9, 0.999)
 optimizer.weight_decay = 1e-4
 optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 1
