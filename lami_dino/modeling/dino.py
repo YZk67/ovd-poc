@@ -201,7 +201,7 @@ class DINO(nn.Module):
             self.cluster_label = np.load(cluster_label_path)
 
         self.score_ensemble = score_ensemble
-        if self.score_ensemble:
+        if self.score_ensemble or hauf_enabled:
             clip_head = torch.load(clip_head_path)
             self.identical, self.thead = clip_head[0]
             self.head = clip_head[1]
