@@ -201,11 +201,13 @@ class DINO(nn.Module):
             self.cluster_label = np.load(cluster_label_path)
 
         self.score_ensemble = score_ensemble
+        # Load CLIP visual head for ROI feature extraction (needed by score_ensemble and HAUF)
         if self.score_ensemble or hauf_enabled:
             clip_head = torch.load(clip_head_path)
             self.identical, self.thead = clip_head[0]
             self.head = clip_head[1]
 
+        if self.score_ensemble:
             self.seen_classes = json.load(open(seen_classes))
             self.all_classes = json.load(open(all_classes))
             idx = [self.all_classes.index(seen) for seen in self.seen_classes]
