@@ -548,9 +548,9 @@ class DINO(nn.Module):
                     aux_output["proposal_unknown_mask"] = proposal_unknown_mask
                     aux_output["unknown_match_mode"] = cur_match_mode
                     aux_output["unknown_match_cost"] = cur_match_cost
-            # NOTE: do NOT inject proposal_unknown_mask into enc_outputs.
-            # Encoder proposals are coarse; applying unknown matching constraints
-            # corrupts the Hungarian assignment and causes loss_bbox_enc to explode.
+            output["enc_outputs"]["proposal_unknown_mask"] = proposal_unknown_mask
+            output["enc_outputs"]["unknown_match_mode"] = cur_match_mode
+            output["enc_outputs"]["unknown_match_cost"] = cur_match_cost
 
         if self.training:
             loss_dict = self.criterion(output, targets, dn_meta)
