@@ -68,7 +68,7 @@ optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in modul
 
 # === Dataloader ===
 dataloader.train.num_workers = 4
-dataloader.train.total_batch_size = 4
+dataloader.train.total_batch_size = 16
 dataloader.evaluator.output_dir = train.output_dir
 # Standard COCO 80-class for VSAS pipeline validation
 dataloader.train.dataset.names = "coco_2017_train"
