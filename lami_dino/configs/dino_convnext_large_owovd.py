@@ -7,7 +7,8 @@ Trains on M-OWODB task splits with incremental class introduction.
 from detrex.config import get_config
 from .models.dino_convnextl import model
 
-# === OVD settings (from LaMI-DETR baseline, OV-COCO 65 classes) ===
+# === OVD settings ===
+# Using ovdcoco VLM embeddings for score_ensemble
 model.vlm_query_path = "dataset/metadata/ovdcoco_confuse_convnextl.npy"
 model.score_ensemble = True
 model.backbone.score_ensemble = model.score_ensemble
@@ -23,7 +24,7 @@ model.hauf_enabled = False  # set True after VSAS attribute selection
 model.hauf_att_path = "dataset/metadata/coco_vsas_selected.pth"
 model.hauf_top_k = 10
 model.hauf_threshold = 0.5
-model.unknown_class_id = 65  # class ID for "unknown" (65 for OV-COCO)
+model.unknown_class_id = 65  # class ID for "unknown"
 
 # === OW-OVD: VSAS distribution logging (Phase 1: collect distributions) ===
 model.vsas_log_distributions = True
@@ -52,7 +53,9 @@ train.clip_grad.params.norm_type = 2
 train.device = "cuda"
 model.device = train.device
 
-# === Model settings (OV-COCO 65 classes) ===
+# === Model settings ===
+# NOTE: using 65-class OV-COCO embeddings for now to validate pipeline.
+# TODO: generate 80-class COCO embeddings for full OWODB training.
 model.num_classes = 65
 model.query_path = "dataset/metadata/ovdcoco_visual_desc_convnextl.npy"
 model.eval_query_path = "dataset/metadata/ovdcoco_visual_desc_convnextl.npy"
@@ -70,8 +73,10 @@ optimizer.betas = (0.9, 0.999)
 optimizer.weight_decay = 1e-4
 optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 1
 
-# === Dataloader (OV-COCO for now, switch to OWODB later) ===
+# === Dataloader ===
 dataloader.train.num_workers = 4
 dataloader.train.total_batch_size = 16
 dataloader.evaluator.output_dir = train.output_dir
-dataloader.test.dataset.names = "ovdcoco65_2017_val_all"
+# Use standard OV-COCO to validate VSAS pipeline first
+# Switch to owodb_m_t1_train after generating 80-class embeddings
+dataloader.test.dataset.names = "ovcoco_2017_val_all"

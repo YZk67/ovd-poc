@@ -58,6 +58,28 @@ _PREDEFINED_SPLITS_COCO["coco"].update({
     "ovcoco_2017_val_all": ("coco/val2017", "coco/annotations1/instances_val2017.json"),
 })
 
+# OW-OVD: M-OWODB and S-OWODB benchmark splits (COCO 80 classes, 4 tasks)
+_PREDEFINED_SPLITS_COCO["coco"].update({
+    # M-OWODB (mixed super-categories)
+    "owodb_m_t1_train": ("coco/train2017", "coco/annotations/owodb/mowodb_t1_train.json"),
+    "owodb_m_t1_test":  ("coco/val2017",   "coco/annotations/owodb/mowodb_val_t1_test.json"),
+    "owodb_m_t2_train": ("coco/train2017", "coco/annotations/owodb/mowodb_t2_train.json"),
+    "owodb_m_t2_test":  ("coco/val2017",   "coco/annotations/owodb/mowodb_val_t2_test.json"),
+    "owodb_m_t3_train": ("coco/train2017", "coco/annotations/owodb/mowodb_t3_train.json"),
+    "owodb_m_t3_test":  ("coco/val2017",   "coco/annotations/owodb/mowodb_val_t3_test.json"),
+    "owodb_m_t4_train": ("coco/train2017", "coco/annotations/owodb/mowodb_t4_train.json"),
+    "owodb_m_t4_test":  ("coco/val2017",   "coco/annotations/owodb/mowodb_val_t4_test.json"),
+    # S-OWODB (super-category grouped)
+    "owodb_s_t1_train": ("coco/train2017", "coco/annotations/owodb/sowodb_t1_train.json"),
+    "owodb_s_t1_test":  ("coco/val2017",   "coco/annotations/owodb/sowodb_val_t1_test.json"),
+    "owodb_s_t2_train": ("coco/train2017", "coco/annotations/owodb/sowodb_t2_train.json"),
+    "owodb_s_t2_test":  ("coco/val2017",   "coco/annotations/owodb/sowodb_val_t2_test.json"),
+    "owodb_s_t3_train": ("coco/train2017", "coco/annotations/owodb/sowodb_t3_train.json"),
+    "owodb_s_t3_test":  ("coco/val2017",   "coco/annotations/owodb/sowodb_val_t3_test.json"),
+    "owodb_s_t4_train": ("coco/train2017", "coco/annotations/owodb/sowodb_t4_train.json"),
+    "owodb_s_t4_test":  ("coco/val2017",   "coco/annotations/owodb/sowodb_val_t4_test.json"),
+})
+
 # _PREDEFINED_SPLITS_COCO["obj365v2"] = {
 #     "obj365v2_train": ("object365/train/", "object365/annotations/obj365v2_train_filtered.json"),
 #     "obj365v2_val": ("object365/val/", "object365/annotations/zhiyuan_objv2_val.json")
