@@ -125,92 +125,62 @@ def compute_iou_matrix(boxes_a, boxes_b):
 
 
 def run_inference_and_collect(model, dataloader, gt_by_image, device):
-    """Run inference once, collect intermediate HAUF signals + GT matching info.
+    """Run inference with HAUF, collect predictions + GT matching info.
 
-    For each image, we save:
-    - pred_boxes: [num_proposals, 4] (xyxy, image coords)
-    - known_cls_scores: [num_proposals, 80] (sigmoid)
-    - att_scores: [num_proposals, num_attrs] (from HAUF)
-    - uncertainty: [num_proposals, 1]
-    - top_k_att: [num_proposals, 1]
-    - max_known: [num_proposals, 1]
-    - gt_is_unknown: [num_proposals] (1 if matched to unknown GT, 0 otherwise)
-    - gt_matched: [num_proposals] (1 if matched to any GT, 0 otherwise)
+    Uses monkey-patching on HAUF.forward to capture intermediate signals
+    without modifying the model's forward pass.
     """
-    from lami_dino.modeling.hauf import HAUF
     hauf = model.hauf_module
-    att_embeddings = model.hauf_att_embeddings
-    temperature = model.vlm_temperature
-
     all_results = []
+    collected_signals = {}
+
+    # Patch HAUF to capture intermediate signals
+    original_forward = hauf.forward.__func__  # unbound method
+
+    def patched_forward(self, known_cls_scores, roi_features, att_emb, temperature=100.0):
+        att_scores = self.compute_attribute_scores(roi_features, att_emb, temperature)
+        top_k_att = self.compute_weighted_top_k(att_scores)
+        uncertainty = self.compute_uncertainty(known_cls_scores)
+        max_known, _ = known_cls_scores.max(dim=-1, keepdim=True)
+
+        collected_signals["known_cls_scores"] = known_cls_scores.cpu()
+        collected_signals["top_k_att"] = top_k_att.cpu()
+        collected_signals["uncertainty"] = uncertainty.cpu()
+        collected_signals["max_known"] = max_known.cpu()
+
+        # Compute original result
+        w = self.att_weight
+        unknown_scores = (w * top_k_att + (1 - w) * uncertainty) * (1.0 - max_known)
+        combined_scores = torch.cat([known_cls_scores, unknown_scores], dim=-1)
+        return unknown_scores, combined_scores
+
+    # Apply patch
+    import types
+    hauf.forward = types.MethodType(patched_forward, hauf)
 
     for batch_idx, batched_inputs in enumerate(dataloader):
-        if batch_idx % 100 == 0:
+        if batch_idx % 500 == 0:
             print(f"Processing batch {batch_idx}/{len(dataloader)}...")
 
-        with torch.no_grad():
-            # We need to hook into the model's forward to get intermediate signals.
-            # Instead of modifying the model, we'll re-extract what HAUF computes.
-
-            images = model.preprocess_image(batched_inputs)
-            img_masks = model.backbone_mask(images)
-
-            features = model.backbone(images.tensor)
-            features_wonorm = getattr(model.backbone, '_features_wonorm', None)
-            # The backbone stores wonorm features when score_ensemble is True
-            # We need to access them. Let's check if they exist on the model.
-
-            # Actually, let's just run the full forward and intercept.
-            # Simpler: run model forward but capture HAUF inputs.
-            pass
-
-        # Simpler approach: use model's own forward but with a hook
-        # Actually, the simplest approach: just run model normally and also
-        # manually compute HAUF signals from the saved roi_features.
-
-        # Let's use a different strategy: patch HAUF forward temporarily
-        collected_signals = {}
-
-        original_forward = hauf.forward
-
-        def patched_forward(known_cls_scores, roi_features, att_emb, temperature=100.0):
-            att_scores = hauf.compute_attribute_scores(roi_features, att_emb, temperature)
-            top_k_att = hauf.compute_weighted_top_k(att_scores)
-            uncertainty = hauf.compute_uncertainty(known_cls_scores)
-            max_known, _ = known_cls_scores.max(dim=-1, keepdim=True)
-
-            collected_signals["known_cls_scores"] = known_cls_scores.cpu()
-            collected_signals["att_scores"] = att_scores.cpu()
-            collected_signals["top_k_att"] = top_k_att.cpu()
-            collected_signals["uncertainty"] = uncertainty.cpu()
-            collected_signals["max_known"] = max_known.cpu()
-            collected_signals["roi_features"] = roi_features.cpu()
-
-            # Run original
-            return original_forward(known_cls_scores, roi_features, att_emb, temperature)
-
-        hauf.forward = patched_forward
+        collected_signals.clear()
 
         with torch.no_grad():
             outputs = model(batched_inputs)
 
-        hauf.forward = original_forward
-
-        # Now process each image in the batch
+        # Process each image in the batch
         for i, (inp, out) in enumerate(zip(batched_inputs, outputs)):
             image_id = inp["image_id"]
             instances = out["instances"]
 
-            pred_boxes = instances.pred_boxes.tensor.cpu().numpy()  # xyxy, image coords
+            pred_boxes = instances.pred_boxes.tensor.cpu().numpy()
             pred_scores = instances.scores.cpu().numpy()
             pred_classes = instances.pred_classes.cpu().numpy()
 
-            # GT matching: for each prediction, check if it matches unknown GT
+            # GT matching
             gt_entries = gt_by_image.get(image_id, [])
             gt_boxes = [g["box"] for g in gt_entries]
             gt_is_unk = [g["is_unknown"] for g in gt_entries]
 
-            # Match predictions to GT
             pred_matched_unknown = np.zeros(len(pred_boxes), dtype=bool)
             pred_matched_known = np.zeros(len(pred_boxes), dtype=bool)
 
@@ -231,13 +201,10 @@ def run_inference_and_collect(model, dataloader, gt_by_image, device):
                 "pred_classes": pred_classes,
                 "matched_unknown": pred_matched_unknown,
                 "matched_known": pred_matched_known,
-                # HAUF signals (for the full 900 proposals, before NMS/top-k selection)
-                # Note: these are batch-level, we store per-image
-                "hauf_signals": {
-                    k: v[i].numpy() if v.dim() > 1 and v.shape[0] > 1 else v[0].numpy()
-                    for k, v in collected_signals.items()
-                } if collected_signals else None,
             })
+
+    # Restore original forward
+    hauf.forward = types.MethodType(original_forward, hauf)
 
     return all_results
 
