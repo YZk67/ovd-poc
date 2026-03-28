@@ -251,7 +251,7 @@ class DINO(nn.Module):
                 self.vsas_logger = VSASDistributionLogger(
                     num_attrs=all_att_emb.shape[0],
                     thresholds=[0.3, 0.5, 0.7],
-                    num_bins=1000,
+                    num_bins=10000,
                 )
             else:
                 self.vsas_log_distributions = False
@@ -259,8 +259,6 @@ class DINO(nn.Module):
         else:
             self.vsas_logger = None
             self.register_buffer("vsas_all_att_embeddings", None)
-
-        self.iter_count = 0
 
     def save_vsas_distributions(self):
         """Save accumulated VSAS distributions. Call at end of epoch."""
@@ -451,9 +449,8 @@ class DINO(nn.Module):
         if self.training:
             loss_dict = self.criterion(output, targets, dn_meta)
 
-            # OW-OVD: log attribute score distributions for VSAS selection (every 10 iters)
-            self.iter_count += 1
-            if self.vsas_log_distributions and self.vsas_logger is not None and self.iter_count % 10 == 0:
+            # OW-OVD: log attribute score distributions for VSAS selection
+            if self.vsas_log_distributions and self.vsas_logger is not None:
                 with torch.no_grad():
                     # Project 768-d attribute embeddings to 256-d via content_layer
                     att_emb_256 = self.content_layer(self.vsas_all_att_embeddings)
