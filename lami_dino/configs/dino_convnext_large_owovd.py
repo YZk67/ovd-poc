@@ -41,10 +41,10 @@ train.ddp.find_unused_parameters = True  # needed: frozen backbone params used i
 train.init_checkpoint = "./pretrained_models/clip_convnext_large_trans.pth"
 train.output_dir = "./output/dino_convnext_large_owovd"
 # 1 epoch: M-OWODB T1 ~95k images / batch 16 = ~5950 iter
-train.max_iter = 5950
-train.eval_period = 5950
+train.max_iter = 17850  # 3 epochs
+train.eval_period = 5950  # eval every epoch
 train.log_period = 200
-train.checkpointer.period = 5950
+train.checkpointer.period = 5950  # save every epoch
 
 train.clip_grad.enabled = True
 train.clip_grad.params.max_norm = 0.1
