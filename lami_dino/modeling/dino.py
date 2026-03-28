@@ -101,6 +101,7 @@ class DINO(nn.Module):
         hauf_att_path: str = None,
         hauf_top_k: int = 10,
         hauf_threshold: float = 0.5,
+        hauf_att_weight: float = 0.5,
         unknown_class_id: int = 80,
         vsas_log_distributions: bool = False,
         vsas_all_att_path: str = None,
@@ -229,7 +230,7 @@ class DINO(nn.Module):
         self.unknown_class_id = unknown_class_id
         if hauf_enabled and hauf_att_path:
             from .hauf import HAUF
-            self.hauf_module = HAUF(top_k=hauf_top_k, unknown_threshold=hauf_threshold)
+            self.hauf_module = HAUF(top_k=hauf_top_k, unknown_threshold=hauf_threshold, att_weight=hauf_att_weight)
             att_data = torch.load(hauf_att_path, map_location="cpu")
             att_emb = att_data["att_embedding"].to(device)
             self.register_buffer("hauf_att_embeddings", att_emb)
