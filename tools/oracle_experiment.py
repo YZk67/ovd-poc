@@ -133,33 +133,7 @@ def run_inference_and_collect(model, dataloader, gt_by_image, device):
     Uses monkey-patching on HAUF.forward to capture intermediate signals
     without modifying the model's forward pass.
     """
-    hauf = model.hauf_module
     all_results = []
-    collected_signals = {}
-
-    # Patch HAUF to capture intermediate signals
-    original_forward = hauf.forward.__func__  # unbound method
-
-    def patched_forward(self, known_cls_scores, roi_features, att_emb, temperature=100.0):
-        att_scores = self.compute_attribute_scores(roi_features, att_emb, temperature)
-        top_k_att = self.compute_weighted_top_k(att_scores)
-        uncertainty = self.compute_uncertainty(known_cls_scores)
-        max_known, _ = known_cls_scores.max(dim=-1, keepdim=True)
-
-        collected_signals["known_cls_scores"] = known_cls_scores.cpu()
-        collected_signals["top_k_att"] = top_k_att.cpu()
-        collected_signals["uncertainty"] = uncertainty.cpu()
-        collected_signals["max_known"] = max_known.cpu()
-
-        # Compute original result
-        w = self.att_weight
-        unknown_scores = (w * top_k_att + (1 - w) * uncertainty) * (1.0 - max_known)
-        combined_scores = torch.cat([known_cls_scores, unknown_scores], dim=-1)
-        return unknown_scores, combined_scores
-
-    # Apply patch
-    import types
-    hauf.forward = types.MethodType(patched_forward, hauf)
 
     for batch_idx, batched_inputs in enumerate(dataloader):
         if batch_idx % 500 == 0:
@@ -205,9 +179,6 @@ def run_inference_and_collect(model, dataloader, gt_by_image, device):
                 "matched_unknown": pred_matched_unknown,
                 "matched_known": pred_matched_known,
             })
-
-    # Restore original forward
-    hauf.forward = types.MethodType(original_forward, hauf)
 
     return all_results
 
