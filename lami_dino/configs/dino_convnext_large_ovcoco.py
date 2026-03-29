@@ -54,7 +54,8 @@ model.eval_query_path = "dataset/metadata/ovdcoco_vlm_query_convnextl.npy"
 model.vlm_query_path = "dataset/metadata/ovdcoco_vlm_query_convnextl.npy"
 
 model.use_fed_loss = True
-model.cluster_fed_loss = False  # cluster file has >65 entries, incompatible with 65-class model
+model.cluster_fed_loss = True
+model.cluster_label_path = "dataset/cluster/ovd_cluster_128.npy"
 model.cat_freq_path = "dataset/coco/ovd_ins_train2017_all_cat_info.json"
 model.select_box_nums_for_evaluation = 2000
 

@@ -289,6 +289,8 @@ class DINO(nn.Module):
                 C=self.num_classes,
                 weight=freq_weight)
 
+        # Filter out any indices >= num_classes (safety for C+1 trick in fed_loss)
+        content_inds = content_inds[content_inds < self.num_classes]
         convert_map = torch.ones(self.num_classes, dtype=torch.int64) * -1
         for idx, content_id in enumerate(content_inds):
             convert_map[content_id.item()] = idx
