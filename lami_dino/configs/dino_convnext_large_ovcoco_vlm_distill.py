@@ -4,7 +4,7 @@ Finetune from OV-COCO baseline (epoch 2) with VLM soft target distillation.
 Adds KL divergence loss between model predictions and VLM similarity distributions.
 """
 
-from .dino_convnext_large_ovcoco import *
+from .dino_convnext_large_ovcoco import model, dataloader, optimizer, lr_multiplier, train
 
 # === VLM distillation settings ===
 model.vlm_distill_enabled = True
