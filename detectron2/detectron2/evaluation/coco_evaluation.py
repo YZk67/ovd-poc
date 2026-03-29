@@ -389,13 +389,11 @@ class COCOEvaluator(DatasetEvaluator):
         results.update({"AP-" + name: ap for name, ap in results_per_category})
 
         # OV-COCO: compute base/novel AP50 split
-        # Novel classes are those in COCO80 but NOT in base 48
-        # For OVDCOCO65: 17 novel classes
+        # Novel = all 65 classes minus 48 seen (base) classes = 17 novel
         NOVEL_NAMES = {
-            "umbrella", "tie", "snowboard", "sports ball", "baseball bat",
-            "baseball glove", "skateboard", "tennis racket", "wine glass",
-            "knife", "hot dog", "cake", "couch", "potted plant",
-            "dining table", "sink", "teddy bear", "hair drier",
+            "airplane", "bus", "cat", "dog", "cow", "elephant",
+            "umbrella", "tie", "snowboard", "skateboard", "cup",
+            "knife", "cake", "couch", "keyboard", "sink", "scissors",
         }
         # Filter to classes actually in this dataset
         novel_indices = [i for i, name in enumerate(class_names) if name in NOVEL_NAMES]
