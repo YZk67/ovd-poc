@@ -51,9 +51,8 @@ model.query_path = "dataset/metadata/ovdcoco_vlm_query_convnextl.npy"
 model.eval_query_path = "dataset/metadata/ovdcoco_vlm_query_convnextl.npy"
 model.vlm_query_path = "dataset/metadata/ovdcoco_vlm_query_convnextl.npy"
 
-model.use_fed_loss = True
-model.cluster_fed_loss = True
-model.cluster_label_path = "dataset/cluster/ovd_cluster_128.npy"
+model.use_fed_loss = False
+model.cluster_fed_loss = False
 model.select_box_nums_for_evaluation = 2000
 
 # === Optimizer ===
