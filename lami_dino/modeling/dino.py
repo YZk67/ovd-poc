@@ -372,7 +372,7 @@ class DINO(nn.Module):
         if self.training:
             gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
             targets = self.prepare_targets(gt_instances)
-            cdn_num_classes = self.fed_loss_num_cat if self.use_fed_loss else self.num_classes
+            cdn_num_classes = len(content_inds) if self.use_fed_loss else self.num_classes
             input_query_label, input_query_bbox, attn_mask, dn_meta = self.prepare_for_cdn(
                 targets,
                 dn_number=self.dn_number,
