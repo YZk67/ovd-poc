@@ -169,11 +169,12 @@ def register_all_coco(root):
             jf = os.path.join(root, json_file) if "://" not in json_file else json_file
             ir = os.path.join(root, image_root)
 
-            # OV-COCO 65-class datasets: set ID mapping but let thing_classes come from JSON
+            # OV-COCO 65-class datasets: override metadata with 65-class mapping
             if key.startswith("ovdcoco65_2017_"):
                 register_coco_instances(key, {}, jf, ir)
                 meta = MetadataCatalog.get(key)
                 meta.evaluator_type = "coco"
+                meta.thing_classes = OVDCOCO65
                 meta.thing_dataset_id_to_contiguous_id = OVDCOCO65_IDMAP
                 continue
 
