@@ -73,6 +73,9 @@ class Trainer(SimpleTrainer):
         # gradient clip hyper-params
         self.clip_grad_params = clip_grad_params
 
+        # VLM distillation injector (set externally if needed)
+        self.vlm_injector = None
+
     def run_step(self):
         """
         Implement the standard training logic described above.
@@ -86,6 +89,9 @@ class Trainer(SimpleTrainer):
         If you want to do something with the data, you can wrap the dataloader.
         """
         data = next(self._data_loader_iter)
+        # Inject VLM soft targets if available
+        if self.vlm_injector is not None:
+            data = self.vlm_injector.inject(data)
         data_time = time.perf_counter() - start
 
         """
@@ -223,9 +229,16 @@ def do_train(args, cfg):
         trainer=trainer,
     )
 
+    # VLM distillation: inject soft targets into training batches
+    raw_model = model.module if hasattr(model, "module") else model
+    if getattr(raw_model, "vlm_distill_enabled", False):
+        vlm_targets_path = getattr(cfg.model, "vlm_targets_path", None)
+        if vlm_targets_path:
+            from lami_dino.modeling.vlm_distill import VLMSoftTargetInjector
+            trainer.vlm_injector = VLMSoftTargetInjector(vlm_targets_path)
+
     # OW-OVD: VSAS distribution logging hook
     vsas_hook = None
-    raw_model = model.module if hasattr(model, "module") else model
     if getattr(raw_model, "vsas_log_distributions", False):
         from lami_dino.modeling.vsas_hook import VSASDistributionHook
         eval_period = getattr(cfg.train, "eval_period", None)

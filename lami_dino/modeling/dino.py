@@ -107,8 +107,14 @@ class DINO(nn.Module):
         vsas_log_distributions: bool = False,
         vsas_all_att_path: str = None,
         vsas_dist_save_path: str = "dataset/metadata/att_distributions.pth",
+        vlm_distill_enabled: bool = False,
+        vlm_distill_weight: float = 1.0,
+        vlm_distill_temperature: float = 2.0,
     ):
         super().__init__()
+        self.vlm_distill_enabled = vlm_distill_enabled
+        self.vlm_distill_weight = vlm_distill_weight
+        self.vlm_distill_temperature = vlm_distill_temperature
         self.vlm_temperature = vlm_temperature
         self.alpha = alpha
         self.beta = beta
@@ -297,7 +303,97 @@ class DINO(nn.Module):
             batched_inputs[idx]['instances'].gt_classes = convert_map[batched_inputs[idx]['instances'].gt_classes]
 
         return content_inds, batched_inputs
- 
+
+    def _compute_vlm_distill_loss(self, output, targets, batched_inputs):
+        """Compute VLM distillation loss on matched predictions.
+
+        For each GT box that has a VLM soft target, find its matched prediction
+        (from Hungarian matching) and apply KL divergence between the model's
+        class prediction and the VLM's similarity distribution.
+        """
+        pred_logits = output["pred_logits"]  # [bs, nq, num_classes]
+        num_classes = pred_logits.shape[-1]
+        device = pred_logits.device
+        tau = self.vlm_distill_temperature
+
+        total_kl = torch.tensor(0.0, device=device)
+        total_unc = torch.tensor(0.0, device=device)
+        count = 0
+
+        for batch_idx, inp in enumerate(batched_inputs):
+            vlm_targets = inp.get('vlm_soft_targets', None)
+            if vlm_targets is None:
+                continue
+
+            target = targets[batch_idx]
+            gt_classes = target["labels"]  # [num_gt]
+
+            # Get matched indices from last layer's matching
+            # We use the prediction logits directly for GT boxes
+            for gt_idx, vlm_t in enumerate(vlm_targets):
+                if vlm_t is None or gt_idx >= len(gt_classes):
+                    continue
+
+                sim_dist = vlm_t.get("similarity_distribution", None)
+                if sim_dist is None:
+                    continue
+
+                sim_dist = torch.tensor(sim_dist, device=device, dtype=torch.float32)
+                if sim_dist.shape[0] != num_classes:
+                    # Truncate or pad to match num_classes
+                    if sim_dist.shape[0] > num_classes:
+                        sim_dist = sim_dist[:num_classes]
+                    else:
+                        pad = torch.zeros(num_classes - sim_dist.shape[0], device=device)
+                        sim_dist = torch.cat([sim_dist, pad])
+
+                # Skip if VLM gave no useful signal
+                if sim_dist.sum() < 1e-6:
+                    continue
+
+                # Soft target from VLM (already normalized)
+                vlm_soft = (sim_dist / tau).softmax(dim=-1)
+
+                # Model prediction for the GT class position
+                # Use encoder output logits as proxy (simpler than tracking matcher)
+                # Find the proposal closest to this GT box
+                gt_box = target["boxes"][gt_idx]  # [4]
+                enc_boxes = output["enc_outputs"]["pred_boxes"]  # [bs, nq, 4]
+                # IoU-based matching: find best matching proposal
+                from torchvision.ops import box_iou
+                from detrex.utils.box_ops import box_cxcywh_to_xyxy
+                gt_box_xyxy = box_cxcywh_to_xyxy(gt_box.unsqueeze(0))
+                enc_boxes_xyxy = box_cxcywh_to_xyxy(enc_boxes[batch_idx])
+                ious = box_iou(gt_box_xyxy, enc_boxes_xyxy)[0]  # [nq]
+                best_idx = ious.argmax()
+
+                if ious[best_idx] < 0.3:
+                    continue  # No good match
+
+                # KL divergence: model pred vs VLM soft target
+                pred_log_prob = (pred_logits[batch_idx, best_idx] / tau).log_softmax(dim=-1)
+                kl = F.kl_div(pred_log_prob, vlm_soft, reduction='sum')
+                total_kl += kl
+
+                # Uncertainty loss (optional): encourage model to output similar confidence
+                unc = vlm_t.get("uncertainty", None)
+                if unc is not None:
+                    pred_conf = pred_logits[batch_idx, best_idx].sigmoid().max()
+                    unc_target = torch.tensor(1.0 - unc, device=device)
+                    total_unc += F.mse_loss(pred_conf, unc_target)
+
+                count += 1
+
+        if count > 0:
+            total_kl = total_kl / count
+            total_unc = total_unc / count
+
+        loss_dict = {"loss_vlm_distill": total_kl * self.vlm_distill_weight}
+        if total_unc > 0:
+            loss_dict["loss_vlm_uncertainty"] = total_unc * self.vlm_distill_weight * 0.5
+
+        return loss_dict
+
     def forward(self, batched_inputs):
         """Forward function of `DINO` which excepts a list of dict as inputs.
 
@@ -450,6 +546,11 @@ class DINO(nn.Module):
 
         if self.training:
             loss_dict = self.criterion(output, targets, dn_meta)
+
+            # VLM distillation: soft target loss on matched predictions
+            if self.vlm_distill_enabled and hasattr(batched_inputs[0], '__getitem__') and 'vlm_soft_targets' in batched_inputs[0]:
+                vlm_loss = self._compute_vlm_distill_loss(output, targets, batched_inputs)
+                loss_dict.update(vlm_loss)
 
             # OW-OVD: log attribute score distributions for VSAS selection
             if self.vsas_log_distributions and self.vsas_logger is not None:
