@@ -34,11 +34,11 @@ train.ddp.find_unused_parameters = True
 train.init_checkpoint = "./pretrained_models/clip_convnext_large_trans.pth"
 train.output_dir = "./output/dino_convnext_large_ovcoco"
 # OV-COCO base train: ~107k images / batch 16 = ~6735 iter per epoch
-# Train 3 epochs
-train.max_iter = 20205
-train.eval_period = 6735
+# Train 12 epochs (matching newOvd/ovdcocoeasy branches)
+train.max_iter = 85200
+train.eval_period = 7100
 train.log_period = 200
-train.checkpointer.period = 6735
+train.checkpointer.period = 7100
 
 train.clip_grad.enabled = True
 train.clip_grad.params.max_norm = 0.1
@@ -57,10 +57,11 @@ model.use_fed_loss = True
 model.cluster_fed_loss = True
 model.cluster_label_path = "dataset/cluster/ovd_cluster_128.npy"
 model.cat_freq_path = "dataset/coco/ovd_ins_train2017_all_cat_info.json"
+model.fed_loss_num_cat = 30
 model.select_box_nums_for_evaluation = 2000
 
 # === Optimizer ===
-optimizer.lr = 5e-5
+optimizer.lr = 1e-4
 optimizer.betas = (0.9, 0.999)
 optimizer.weight_decay = 1e-4
 optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 1
