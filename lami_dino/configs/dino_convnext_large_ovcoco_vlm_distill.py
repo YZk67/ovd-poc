@@ -10,7 +10,7 @@ from .dino_convnext_large_ovcoco import model, dataloader, optimizer, lr_multipl
 model.vlm_distill_enabled = True
 model.vlm_distill_weight = 1.0
 model.vlm_distill_temperature = 2.0
-model.vlm_targets_path = "dataset/vlm_targets/vlm_soft_targets.pth"
+train.vlm_targets_path = "dataset/vlm_targets/vlm_soft_targets.pth"
 
 # === Resume from epoch 2 baseline ===
 train.init_checkpoint = "./output/dino_convnext_large_ovcoco/model_0014199.pth"

@@ -232,7 +232,7 @@ def do_train(args, cfg):
     # VLM distillation: inject soft targets into training batches
     raw_model = model.module if hasattr(model, "module") else model
     if getattr(raw_model, "vlm_distill_enabled", False):
-        vlm_targets_path = getattr(cfg.model, "vlm_targets_path", None)
+        vlm_targets_path = getattr(cfg.train, "vlm_targets_path", None)
         if vlm_targets_path:
             from lami_dino.modeling.vlm_distill import VLMSoftTargetInjector
             trainer.vlm_injector = VLMSoftTargetInjector(vlm_targets_path)
