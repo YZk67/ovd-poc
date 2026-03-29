@@ -21,7 +21,25 @@ import os
 
 from detectron2.data import DatasetCatalog, MetadataCatalog
 
-from .builtin_meta import ADE20K_SEM_SEG_CATEGORIES, _get_builtin_metadata
+from .builtin_meta import ADE20K_SEM_SEG_CATEGORIES, COCO_CATEGORIES, _get_builtin_metadata
+
+# OV-COCO 65-class definition (48 base + 17 novel)
+OVDCOCO65 = [
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
+    "bench", "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra",
+    "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard",
+    "kite", "skateboard", "surfboard", "bottle", "cup", "fork", "knife", "spoon", "bowl", "banana",
+    "apple", "sandwich", "orange", "broccoli", "carrot", "pizza", "donut", "cake", "chair", "couch",
+    "bed", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "microwave", "oven", "toaster",
+    "sink", "refrigerator", "book", "clock", "vase", "scissors", "toothbrush"
+]
+
+def _build_ovdcoco65_id_map():
+    name_to_id = {c["name"]: c["id"] for c in COCO_CATEGORIES}
+    dataset_ids = [name_to_id[n] for n in OVDCOCO65]
+    return {cid: i for i, cid in enumerate(dataset_ids)}
+
+OVDCOCO65_IDMAP = _build_ovdcoco65_id_map()
 from .cityscapes import load_cityscapes_instances, load_cityscapes_semantic
 from .cityscapes_panoptic import register_all_cityscapes_panoptic
 from .coco import load_sem_seg, register_coco_instances
@@ -55,12 +73,14 @@ _PREDEFINED_SPLITS_COCO["coco"].update({
     "ovcoco_2017_train_t":   ("coco/train2017", "coco/annotations/ovd_ins_train2017_t.json"),  # 一般不用训练
     "ovcoco_2017_val_b":     ("coco/val2017",   "coco/annotations/ovd_ins_val2017_b.json"),
     "ovcoco_2017_val_t":     ("coco/val2017",   "coco/annotations/ovd_ins_val2017_t.json"),
-    "ovcoco_2017_val_all": ("coco/val2017", "coco/annotations1/instances_val2017.json"),
+    "ovcoco_2017_val_all":   ("coco/val2017",   "coco/annotations/ovd_ins_val2017_all.json"),
+    "ovdcoco65_2017_train_b": ("coco/train2017", "coco/annotations/ovd_ins_train2017_b.json"),
+    "ovdcoco65_2017_val_b":   ("coco/val2017",   "coco/annotations/ovd_ins_val2017_b.json"),
+    "ovdcoco65_2017_val_all": ("coco/val2017",   "coco/annotations/ovd_ins_val2017_all.json"),
 })
 
-# OW-OVD: M-OWODB and S-OWODB benchmark splits (COCO 80 classes, 4 tasks)
+# OW-OVD: M-OWODB benchmark splits (COCO 80 classes, 4 tasks)
 _PREDEFINED_SPLITS_COCO["coco"].update({
-    # M-OWODB (mixed super-categories)
     "owodb_m_t1_train": ("coco/train2017", "coco/annotations/owodb/mowodb_t1_train.json"),
     "owodb_m_t1_test":  ("coco/val2017",   "coco/annotations/owodb/mowodb_val_t1_test.json"),
     "owodb_m_t2_train": ("coco/train2017", "coco/annotations/owodb/mowodb_t2_train.json"),
@@ -69,15 +89,6 @@ _PREDEFINED_SPLITS_COCO["coco"].update({
     "owodb_m_t3_test":  ("coco/val2017",   "coco/annotations/owodb/mowodb_val_t3_test.json"),
     "owodb_m_t4_train": ("coco/train2017", "coco/annotations/owodb/mowodb_t4_train.json"),
     "owodb_m_t4_test":  ("coco/val2017",   "coco/annotations/owodb/mowodb_val_t4_test.json"),
-    # S-OWODB (super-category grouped)
-    "owodb_s_t1_train": ("coco/train2017", "coco/annotations/owodb/sowodb_t1_train.json"),
-    "owodb_s_t1_test":  ("coco/val2017",   "coco/annotations/owodb/sowodb_val_t1_test.json"),
-    "owodb_s_t2_train": ("coco/train2017", "coco/annotations/owodb/sowodb_t2_train.json"),
-    "owodb_s_t2_test":  ("coco/val2017",   "coco/annotations/owodb/sowodb_val_t2_test.json"),
-    "owodb_s_t3_train": ("coco/train2017", "coco/annotations/owodb/sowodb_t3_train.json"),
-    "owodb_s_t3_test":  ("coco/val2017",   "coco/annotations/owodb/sowodb_val_t3_test.json"),
-    "owodb_s_t4_train": ("coco/train2017", "coco/annotations/owodb/sowodb_t4_train.json"),
-    "owodb_s_t4_test":  ("coco/val2017",   "coco/annotations/owodb/sowodb_val_t4_test.json"),
 })
 
 # _PREDEFINED_SPLITS_COCO["obj365v2"] = {
@@ -155,12 +166,24 @@ _PREDEFINED_SPLITS_COCO_PANOPTIC = {
 def register_all_coco(root):
     for dataset_name, splits_per_dataset in _PREDEFINED_SPLITS_COCO.items():
         for key, (image_root, json_file) in splits_per_dataset.items():
+            jf = os.path.join(root, json_file) if "://" not in json_file else json_file
+            ir = os.path.join(root, image_root)
+
+            # OV-COCO 65-class datasets: override metadata with 65-class mapping
+            if key.startswith("ovdcoco65_2017_"):
+                register_coco_instances(key, {}, jf, ir)
+                meta = MetadataCatalog.get(key)
+                meta.evaluator_type = "coco"
+                meta.thing_classes = OVDCOCO65
+                meta.thing_dataset_id_to_contiguous_id = OVDCOCO65_IDMAP
+                continue
+
             # Assume pre-defined datasets live in `./datasets`.
             register_coco_instances(
                 key,
                 _get_builtin_metadata(dataset_name),
-                os.path.join(root, json_file) if "://" not in json_file else json_file,
-                os.path.join(root, image_root),
+                jf,
+                ir,
             )
 
     for (
