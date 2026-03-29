@@ -14,6 +14,8 @@ model.vlm_temperature = 100.0
 model.alpha = 0.0
 model.beta = 0.4
 model.novel_scale = 5.0
+model.seen_classes = "dataset/metadata/ovcoco_seen_classes.json"
+model.all_classes = "dataset/metadata/ovcoco_all_classes.json"
 
 # === Freeze backbone (preserve CLIP features) ===
 model.freeze_backbone = True
