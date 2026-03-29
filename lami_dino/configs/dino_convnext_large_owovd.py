@@ -23,6 +23,8 @@ model.hauf_enabled = False
 model.hauf_att_path = "dataset/metadata/coco_vsas_selected.pth"
 model.hauf_top_k = 10
 model.hauf_threshold = 0.55
+model.hauf_att_weight = 0.5
+model.hauf_objectness_threshold = 0.05
 model.unknown_class_id = 80
 
 # === OW-OVD: VSAS distribution logging ===
