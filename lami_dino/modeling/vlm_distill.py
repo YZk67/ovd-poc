@@ -22,7 +22,7 @@ class VLMSoftTargetInjector:
 
     def __init__(self, targets_path):
         logger.info(f"Loading VLM soft targets from {targets_path}")
-        self.targets = torch.load(targets_path, weights_only=False)
+        self.targets = torch.load(targets_path, map_location="cpu")
         logger.info(f"Loaded VLM targets for {len(self.targets)} images")
 
     def inject(self, batched_inputs):
