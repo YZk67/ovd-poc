@@ -139,8 +139,6 @@ def run_inference_and_collect(model, dataloader, gt_by_image, device):
         if batch_idx % 500 == 0:
             print(f"Processing batch {batch_idx}/{len(dataloader)}...")
 
-        collected_signals.clear()
-
         with torch.no_grad():
             outputs = model(batched_inputs)
 
