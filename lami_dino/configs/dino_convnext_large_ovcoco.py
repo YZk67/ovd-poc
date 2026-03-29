@@ -49,15 +49,15 @@ model.device = train.device
 
 # === Model settings (65 classes for OV-COCO) ===
 model.num_classes = 65
-model.query_path = "dataset/metadata/ovdcoco_vlm_query_convnextl.npy"
-model.eval_query_path = "dataset/metadata/ovdcoco_vlm_query_convnextl.npy"
-model.vlm_query_path = "dataset/metadata/ovdcoco_vlm_query_convnextl.npy"
+model.query_path = "dataset/metadata/ovdcoco_visual_desc_convnextl.npy"
+model.eval_query_path = "dataset/metadata/ovdcoco_visual_desc_convnextl.npy"
+model.vlm_query_path = "dataset/metadata/ovdcoco_confuse_convnextl.npy"
 
 model.use_fed_loss = True
 model.cluster_fed_loss = True
-model.cluster_label_path = "dataset/cluster/ovd_cluster_128.npy"
+model.cluster_label_path = "dataset/cluster/ovdcoco_cluster4_16.npy"
 model.cat_freq_path = "dataset/coco/ovd_ins_train2017_all_cat_info.json"
-model.fed_loss_num_cat = 30
+model.fed_loss_num_cat = 32
 model.select_box_nums_for_evaluation = 2000
 
 # === Optimizer ===
