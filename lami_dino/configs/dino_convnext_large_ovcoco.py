@@ -47,8 +47,8 @@ model.device = train.device
 
 # === Model settings (65 classes for OV-COCO) ===
 model.num_classes = 65
-model.query_path = "dataset/metadata/ovdcoco_prompts_list8_v2.npy"
-model.eval_query_path = "dataset/metadata/ovdcoco_prompts_list8_v2.npy"
+model.query_path = "dataset/metadata/ovdcoco_vlm_query_convnextl.npy"
+model.eval_query_path = "dataset/metadata/ovdcoco_vlm_query_convnextl.npy"
 model.vlm_query_path = "dataset/metadata/ovdcoco_vlm_query_convnextl.npy"
 
 model.use_fed_loss = True
