@@ -46,6 +46,8 @@ def parse_args():
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output-dir", default="output/oracle_experiment")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--objectness-threshold", type=float, default=0.05,
+                        help="Min max_known score to be considered an object (not background)")
     return parser.parse_args()
 
 
@@ -56,6 +58,7 @@ def load_model(cfg, checkpoint_path, device):
     cfg.model.hauf_att_path = "dataset/metadata/coco_vsas_selected_v2.pth"
     cfg.model.backbone.score_ensemble = True
     cfg.model.score_ensemble = False  # We use HAUF path, not score_ensemble path
+    cfg.model.hauf_objectness_threshold = getattr(cfg.model, 'hauf_objectness_threshold', 0.05)
 
     model = instantiate(cfg.model)
     model.to(device)
@@ -333,19 +336,18 @@ def oracle_rescore(all_results, gt_by_image, unknown_class_id=80, mode="oracle_f
                         new_scores[pred_idx] = max(new_scores[pred_idx], 0.9)
 
                 elif mode == "oracle_full":
-                    # Perfect oracle: anything matching unknown GT → unknown class
-                    # anything matching known GT → keep as is
-                    # anything not matching → keep as is
+                    # Perfect oracle:
+                    # - matches unknown GT → force unknown with high score
+                    # - matches known GT → keep known class
+                    # - no match + currently unknown → zero out (remove false unknown)
                     if best_iou >= 0.5 and gt_is_unk[best_gt]:
                         new_classes[pred_idx] = unknown_class_id
                         new_scores[pred_idx] = 0.95
                     elif best_iou >= 0.5 and not gt_is_unk[best_gt]:
-                        # Keep known class, slightly boost confidence
                         pass
                     else:
-                        # No match - if currently unknown, reduce score
                         if new_classes[pred_idx] == unknown_class_id:
-                            new_scores[pred_idx] *= 0.1  # suppress false unknown
+                            new_scores[pred_idx] = 0.0  # completely remove false unknown
 
                 elif mode == "oracle_att_only":
                     # Only replace attribute signal: boost unknown score for
@@ -382,6 +384,7 @@ def main():
 
     # Load model
     print("Loading model...")
+    cfg.model.hauf_objectness_threshold = args.objectness_threshold
     model = load_model(cfg, args.checkpoint, args.device)
 
     # Run inference and collect HAUF signals
@@ -458,8 +461,15 @@ def main():
         print("   → Full VLM distillation (attributes + uncertainty) recommended.")
 
     # Save summary
+    def to_json_val(v):
+        if isinstance(v, (float, np.floating)):
+            return float(v)
+        elif isinstance(v, (int, np.integer)):
+            return int(v)
+        return str(v)
+
     summary = {
-        "metrics": {k: {kk: float(vv) if isinstance(vv, (float, np.floating)) else int(vv)
+        "metrics": {k: {kk: to_json_val(vv)
                         for kk, vv in v.items()} for k, v in all_metrics.items()},
         "gaps": {
             "oracle_uncertainty": float(gap_unc),

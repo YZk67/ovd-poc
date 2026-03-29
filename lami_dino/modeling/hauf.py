@@ -22,11 +22,12 @@ class HAUF(nn.Module):
         unknown_threshold: Score threshold above which a proposal is classified as unknown.
     """
 
-    def __init__(self, top_k=10, unknown_threshold=0.5, att_weight=0.5):
+    def __init__(self, top_k=10, unknown_threshold=0.5, att_weight=0.5, objectness_threshold=0.05):
         super().__init__()
         self.top_k = top_k
         self.unknown_threshold = unknown_threshold
         self.att_weight = att_weight  # weight for attribute score vs uncertainty
+        self.objectness_threshold = objectness_threshold  # min known score to be considered an object
 
     def compute_attribute_scores(self, roi_features, att_embeddings, temperature=100.0):
         """Compute attribute similarity scores for each proposal.
@@ -100,6 +101,11 @@ class HAUF(nn.Module):
         # HAUF fusion (att_weight controls attribute vs uncertainty balance)
         w = self.att_weight
         unknown_scores = (w * top_k_att + (1 - w) * uncertainty) * (1.0 - max_known)
+
+        # Gate: proposals with very low max_known are likely background, not unknown objects.
+        # An unknown object should still trigger *some* known-class activation.
+        objectness_gate = (max_known >= self.objectness_threshold).float()
+        unknown_scores = unknown_scores * objectness_gate
 
         # Concatenate known + unknown
         combined_scores = torch.cat([known_cls_scores, unknown_scores], dim=-1)
