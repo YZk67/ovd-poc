@@ -387,6 +387,44 @@ class COCOEvaluator(DatasetEvaluator):
         self._logger.info("Per-category {} AP: \n".format(iou_type) + table)
 
         results.update({"AP-" + name: ap for name, ap in results_per_category})
+
+        # OV-COCO: compute base/novel AP50 split
+        # Novel classes are those in COCO80 but NOT in base 48
+        # For OVDCOCO65: 17 novel classes
+        NOVEL_NAMES = {
+            "umbrella", "tie", "snowboard", "sports ball", "baseball bat",
+            "baseball glove", "skateboard", "tennis racket", "wine glass",
+            "knife", "hot dog", "cake", "couch", "potted plant",
+            "dining table", "sink", "teddy bear", "hair drier",
+        }
+        # Filter to classes actually in this dataset
+        novel_indices = [i for i, name in enumerate(class_names) if name in NOVEL_NAMES]
+        base_indices = [i for i, name in enumerate(class_names) if name not in NOVEL_NAMES]
+
+        if novel_indices and precisions.shape[0] > 0:
+            # AP50 is at IoU index 0 (IoU=0.50 is first threshold in COCO eval)
+            # precision dims: (iou, recall, cls, area, max_dets)
+            # IoU=0.50 is index 0
+            novel_ap50_list = []
+            base_ap50_list = []
+            for idx in novel_indices:
+                p = precisions[0, :, idx, 0, -1]  # IoU=0.50, all recall, area=all, maxDets=100
+                p = p[p > -1]
+                novel_ap50_list.append(np.mean(p) * 100 if p.size else float("nan"))
+            for idx in base_indices:
+                p = precisions[0, :, idx, 0, -1]
+                p = p[p > -1]
+                base_ap50_list.append(np.mean(p) * 100 if p.size else float("nan"))
+
+            novel_ap50 = np.nanmean(novel_ap50_list) if novel_ap50_list else float("nan")
+            base_ap50 = np.nanmean(base_ap50_list) if base_ap50_list else float("nan")
+            results["AP50-novel"] = float(novel_ap50)
+            results["AP50-base"] = float(base_ap50)
+            self._logger.info(
+                f"OV-COCO split: AP50-novel={novel_ap50:.2f}, AP50-base={base_ap50:.2f} "
+                f"(novel={len(novel_indices)} classes, base={len(base_indices)} classes)"
+            )
+
         return results
 
 
