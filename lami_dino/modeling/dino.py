@@ -388,9 +388,10 @@ class DINO(nn.Module):
             total_kl = total_kl / count
             total_unc = total_unc / count
 
-        loss_dict = {"loss_vlm_distill": total_kl * self.vlm_distill_weight}
-        if total_unc > 0:
-            loss_dict["loss_vlm_uncertainty"] = total_unc * self.vlm_distill_weight * 0.5
+        loss_dict = {
+            "loss_vlm_distill": total_kl * self.vlm_distill_weight,
+            "loss_vlm_uncertainty": total_unc * self.vlm_distill_weight * 0.5,
+        }
 
         return loss_dict
 
