@@ -361,7 +361,7 @@ class DINO(nn.Module):
                 enc_boxes = output["enc_outputs"]["pred_boxes"]  # [bs, nq, 4]
                 # IoU-based matching: find best matching proposal
                 from torchvision.ops import box_iou
-                from detrex.utils.box_ops import box_cxcywh_to_xyxy
+                from detrex.layers.box_ops import box_cxcywh_to_xyxy
                 gt_box_xyxy = box_cxcywh_to_xyxy(gt_box.unsqueeze(0))
                 enc_boxes_xyxy = box_cxcywh_to_xyxy(enc_boxes[batch_idx])
                 ious = box_iou(gt_box_xyxy, enc_boxes_xyxy)[0]  # [nq]
