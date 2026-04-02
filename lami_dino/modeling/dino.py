@@ -327,18 +327,34 @@ class DINO(nn.Module):
 
             target = targets[batch_idx]
             gt_classes = target["labels"]  # [num_gt]
+            gt_ann_ids = target.get("ann_ids")
+
+            vlm_by_ann_id = None
+            if gt_ann_ids is not None:
+                vlm_by_ann_id = {
+                    int(vlm_t["ann_id"]): vlm_t
+                    for vlm_t in vlm_targets
+                    if vlm_t is not None and "ann_id" in vlm_t
+                }
 
             # Get matched indices from last layer's matching
             # We use the prediction logits directly for GT boxes
-            for gt_idx, vlm_t in enumerate(vlm_targets):
-                if vlm_t is None or gt_idx >= len(gt_classes):
+            for gt_idx in range(len(gt_classes)):
+                if vlm_by_ann_id is not None:
+                    vlm_t = vlm_by_ann_id.get(int(gt_ann_ids[gt_idx].item()))
+                elif gt_idx < len(vlm_targets):
+                    vlm_t = vlm_targets[gt_idx]
+                else:
+                    vlm_t = None
+
+                if vlm_t is None:
                     continue
 
                 sim_dist = vlm_t.get("similarity_distribution", None)
                 if sim_dist is None:
                     continue
 
-                sim_dist = torch.tensor(sim_dist, device=device, dtype=torch.float32)
+                sim_dist = torch.as_tensor(sim_dist, device=device, dtype=torch.float32)
                 if sim_dist.shape[0] != num_classes:
                     # Truncate or pad to match num_classes
                     if sim_dist.shape[0] > num_classes:
@@ -351,8 +367,8 @@ class DINO(nn.Module):
                 if sim_dist.sum() < 1e-6:
                     continue
 
-                # Soft target from VLM (already normalized)
-                vlm_soft = (sim_dist / tau).softmax(dim=-1)
+                # similarity_distribution is already a normalized probability distribution
+                vlm_soft = sim_dist / sim_dist.sum()
 
                 # Model prediction for the GT class position
                 # Use encoder output logits as proxy (simpler than tracking matcher)
@@ -900,5 +916,8 @@ class DINO(nn.Module):
             gt_scores = targets_per_image.gt_scores
             gt_boxes = targets_per_image.gt_boxes.tensor / image_size_xyxy
             gt_boxes = box_xyxy_to_cxcywh(gt_boxes)
-            new_targets.append({"labels": gt_classes, "boxes": gt_boxes, "scores": gt_scores})
+            target_dict = {"labels": gt_classes, "boxes": gt_boxes, "scores": gt_scores}
+            if targets_per_image.has("gt_ann_ids"):
+                target_dict["ann_ids"] = targets_per_image.gt_ann_ids.to(self.device)
+            new_targets.append(target_dict)
         return new_targets

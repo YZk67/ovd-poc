@@ -10,11 +10,18 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _torch_load_compat(path, **kwargs):
+    try:
+        return torch.load(path, weights_only=False, **kwargs)
+    except TypeError:
+        return torch.load(path, **kwargs)
+
+
 class VLMSoftTargetInjector:
     """Loads VLM soft targets and injects them into training batches.
 
     Usage:
-        injector = VLMSoftTargetInjector("dataset/vlm_targets/vlm_soft_targets.pth")
+        injector = VLMSoftTargetInjector("dataset/vlm_targets_crop/vlm_soft_targets.pth")
 
         # In training loop, after getting batched_inputs:
         batched_inputs = injector.inject(batched_inputs)
@@ -22,7 +29,7 @@ class VLMSoftTargetInjector:
 
     def __init__(self, targets_path):
         logger.info(f"Loading VLM soft targets from {targets_path}")
-        self.targets = torch.load(targets_path, map_location="cpu")
+        self.targets = _torch_load_compat(targets_path, map_location="cpu")
         logger.info(f"Loaded VLM targets for {len(self.targets)} images")
 
     def inject(self, batched_inputs):
