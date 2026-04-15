@@ -386,9 +386,20 @@ class DINO(nn.Module):
                 if ious[best_idx] < 0.3:
                     continue  # No good match
 
-                # KL divergence: model pred vs VLM soft target
-                pred_log_prob = (pred_logits[batch_idx, best_idx] / tau).log_softmax(dim=-1)
-                kl = F.kl_div(pred_log_prob, vlm_soft, reduction='sum')
+                # KL divergence on novel classes only
+                # Extract novel-class dimensions to avoid base signal overwhelming novel
+                novel_mask = self.novel_idx.to(device)
+                pred_novel = pred_logits[batch_idx, best_idx][novel_mask] / tau
+                vlm_novel = vlm_soft[novel_mask]
+
+                # Re-normalize novel slice to form valid distributions
+                vlm_novel_sum = vlm_novel.sum()
+                if vlm_novel_sum < 1e-6:
+                    continue  # No novel signal in this target
+                vlm_novel = vlm_novel / vlm_novel_sum
+
+                pred_log_prob = pred_novel.log_softmax(dim=-1)
+                kl = F.kl_div(pred_log_prob, vlm_novel, reduction='sum')
                 total_kl += kl
 
                 # Uncertainty loss (optional): encourage model to output similar confidence
