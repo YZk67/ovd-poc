@@ -99,6 +99,14 @@ class DINO(nn.Module):
         clip_head_path=None,
         use_soft_attention: bool = True,
         soft_attention_tau: float = 0.1,
+        # ATCG (Analogical Textual Concept Generator) params
+        atcg_enabled: bool = False,
+        atcg_text_embeddings_path: str = None,
+        atcg_temperature: float = 0.05,
+        atcg_momentum: float = 0.999,
+        atcg_loss_temperature: float = 0.1,
+        atcg_novel_only: bool = True,
+        atcg_num_stacked_layers: int = 0,
     ):
         super().__init__()
         self.vlm_temperature = vlm_temperature
@@ -238,7 +246,28 @@ class DINO(nn.Module):
         self.save_dir = save_dir
         if self.save_dir:
             os.makedirs(self.save_dir, exist_ok=True)
-    
+
+        # ATCG: Analogical Textual Concept Generator
+        self.atcg_enabled = atcg_enabled
+        if self.atcg_enabled:
+            assert self.score_ensemble, "ATCG requires score_ensemble=True for CLIP ROI features"
+            from .atcg import AnalogicalPrototypeBank
+
+            # base_class_ids: indices where base_idx is True
+            base_class_ids = self.base_idx.nonzero(as_tuple=True)[0].tolist()
+            self.atcg = AnalogicalPrototypeBank(
+                num_base_classes=len(base_class_ids),
+                num_all_classes=len(self.all_classes),
+                feat_dim=768,  # CLIP ConvNeXt-L feature dim
+                base_class_ids=base_class_ids,
+                text_embeddings_path=atcg_text_embeddings_path,
+                temperature=atcg_temperature,
+                momentum=atcg_momentum,
+                loss_temperature=atcg_loss_temperature,
+                novel_only=atcg_novel_only,
+                num_stacked_layers=atcg_num_stacked_layers,
+            )
+
     def _aggregate_prototypes(self, embeddings, method='mean', region_feats=None, tau=0.1):
         """
         Aggregate multiple prototypes into a single embedding.
@@ -554,6 +583,14 @@ class DINO(nn.Module):
             loss_dict = self.criterion(output, targets, dn_meta)
             if apr_loss is not None:
                 loss_dict["loss_apr"] = apr_loss
+
+            # ATCG loss: analogical cross-attention distillation
+            # Skip when fed_loss is active (pred_logits has reduced class dim)
+            if self.atcg_enabled and not self.use_fed_loss:
+                loss_dict["loss_atcg"] = self._compute_atcg_loss(
+                    output, targets, features_wonorm
+                )
+
             weight_dict = self.criterion.weight_dict
             for k in loss_dict.keys():
                 if k in weight_dict:
@@ -599,6 +636,71 @@ class DINO(nn.Module):
                 processed_results.append({"instances": r})
             return processed_results
     
+    def _compute_atcg_loss(self, output, targets, features_wonorm):
+        """Compute ATCG analogical distillation loss.
+
+        For each GT box:
+        1. Extract CLIP ROI feature
+        2. Update EMA visual prototypes (base classes)
+        3. Generate pseudo text embedding via cross-attention
+        4. Find best matching predicted box (highest IoU)
+        5. KL divergence between detector logits and pseudo soft targets
+
+        Args:
+            output: dict with pred_logits [B, Q, C] and pred_boxes [B, Q, 4].
+            targets: list of dicts with 'labels' [N_i] and 'boxes' [N_i, 4].
+            features_wonorm: backbone features without normalization (for CLIP ROI).
+
+        Returns:
+            loss: scalar ATCG loss.
+        """
+        device = output["pred_logits"].device
+        pred_logits = output["pred_logits"]  # [B, Q, C]
+        pred_boxes = output["pred_boxes"]    # [B, Q, 4]
+
+        # Use a dummy grad-connected tensor for DDP compatibility
+        total_loss = (pred_logits.sum() * 0.0)
+        num_gt = 0
+
+        for b_idx, tgt in enumerate(targets):
+            gt_labels = tgt["labels"]  # [N]
+            gt_boxes = tgt["boxes"]    # [N, 4] normalized cxcywh
+
+            if gt_labels.numel() == 0:
+                continue
+
+            # Extract CLIP ROI features for GT boxes
+            gt_boxes_batch = gt_boxes.unsqueeze(0)  # [1, N, 4]
+            with torch.no_grad():
+                gt_roi_features = self.extract_region_feature(
+                    {k: v[b_idx:b_idx+1] for k, v in features_wonorm.items()},
+                    gt_boxes_batch, 'p3'
+                )  # [1, N, 768]
+                gt_roi_features = gt_roi_features.squeeze(0)  # [N, 768]
+
+            # Update EMA prototypes with base-class GT features
+            self.atcg.update_prototypes(gt_roi_features, gt_labels)
+
+            # Find best matching prediction for each GT (IoU-based)
+            with torch.no_grad():
+                gt_xyxy = box_cxcywh_to_xyxy(gt_boxes)  # [N, 4]
+                pred_xyxy = box_cxcywh_to_xyxy(pred_boxes[b_idx])  # [Q, 4]
+                ious = torchvision.ops.box_iou(gt_xyxy, pred_xyxy)  # [N, Q]
+                best_pred_idx = ious.argmax(dim=1)  # [N]
+
+            # Gather matched detector logits
+            matched_logits = pred_logits[b_idx][best_pred_idx]  # [N, C]
+
+            # Compute ATCG loss
+            loss = self.atcg.compute_loss(matched_logits, gt_roi_features)
+            total_loss = total_loss + loss * gt_labels.numel()
+            num_gt += gt_labels.numel()
+
+        if num_gt > 0:
+            total_loss = total_loss / num_gt
+
+        return total_loss
+
     def extract_region_feature(self, features, bbox, layer_name):
         if layer_name == 'p2':
             h, w = features['p2'].shape[-2:]# 50 75

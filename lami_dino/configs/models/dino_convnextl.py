@@ -93,6 +93,7 @@ model = L(DINO)(
             "loss_bbox_dn": 5.0,
             "loss_giou_dn": 2.0,
             "loss_apr": 1.0,  # APR loss weight
+            "loss_atcg": 1.0,  # ATCG analogical distillation loss weight
         },
         loss_class_type="focal_loss",
         alpha=0.25,
@@ -134,6 +135,14 @@ model = L(DINO)(
     pixel_std=[58.395, 57.120, 57.375],
     device="cuda",
     clip_head_path='./pretrained_models/clip_convnext_large_head.pth',
+    # ATCG defaults (disabled)
+    atcg_enabled=False,
+    atcg_text_embeddings_path=None,
+    atcg_temperature=0.05,
+    atcg_momentum=0.999,
+    atcg_loss_temperature=0.1,
+    atcg_novel_only=True,
+    atcg_num_stacked_layers=0,
 )
 
 # set aux loss weight dict
