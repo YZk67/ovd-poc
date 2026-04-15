@@ -304,17 +304,26 @@ class DINO(nn.Module):
 
         return content_inds, batched_inputs
 
-    def _compute_vlm_distill_loss(self, output, targets, batched_inputs):
-        """Compute VLM distillation loss on matched predictions.
+    def _compute_vlm_distill_loss(self, output, targets, batched_inputs, content_inds=None):
+        """Compute VLM distillation loss on matched predictions (novel classes only).
 
         For each GT box that has a VLM soft target, find its matched prediction
-        (from Hungarian matching) and apply KL divergence between the model's
-        class prediction and the VLM's similarity distribution.
+        (from Hungarian matching) and apply KL divergence on the novel-class
+        dimensions only, to avoid base-class signal suppressing novel classes.
         """
-        pred_logits = output["pred_logits"]  # [bs, nq, num_classes]
+        pred_logits = output["pred_logits"]  # [bs, nq, num_classes_sampled]
         num_classes = pred_logits.shape[-1]
         device = pred_logits.device
         tau = self.vlm_distill_temperature
+
+        # Build novel mask for the current (possibly subsampled) class set
+        # content_inds maps pred_logits dim -> full 65-class index
+        novel_idx_full = self.novel_idx.to(device)  # [65] bool
+        if content_inds is not None:
+            # content_inds: tensor of shape [num_sampled], values in [0, 65)
+            novel_mask = novel_idx_full[content_inds]  # [num_sampled] bool
+        else:
+            novel_mask = novel_idx_full  # [65] bool
 
         total_kl = torch.tensor(0.0, device=device)
         total_unc = torch.tensor(0.0, device=device)
@@ -355,27 +364,19 @@ class DINO(nn.Module):
                     continue
 
                 sim_dist = torch.as_tensor(sim_dist, device=device, dtype=torch.float32)
-                if sim_dist.shape[0] != num_classes:
-                    # Truncate or pad to match num_classes
-                    if sim_dist.shape[0] > num_classes:
-                        sim_dist = sim_dist[:num_classes]
-                    else:
-                        pad = torch.zeros(num_classes - sim_dist.shape[0], device=device)
-                        sim_dist = torch.cat([sim_dist, pad])
 
-                # Skip if VLM gave no useful signal
-                if sim_dist.sum() < 1e-6:
+                # Extract novel-class slice from VLM distribution (always 65-dim)
+                vlm_novel = sim_dist[novel_idx_full]  # [17]
+
+                # Skip if VLM gave no useful novel signal
+                vlm_novel_sum = vlm_novel.sum()
+                if vlm_novel_sum < 1e-6:
                     continue
+                vlm_novel = vlm_novel / vlm_novel_sum  # re-normalize
 
-                # similarity_distribution is already a normalized probability distribution
-                vlm_soft = sim_dist / sim_dist.sum()
-
-                # Model prediction for the GT class position
-                # Use encoder output logits as proxy (simpler than tracking matcher)
                 # Find the proposal closest to this GT box
                 gt_box = target["boxes"][gt_idx]  # [4]
                 enc_boxes = output["enc_outputs"]["pred_boxes"]  # [bs, nq, 4]
-                # IoU-based matching: find best matching proposal
                 from torchvision.ops import box_iou
                 from detrex.layers.box_ops import box_cxcywh_to_xyxy
                 gt_box_xyxy = box_cxcywh_to_xyxy(gt_box.unsqueeze(0))
@@ -386,20 +387,36 @@ class DINO(nn.Module):
                 if ious[best_idx] < 0.3:
                     continue  # No good match
 
-                # KL divergence on novel classes only
-                # Extract novel-class dimensions to avoid base signal overwhelming novel
-                novel_mask = self.novel_idx.to(device)
+                # Extract novel-class slice from model predictions
+                # novel_mask is adapted to current content_inds sampling
                 pred_novel = pred_logits[batch_idx, best_idx][novel_mask] / tau
-                vlm_novel = vlm_soft[novel_mask]
 
-                # Re-normalize novel slice to form valid distributions
-                vlm_novel_sum = vlm_novel.sum()
-                if vlm_novel_sum < 1e-6:
-                    continue  # No novel signal in this target
-                vlm_novel = vlm_novel / vlm_novel_sum
+                # Need at least 2 novel classes in the sampled set
+                if pred_novel.shape[0] < 2:
+                    continue
+
+                # Subsample vlm_novel to match pred_novel when using fed_loss
+                if content_inds is not None:
+                    # Which of the 17 novel classes are present in content_inds?
+                    novel_in_full = torch.where(novel_idx_full)[0]  # [17] indices in [0,65)
+                    novel_in_sample = torch.isin(content_inds.to(device), novel_in_full)
+                    # Map content_inds novel entries back to novel_idx positions
+                    sampled_novel_ids = content_inds[novel_in_sample]  # actual class ids
+                    # Get corresponding positions in the 17-novel ordering
+                    novel_positions = []
+                    for cid in sampled_novel_ids:
+                        pos = (novel_in_full == cid.item()).nonzero(as_tuple=True)[0].item()
+                        novel_positions.append(pos)
+                    vlm_novel_sub = vlm_novel[novel_positions]
+                    vlm_novel_sum2 = vlm_novel_sub.sum()
+                    if vlm_novel_sum2 < 1e-6:
+                        continue
+                    vlm_novel_sub = vlm_novel_sub / vlm_novel_sum2
+                else:
+                    vlm_novel_sub = vlm_novel
 
                 pred_log_prob = pred_novel.log_softmax(dim=-1)
-                kl = F.kl_div(pred_log_prob, vlm_novel, reduction='sum')
+                kl = F.kl_div(pred_log_prob, vlm_novel_sub, reduction='sum')
                 total_kl += kl
 
                 # Uncertainty loss (optional): encourage model to output similar confidence
@@ -577,7 +594,7 @@ class DINO(nn.Module):
 
             # VLM distillation: soft target loss on matched predictions
             if self.vlm_distill_enabled and hasattr(batched_inputs[0], '__getitem__') and 'vlm_soft_targets' in batched_inputs[0]:
-                vlm_loss = self._compute_vlm_distill_loss(output, targets, batched_inputs)
+                vlm_loss = self._compute_vlm_distill_loss(output, targets, batched_inputs, content_inds=content_inds)
                 loss_dict.update(vlm_loss)
 
             # OW-OVD: log attribute score distributions for VSAS selection
