@@ -104,6 +104,9 @@ class DINO(nn.Module):
         unknown_match_mode: str = "soft",
         unknown_match_cost: float = 2.0,
         pseudo_score_thr: float = 0.95,
+        vlm_distill_enabled: bool = False,
+        vlm_distill_weight: float = 1.0,
+        vlm_distill_temperature: float = 2.0,
         vlm_temperature: float =100.0,
         alpha: float =0.3,
         beta: float =0.7,
@@ -124,6 +127,9 @@ class DINO(nn.Module):
         self.unknown_match_mode = str(unknown_match_mode)
         self.unknown_match_cost = float(unknown_match_cost)
         self.pseudo_score_thr = float(pseudo_score_thr)
+        self.vlm_distill_enabled = vlm_distill_enabled
+        self.vlm_distill_weight = vlm_distill_weight
+        self.vlm_distill_temperature = vlm_distill_temperature
         self._train_forward_count = 0
         # define backbone and position embedding module
         self.backbone = backbone
@@ -331,7 +337,123 @@ class DINO(nn.Module):
             batched_inputs[idx]['instances'].gt_classes = mapped
 
         return content_inds, batched_inputs
- 
+
+    def _compute_vlm_distill_loss(self, output, targets, batched_inputs, content_inds=None):
+        """Compute VLM distillation loss on matched predictions (novel classes only).
+
+        For each GT box that has a VLM soft target, find its matched prediction
+        and apply KL divergence on the novel-class dimensions only.
+        """
+        pred_logits = output["pred_logits"]  # [bs, nq, num_classes_sampled]
+        device = pred_logits.device
+        tau = self.vlm_distill_temperature
+
+        novel_idx_full = self.novel_idx.to(device)  # [65] bool
+        if content_inds is not None:
+            novel_mask = novel_idx_full[content_inds]
+        else:
+            novel_mask = novel_idx_full
+
+        total_kl = torch.tensor(0.0, device=device)
+        total_unc = torch.tensor(0.0, device=device)
+        count = 0
+
+        for batch_idx, inp in enumerate(batched_inputs):
+            vlm_targets = inp.get('vlm_soft_targets', None)
+            if vlm_targets is None:
+                continue
+
+            target = targets[batch_idx]
+            gt_classes = target["labels"]
+            gt_ann_ids = target.get("ann_ids")
+
+            vlm_by_ann_id = None
+            if gt_ann_ids is not None:
+                vlm_by_ann_id = {
+                    int(vlm_t["ann_id"]): vlm_t
+                    for vlm_t in vlm_targets
+                    if vlm_t is not None and "ann_id" in vlm_t
+                }
+
+            for gt_idx in range(len(gt_classes)):
+                if vlm_by_ann_id is not None:
+                    vlm_t = vlm_by_ann_id.get(int(gt_ann_ids[gt_idx].item()))
+                elif gt_idx < len(vlm_targets):
+                    vlm_t = vlm_targets[gt_idx]
+                else:
+                    vlm_t = None
+
+                if vlm_t is None:
+                    continue
+
+                sim_dist = vlm_t.get("similarity_distribution", None)
+                if sim_dist is None:
+                    continue
+
+                sim_dist = torch.as_tensor(sim_dist, device=device, dtype=torch.float32)
+
+                # Extract novel-class slice from VLM distribution (always 65-dim)
+                vlm_novel = sim_dist[novel_idx_full]
+                vlm_novel_sum = vlm_novel.sum()
+                if vlm_novel_sum < 1e-6:
+                    continue
+                vlm_novel = vlm_novel / vlm_novel_sum
+
+                # Find best-IoU encoder proposal
+                gt_box = target["boxes"][gt_idx]
+                enc_boxes = output["enc_outputs"]["pred_boxes"]
+                from torchvision.ops import box_iou
+                from detrex.layers.box_ops import box_cxcywh_to_xyxy
+                gt_box_xyxy = box_cxcywh_to_xyxy(gt_box.unsqueeze(0))
+                enc_boxes_xyxy = box_cxcywh_to_xyxy(enc_boxes[batch_idx])
+                ious = box_iou(gt_box_xyxy, enc_boxes_xyxy)[0]
+                best_idx = ious.argmax()
+
+                if ious[best_idx] < 0.3:
+                    continue
+
+                pred_novel = pred_logits[batch_idx, best_idx][novel_mask] / tau
+                if pred_novel.shape[0] < 2:
+                    continue
+
+                # Subsample vlm_novel when using fed_loss
+                if content_inds is not None:
+                    novel_in_full = torch.where(novel_idx_full)[0]
+                    novel_in_sample = torch.isin(content_inds.to(device), novel_in_full)
+                    sampled_novel_ids = content_inds[novel_in_sample]
+                    novel_positions = []
+                    for cid in sampled_novel_ids:
+                        pos = (novel_in_full == cid.item()).nonzero(as_tuple=True)[0].item()
+                        novel_positions.append(pos)
+                    vlm_novel_sub = vlm_novel[novel_positions]
+                    vlm_novel_sum2 = vlm_novel_sub.sum()
+                    if vlm_novel_sum2 < 1e-6:
+                        continue
+                    vlm_novel_sub = vlm_novel_sub / vlm_novel_sum2
+                else:
+                    vlm_novel_sub = vlm_novel
+
+                pred_log_prob = pred_novel.log_softmax(dim=-1)
+                kl = F.kl_div(pred_log_prob, vlm_novel_sub, reduction='sum')
+                total_kl += kl
+
+                unc = vlm_t.get("uncertainty", None)
+                if unc is not None:
+                    pred_conf = pred_logits[batch_idx, best_idx].sigmoid().max()
+                    unc_target = torch.tensor(1.0 - unc, device=device)
+                    total_unc += F.mse_loss(pred_conf, unc_target)
+
+                count += 1
+
+        if count > 0:
+            total_kl = total_kl / count
+            total_unc = total_unc / count
+
+        return {
+            "loss_vlm_distill": total_kl * self.vlm_distill_weight,
+            "loss_vlm_uncertainty": total_unc * self.vlm_distill_weight * 0.5,
+        }
+
     def forward(self, batched_inputs):
         """Forward function of `DINO` which excepts a list of dict as inputs.
 
@@ -586,6 +708,11 @@ class DINO(nn.Module):
                             reg_loss = reg_loss + F.mse_loss(cls_layer.linear.weight, anchor_w)
                             reg_loss = reg_loss + F.mse_loss(cls_layer.linear.bias, anchor_b)
                 loss_dict["loss_cls_anchor_reg"] = reg_loss
+
+            # VLM distillation: soft target loss on novel classes
+            if self.vlm_distill_enabled and hasattr(batched_inputs[0], '__getitem__') and 'vlm_soft_targets' in batched_inputs[0]:
+                vlm_loss = self._compute_vlm_distill_loss(output, targets, batched_inputs, content_inds=content_inds)
+                loss_dict.update(vlm_loss)
 
             weight_dict = self.criterion.weight_dict
             for k in loss_dict.keys():
