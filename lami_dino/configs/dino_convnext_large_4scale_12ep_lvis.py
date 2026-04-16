@@ -57,10 +57,12 @@ model.query_path = "dataset/metadata/ovdcoco_visual_desc_convnextl.npy"
 model.eval_query_path = "dataset/metadata/ovdcoco_visual_desc_convnextl.npy"
 
 # OV-DQUO: RoQI Selection — objectness × CLIP-sim for encoder proposal ranking
-model.transformer.roqi_selection = True
+# Disabled: hurts early-epoch novel AP (17.2 vs 29.1 without it)
+# model.transformer.roqi_selection = True
 
 # OV-DQUO: Denoising Text Query — CLIP text embeddings for CDN denoising groups
-model.text_query_path = "dataset/metadata/ovdcoco_text_desc_convnextl.npy"
+# Disabled: text_query_embedding not in pretrained checkpoint, needs separate tuning
+# model.text_query_path = "dataset/metadata/ovdcoco_text_desc_convnextl.npy"
 
 model.use_fed_loss = True
 model.cluster_fed_loss = True
