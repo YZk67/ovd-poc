@@ -36,8 +36,9 @@ from detectron2.utils import comm
 from detectron2.utils.events import get_event_storage
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from tools.ema import ModelEma, EMAHook
+from ema import ModelEma, EMAHook  # tools/ema.py
 
 logger = logging.getLogger("detrex")
 
