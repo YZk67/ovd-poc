@@ -253,12 +253,39 @@ def do_train(args, cfg):
     )
 
     def _eval_fn():
-        results = do_test(cfg, model)
+        """Return combined dict so EvalHook pushes both raw and EMA metrics into storage."""
+        results = do_test(cfg, model) or {}
+        combined = dict(results)
         if ema is not None:
-            do_test_ema(cfg, ema.module)
-        return results
+            ema_results = do_test_ema(cfg, ema.module) or {}
+            combined.update(ema_results)
+        return combined
 
     ema_hook = EMAHook(ema, update_period=int(getattr(cfg.train, "ema_update_period", 1))) if ema is not None else None
+
+    # Best-checkpoint hooks. Watch bbox/AP50-novel; save a second one for EMA if enabled.
+    best_metric = getattr(cfg.train, "best_metric", "bbox/AP50-novel")
+    best_hooks = []
+    if comm.is_main_process():
+        best_hooks.append(
+            hooks.BestCheckpointer(
+                eval_period=cfg.train.eval_period,
+                checkpointer=checkpointer,
+                val_metric=best_metric,
+                mode="max",
+                file_prefix="model_best_novel",
+            )
+        )
+        if ema is not None:
+            best_hooks.append(
+                hooks.BestCheckpointer(
+                    eval_period=cfg.train.eval_period,
+                    checkpointer=checkpointer,
+                    val_metric=f"ema/{best_metric}",
+                    mode="max",
+                    file_prefix="model_best_novel_ema",
+                )
+            )
 
     trainer.register_hooks(
         [
@@ -269,6 +296,7 @@ def do_train(args, cfg):
             if comm.is_main_process()
             else None,
             hooks.EvalHook(cfg.train.eval_period, _eval_fn),
+            *best_hooks,
             hooks.PeriodicWriter(
                 default_writers(cfg.train.output_dir, cfg.train.max_iter),
                 period=cfg.train.log_period,
