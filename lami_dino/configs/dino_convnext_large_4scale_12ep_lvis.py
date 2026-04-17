@@ -67,13 +67,7 @@ optimizer.lr = 1e-4
 optimizer.betas = (0.9, 0.999)
 optimizer.weight_decay = 1e-4
 
-
 optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 1
-
-# EMA settings
-train.ema_enabled = True
-train.ema_decay = 0.9998
-train.ema_update_period = 1
 
 # modify dataloader config
 dataloader.train.dataset.names = "ovd_coco_train_with_pseudo"

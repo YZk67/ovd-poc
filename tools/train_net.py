@@ -36,9 +36,6 @@ from detectron2.utils import comm
 from detectron2.utils.events import get_event_storage
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from ema import ModelEma, EMAHook  # tools/ema.py
 
 logger = logging.getLogger("detrex")
 
@@ -177,22 +174,6 @@ def do_test(cfg, model):
         return ret
 
 
-def do_test_ema(cfg, ema_module):
-    """Eval using EMA weights. Prefix results with 'ema/' so we can tell them apart."""
-    if "evaluator" not in cfg.dataloader:
-        return None
-    logger_ = logging.getLogger("detectron2")
-    logger_.info("[EMA] Running evaluation with EMA weights...")
-    ret = inference_on_dataset(
-        ema_module, instantiate(cfg.dataloader.test),
-        instantiate(cfg.dataloader.evaluator), cfg.DDEBUG
-    )
-    if ret is not None:
-        ret = {f"ema/{k}": v for k, v in ret.items()}
-        print_csv_format(ret)
-    return ret
-
-
 def do_train(args, cfg):
     """
     Args:
@@ -232,39 +213,13 @@ def do_train(args, cfg):
         clip_grad_params=cfg.train.clip_grad.params if cfg.train.clip_grad.enabled else None,
     )
 
-    # EMA setup
-    ema = None
-    if getattr(cfg.train, "ema_enabled", False):
-        ema = ModelEma(
-            model,
-            decay=float(getattr(cfg.train, "ema_decay", 0.9999)),
-            device=cfg.train.device,
-        )
-        logger.info(f"[EMA] enabled, decay={ema.decay}")
-
-    checkpointer_kwargs = {"trainer": trainer}
-    if ema is not None:
-        # persist EMA weights alongside the regular checkpoint
-        checkpointer_kwargs["ema"] = ema.module
-
     checkpointer = DetectionCheckpointer(
         model,
         cfg.train.output_dir,
-        **checkpointer_kwargs,
+        trainer=trainer,
     )
 
-    def _eval_fn():
-        """Return combined dict so EvalHook pushes both raw and EMA metrics into storage."""
-        results = do_test(cfg, model) or {}
-        combined = dict(results)
-        if ema is not None:
-            ema_results = do_test_ema(cfg, ema.module) or {}
-            combined.update(ema_results)
-        return combined
-
-    ema_hook = EMAHook(ema, update_period=int(getattr(cfg.train, "ema_update_period", 1))) if ema is not None else None
-
-    # Best-checkpoint hooks. Watch bbox/AP50-novel; save a second one for EMA if enabled.
+    # Best-checkpoint hook watching bbox/AP50-novel.
     best_metric = getattr(cfg.train, "best_metric", "bbox/AP50-novel")
     best_hooks = []
     if comm.is_main_process():
@@ -277,26 +232,15 @@ def do_train(args, cfg):
                 file_prefix="model_best_novel",
             )
         )
-        if ema is not None:
-            best_hooks.append(
-                hooks.BestCheckpointer(
-                    eval_period=cfg.train.eval_period,
-                    checkpointer=checkpointer,
-                    val_metric=f"ema/{best_metric}",
-                    mode="max",
-                    file_prefix="model_best_novel_ema",
-                )
-            )
 
     trainer.register_hooks(
         [
             hooks.IterationTimer(),
             hooks.LRScheduler(scheduler=instantiate(cfg.lr_multiplier)),
-            ema_hook,
             hooks.PeriodicCheckpointer(checkpointer, **cfg.train.checkpointer)
             if comm.is_main_process()
             else None,
-            hooks.EvalHook(cfg.train.eval_period, _eval_fn),
+            hooks.EvalHook(cfg.train.eval_period, lambda: do_test(cfg, model)),
             *best_hooks,
             hooks.PeriodicWriter(
                 default_writers(cfg.train.output_dir, cfg.train.max_iter),
