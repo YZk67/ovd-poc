@@ -68,17 +68,7 @@ optimizer.betas = (0.9, 0.999)
 optimizer.weight_decay = 1e-4
 
 
-def _lr_factor(module_name):
-    if "backbone" in module_name:
-        return 0.1
-    if "class_embed" in module_name:
-        return 0.1
-    if "transformer.decoder" in module_name:
-        return 0.5
-    return 1.0
-
-
-optimizer.params.lr_factor_func = _lr_factor
+optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 1
 
 # EMA settings
 train.ema_enabled = True
