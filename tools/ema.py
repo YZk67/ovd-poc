@@ -10,10 +10,17 @@ def _unwrap(model):
 
 
 class ModelEma:
-    """Exponential moving average of model parameters/buffers."""
+    """Exponential moving average of model parameters/buffers.
 
-    def __init__(self, model, decay=0.9999, device=None):
+    Uses timm-style warmup so the EMA tracks the current model closely in early
+    iters (when decay^step is still far from 1) and gradually converges to the
+    target decay:  d_effective = min(decay, (1 + step) / (warmup_tau + step))
+    """
+
+    def __init__(self, model, decay=0.9999, warmup_tau=10.0, device=None):
         self.decay = decay
+        self.warmup_tau = float(warmup_tau)
+        self.num_updates = 0
         self.module = copy.deepcopy(_unwrap(model))
         self.module.eval()
         for p in self.module.parameters():
@@ -21,13 +28,19 @@ class ModelEma:
         if device is not None:
             self.module.to(device)
 
+    def _effective_decay(self):
+        # classic timm ModelEmaV2 warmup
+        return min(self.decay, (1.0 + self.num_updates) / (self.warmup_tau + self.num_updates))
+
     @torch.no_grad()
     def update(self, model):
+        self.num_updates += 1
+        d = self._effective_decay()
         msd = _unwrap(model).state_dict()
         for k, v in self.module.state_dict().items():
             src = msd[k].detach()
             if v.dtype.is_floating_point and src.dtype.is_floating_point:
-                v.mul_(self.decay).add_(src.to(v.dtype), alpha=1.0 - self.decay)
+                v.mul_(d).add_(src.to(v.dtype), alpha=1.0 - d)
             else:
                 v.copy_(src)
 
