@@ -66,7 +66,24 @@ model.select_box_nums_for_evaluation = 2000
 optimizer.lr = 1e-4
 optimizer.betas = (0.9, 0.999)
 optimizer.weight_decay = 1e-4
-optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 1
+
+
+def _lr_factor(module_name):
+    if "backbone" in module_name:
+        return 0.1
+    if "class_embed" in module_name:
+        return 0.1
+    if "transformer.decoder" in module_name:
+        return 0.5
+    return 1.0
+
+
+optimizer.params.lr_factor_func = _lr_factor
+
+# EMA settings
+train.ema_enabled = True
+train.ema_decay = 0.9998
+train.ema_update_period = 1
 
 # modify dataloader config
 dataloader.train.dataset.names = "ovd_coco_train_with_pseudo"
