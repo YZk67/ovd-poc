@@ -246,6 +246,7 @@ def _ovcoco_build_id_map(_json_path=None):
 
 def register_all_coco(root):
     pseudo_extra_annotation_keys = [
+        "id",
         "score",
         "is_pseudo",
         "pseudo",
