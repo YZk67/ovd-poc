@@ -16,7 +16,7 @@ from .dino_convnext_large_4scale_12ep_lvis import (
 model.vlm_distill_enabled = True
 model.vlm_distill_weight = 0.5
 model.vlm_distill_temperature = 1.0
-train.vlm_targets_path = "dataset/vlm_targets_crop/vlm_soft_targets.pth"
+train.vlm_targets_path = "dataset/vlm_targets_crop_ab_backup/vlm_soft_targets.pth"
 
 # Finetune from the iter-8999 peak produced by the no_ema_baseline run.
 train.init_checkpoint = "./output/no_ema_baseline/model_best_novel.pth"
