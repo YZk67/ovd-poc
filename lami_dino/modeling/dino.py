@@ -109,8 +109,14 @@ class DINO(nn.Module):
         beta: float =0.7,
         novel_scale: float =5.0,
         clip_head_path=None,
+        vlm_distill_enabled: bool = False,
+        vlm_distill_weight: float = 0.5,
+        vlm_distill_temperature: float = 1.0,
     ):
         super().__init__()
+        self.vlm_distill_enabled = vlm_distill_enabled
+        self.vlm_distill_weight = vlm_distill_weight
+        self.vlm_distill_temperature = vlm_distill_temperature
         self.vlm_temperature = vlm_temperature
         self.alpha = alpha
         self.beta = beta
@@ -495,6 +501,12 @@ class DINO(nn.Module):
 
         if self.training:
             loss_dict = self.criterion(output, targets, dn_meta)
+            if self.vlm_distill_enabled:
+                loss_dict.update(
+                    self._compute_vlm_distill_loss(
+                        output, targets, batched_inputs, content_inds=content_inds
+                    )
+                )
             if "proposal_unknown_mask" in output:
                 unknown_mask = output["proposal_unknown_mask"]
                 unknown_counts = unknown_mask.sum(dim=1).float()
@@ -920,6 +932,112 @@ class DINO(nn.Module):
             results.append(result)
         return results
 
+    def _compute_vlm_distill_loss(self, output, targets, batched_inputs, content_inds=None):
+        """Novel-only KL distillation on the prediction matched to each annotated GT.
+
+        For each GT box that has a VLM soft target, find the encoder proposal with
+        highest IoU (>=0.3), slice both the model logits and VLM distribution to the
+        17 novel-class dimensions, re-normalize, and accumulate KL divergence.
+        Full-65-dim KL was shown to suppress novel classes on the oracle branch.
+        """
+        from torchvision.ops import box_iou
+        from detrex.layers import box_cxcywh_to_xyxy
+
+        pred_logits = output["pred_logits"]  # [bs, nq, num_classes_sampled]
+        device = pred_logits.device
+        tau = self.vlm_distill_temperature
+
+        novel_idx_full = self.novel_idx.to(device)  # [65] bool
+        if content_inds is not None:
+            content_inds = content_inds.to(device)
+            novel_mask = novel_idx_full[content_inds]
+        else:
+            novel_mask = novel_idx_full
+
+        total_kl = torch.tensor(0.0, device=device)
+        count = 0
+        enc_boxes_all = output["enc_outputs"]["pred_boxes"]  # [bs, nq, 4]
+
+        for batch_idx, inp in enumerate(batched_inputs):
+            vlm_targets = inp.get("vlm_soft_targets", None)
+            if not vlm_targets:
+                continue
+
+            target = targets[batch_idx]
+            gt_ann_ids = target.get("ann_ids")
+            vlm_by_ann_id = None
+            if gt_ann_ids is not None:
+                vlm_by_ann_id = {
+                    int(t["ann_id"]): t
+                    for t in vlm_targets
+                    if t is not None and "ann_id" in t
+                }
+
+            gt_boxes = target["boxes"]  # [num_gt, 4] cxcywh
+            num_gt = gt_boxes.shape[0]
+            if num_gt == 0:
+                continue
+
+            enc_boxes_xyxy = box_cxcywh_to_xyxy(enc_boxes_all[batch_idx])
+
+            for gt_idx in range(num_gt):
+                if vlm_by_ann_id is not None and gt_ann_ids is not None:
+                    vlm_t = vlm_by_ann_id.get(int(gt_ann_ids[gt_idx].item()))
+                elif gt_idx < len(vlm_targets):
+                    vlm_t = vlm_targets[gt_idx]
+                else:
+                    vlm_t = None
+                if vlm_t is None:
+                    continue
+
+                sim_dist = vlm_t.get("similarity_distribution", None)
+                if sim_dist is None:
+                    continue
+                sim_dist = torch.as_tensor(sim_dist, device=device, dtype=torch.float32)
+
+                vlm_novel = sim_dist[novel_idx_full]  # [17]
+                vlm_novel_sum = vlm_novel.sum()
+                if vlm_novel_sum < 1e-6:
+                    continue
+                vlm_novel = vlm_novel / vlm_novel_sum
+
+                gt_box_xyxy = box_cxcywh_to_xyxy(gt_boxes[gt_idx].unsqueeze(0))
+                ious = box_iou(gt_box_xyxy, enc_boxes_xyxy)[0]
+                best_idx = ious.argmax()
+                if ious[best_idx] < 0.3:
+                    continue
+
+                pred_novel = pred_logits[batch_idx, best_idx][novel_mask] / tau
+                if pred_novel.shape[0] < 2:
+                    continue
+
+                # When fed_loss subsamples classes, vlm_novel must be sliced to the
+                # subset of novel classes that survived sampling.
+                if content_inds is not None:
+                    novel_full_ids = torch.where(novel_idx_full)[0]
+                    sampled_mask = torch.isin(content_inds, novel_full_ids)
+                    sampled_novel_ids = content_inds[sampled_mask]
+                    positions = [
+                        (novel_full_ids == cid.item()).nonzero(as_tuple=True)[0].item()
+                        for cid in sampled_novel_ids
+                    ]
+                    vlm_novel_sub = vlm_novel[positions]
+                    s = vlm_novel_sub.sum()
+                    if s < 1e-6:
+                        continue
+                    vlm_novel_sub = vlm_novel_sub / s
+                else:
+                    vlm_novel_sub = vlm_novel
+
+                pred_log_prob = pred_novel.log_softmax(dim=-1)
+                total_kl = total_kl + F.kl_div(pred_log_prob, vlm_novel_sub, reduction="sum")
+                count += 1
+
+        if count > 0:
+            total_kl = total_kl / count
+        # Return loss even when count==0 so DDP sees the same key every step.
+        return {"loss_vlm_distill": total_kl * self.vlm_distill_weight}
+
     def prepare_targets(self, targets):
         new_targets = []
         for targets_per_image in targets:
@@ -948,6 +1066,8 @@ class DINO(nn.Module):
                 target_dict["pseudo_weight"] = targets_per_image.gt_pseudo_weight.to(
                     device=self.device, dtype=torch.float32
                 )
+            if targets_per_image.has("gt_ann_ids"):
+                target_dict["ann_ids"] = targets_per_image.gt_ann_ids.to(self.device)
             new_targets.append(
                 target_dict
             )

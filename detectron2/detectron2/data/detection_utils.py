@@ -451,6 +451,10 @@ def annotations_to_instances(annos, image_size, mask_format="polygon"):
     classes = torch.tensor(classes, dtype=torch.int64)
     target.gt_classes = classes
 
+    if len(annos) and "id" in annos[0]:
+        ann_ids = [int(obj["id"]) for obj in annos]
+        target.gt_ann_ids = torch.tensor(ann_ids, dtype=torch.int64)
+
     if "score" in annos[0]:
         scores = [obj['score'] for obj in annos]
         scores = torch.tensor(scores)

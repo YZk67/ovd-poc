@@ -74,6 +74,9 @@ class Trainer(SimpleTrainer):
         # gradient clip hyper-params
         self.clip_grad_params = clip_grad_params
 
+        # VLM distillation injector (set by do_train when cfg enables it)
+        self.vlm_injector = None
+
     def run_step(self):
         """
         Implement the standard training logic described above.
@@ -87,6 +90,8 @@ class Trainer(SimpleTrainer):
         If you want to do something with the data, you can wrap the dataloader.
         """
         data = next(self._data_loader_iter)
+        if self.vlm_injector is not None:
+            data = self.vlm_injector.inject(data)
         data_time = time.perf_counter() - start
 
         """
@@ -212,6 +217,16 @@ def do_train(args, cfg):
         amp=cfg.train.amp.enabled,
         clip_grad_params=cfg.train.clip_grad.params if cfg.train.clip_grad.enabled else None,
     )
+
+    # VLM distillation: attach injector if model opts in and a targets file is configured.
+    raw_model = model.module if hasattr(model, "module") else model
+    if getattr(raw_model, "vlm_distill_enabled", False):
+        vlm_targets_path = getattr(cfg.train, "vlm_targets_path", None)
+        if vlm_targets_path:
+            from lami_dino.modeling.vlm_distill import VLMSoftTargetInjector
+            trainer.vlm_injector = VLMSoftTargetInjector(vlm_targets_path)
+        else:
+            logger.warning("vlm_distill_enabled=True but train.vlm_targets_path is not set")
 
     checkpointer = DetectionCheckpointer(
         model,
