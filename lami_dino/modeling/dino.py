@@ -956,6 +956,9 @@ class DINO(nn.Module):
 
         total_kl = torch.tensor(0.0, device=device)
         count = 0
+        # Per-filter drop breakdown (first few calls only).
+        diag = {"seen": 0, "no_sim": 0, "zero_novel": 0, "low_iou": 0,
+                "too_few_pred": 0, "empty_content_novel": 0, "ok": 0}
         enc_boxes_all = output["enc_outputs"]["pred_boxes"]  # [bs, nq, 4]
 
         for batch_idx, inp in enumerate(batched_inputs):
@@ -989,15 +992,18 @@ class DINO(nn.Module):
                     vlm_t = None
                 if vlm_t is None:
                     continue
+                diag["seen"] += 1
 
                 sim_dist = vlm_t.get("similarity_distribution", None)
                 if sim_dist is None:
+                    diag["no_sim"] += 1
                     continue
                 sim_dist = torch.as_tensor(sim_dist, device=device, dtype=torch.float32)
 
                 vlm_novel = sim_dist[novel_idx_full]  # [17]
                 vlm_novel_sum = vlm_novel.sum()
                 if vlm_novel_sum < 1e-6:
+                    diag["zero_novel"] += 1
                     continue
                 vlm_novel = vlm_novel / vlm_novel_sum
 
@@ -1005,10 +1011,12 @@ class DINO(nn.Module):
                 ious = box_iou(gt_box_xyxy, enc_boxes_xyxy)[0]
                 best_idx = ious.argmax()
                 if ious[best_idx] < 0.3:
+                    diag["low_iou"] += 1
                     continue
 
                 pred_novel = pred_logits[batch_idx, best_idx][novel_mask] / tau
                 if pred_novel.shape[0] < 2:
+                    diag["too_few_pred"] += 1
                     continue
 
                 # When fed_loss subsamples classes, vlm_novel must be sliced to the
@@ -1024,6 +1032,7 @@ class DINO(nn.Module):
                     vlm_novel_sub = vlm_novel[positions]
                     s = vlm_novel_sub.sum()
                     if s < 1e-6:
+                        diag["empty_content_novel"] += 1
                         continue
                     vlm_novel_sub = vlm_novel_sub / s
                 else:
@@ -1032,9 +1041,23 @@ class DINO(nn.Module):
                 pred_log_prob = pred_novel.log_softmax(dim=-1)
                 total_kl = total_kl + F.kl_div(pred_log_prob, vlm_novel_sub, reduction="sum")
                 count += 1
+                diag["ok"] += 1
 
         if count > 0:
             total_kl = total_kl / count
+
+        # Per-call filter breakdown for the first few calls (debug only).
+        if not hasattr(self, "_distill_diag_remaining"):
+            self._distill_diag_remaining = 5
+        if self._distill_diag_remaining > 0:
+            import logging as _logging
+            _logging.getLogger("detectron2.vlm_distill").warning(
+                f"[VLM distill] call diag: count={count} loss={float(total_kl):.4f} "
+                f"content_inds_len={None if content_inds is None else int(content_inds.numel())} "
+                f"{diag}"
+            )
+            self._distill_diag_remaining -= 1
+
         # Return loss even when count==0 so DDP sees the same key every step.
         return {"loss_vlm_distill": total_kl * self.vlm_distill_weight}
 
