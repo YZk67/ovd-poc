@@ -45,6 +45,7 @@ import torch.nn.functional as F
 
 from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.config import LazyConfig, instantiate
+from detectron2.data import DatasetCatalog
 from detectron2.utils.logger import setup_logger
 
 logger = logging.getLogger("diag.encoder_topk")
@@ -129,6 +130,43 @@ def run_encoder_only(model, batched_inputs) -> Tuple[torch.Tensor, torch.Tensor,
     return enc_logits, enc_ref, images.image_sizes, (H_pad, W_pad)
 
 
+def _build_gt_index(dataset_name: str, device: str) -> Dict[int, Dict[str, Any]]:
+    """Return {image_id: {'boxes_xyxy_orig': [N,4] tensor, 'classes': [N] tensor,
+                          'orig_h': int, 'orig_w': int}}.
+
+    The test-time DetrDatasetMapper drops GT instances (LVIS/COCO evaluators read
+    GT from the raw JSON, not from the batch), so we rebuild it here directly
+    from DatasetCatalog. Boxes are in ORIGINAL image coords (XYXY absolute);
+    caller must scale to the model's resized coord system.
+    """
+    dicts = DatasetCatalog.get(dataset_name)
+    gt: Dict[int, Dict[str, Any]] = {}
+    skipped_crowd = 0
+    for d in dicts:
+        img_id = d.get("image_id")
+        if img_id is None:
+            continue
+        boxes, classes = [], []
+        for ann in d.get("annotations", []):
+            if ann.get("iscrowd", 0):
+                skipped_crowd += 1
+                continue
+            x, y, w, h = ann["bbox"]
+            boxes.append([x, y, x + w, y + h])
+            classes.append(int(ann["category_id"]))
+        gt[img_id] = {
+            "boxes_xyxy_orig": torch.tensor(boxes, dtype=torch.float32, device=device)
+                if boxes else torch.zeros((0, 4), dtype=torch.float32, device=device),
+            "classes": torch.tensor(classes, dtype=torch.long, device=device)
+                if classes else torch.zeros((0,), dtype=torch.long, device=device),
+            "orig_h": int(d.get("height", 0)),
+            "orig_w": int(d.get("width", 0)),
+        }
+    logger.info(f"Built GT index for {dataset_name}: {len(gt)} images, "
+                f"skipped {skipped_crowd} crowd annotations")
+    return gt
+
+
 def _load_class_groups(path: Optional[str]) -> Optional[Dict[int, str]]:
     if not path:
         return None
@@ -186,6 +224,12 @@ def main():
     logger.info("Building eval dataloader from cfg.dataloader.test ...")
     dataloader = instantiate(cfg.dataloader.test)
 
+    # Build GT index directly from DatasetCatalog (test mapper drops instances).
+    dataset_name = cfg.dataloader.test.dataset.names
+    if isinstance(dataset_name, (list, tuple)):
+        dataset_name = dataset_name[0]
+    gt_by_image_id = _build_gt_index(dataset_name, args.device)
+
     # Resolve stratification.
     base_mask = None
     if hasattr(model, "base_idx") and isinstance(model.base_idx, torch.Tensor):
@@ -222,16 +266,27 @@ def main():
             processed += 1
 
             inp = batch[b]
-            gt_inst = inp.get("instances", None)
-            if gt_inst is None or len(gt_inst) == 0:
+            img_id = inp.get("image_id")
+            entry = gt_by_image_id.get(img_id) if img_id is not None else None
+            if entry is None or entry["classes"].numel() == 0:
                 continue
 
-            # GT boxes are in the post-resize (pre-pad) coords: [0, img_h] x [0, img_w].
-            # Encoder proposals are normalized to the padded image (H_pad, W_pad).
-            # Padding is at bottom-right, so they share the same top-left origin and
-            # we can bring proposals to absolute-padded coords with (W_pad, H_pad).
-            gt_boxes = gt_inst.gt_boxes.tensor.to(enc_logits.device).float()  # xyxy abs
-            gt_classes = gt_inst.gt_classes.to(enc_logits.device).long()
+            # GT from DatasetCatalog is in ORIGINAL image coords.
+            # Encoder proposals are normalized cxcywh in (H_pad, W_pad) coord system,
+            # where (H_pad, W_pad) is the batch-padded resized image.
+            # Scale GT: original -> resized (the resize factor equals the
+            # per-image image_sizes ratio over original h/w).
+            H_resize, W_resize = image_sizes[b]
+            orig_h, orig_w = entry["orig_h"], entry["orig_w"]
+            if orig_h <= 0 or orig_w <= 0:
+                continue
+            sx = W_resize / float(orig_w)
+            sy = H_resize / float(orig_h)
+            scale_gt = torch.tensor([sx, sy, sx, sy],
+                                    dtype=torch.float32,
+                                    device=enc_logits.device)
+            gt_boxes = entry["boxes_xyxy_orig"].to(enc_logits.device) * scale_gt
+            gt_classes = entry["classes"].to(enc_logits.device)
 
             ref_b = enc_ref[b]  # [topk, 4] normalized cxcywh
             pred_xyxy = box_cxcywh_to_xyxy(ref_b)
