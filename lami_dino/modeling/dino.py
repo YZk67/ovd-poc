@@ -112,13 +112,11 @@ class DINO(nn.Module):
         vlm_distill_enabled: bool = False,
         vlm_distill_weight: float = 0.5,
         vlm_distill_temperature: float = 1.0,
-        vlm_distill_novel_mass_threshold: float = 1e-6,
     ):
         super().__init__()
         self.vlm_distill_enabled = vlm_distill_enabled
         self.vlm_distill_weight = vlm_distill_weight
         self.vlm_distill_temperature = vlm_distill_temperature
-        self.vlm_distill_novel_mass_threshold = float(vlm_distill_novel_mass_threshold)
         self.vlm_temperature = vlm_temperature
         self.alpha = alpha
         self.beta = beta
@@ -1004,7 +1002,7 @@ class DINO(nn.Module):
 
                 vlm_novel = sim_dist[novel_idx_full]  # [17]
                 vlm_novel_sum = vlm_novel.sum()
-                if vlm_novel_sum < self.vlm_distill_novel_mass_threshold:
+                if vlm_novel_sum < 1e-6:
                     diag["zero_novel"] += 1
                     continue
                 vlm_novel = vlm_novel / vlm_novel_sum
