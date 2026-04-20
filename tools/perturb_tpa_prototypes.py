@@ -29,7 +29,7 @@ def main():
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
-    state = torch.load(args.ckpt_in, map_location="cpu", weights_only=False)
+    state = torch.load(args.ckpt_in, map_location="cpu")
     model_sd = state["model"] if isinstance(state, dict) and "model" in state else state
 
     touched = []
