@@ -30,7 +30,7 @@ train.seed = 42  # Fixed seed for fair comparison
 
 # modify training config
 # train.init_checkpoint = "clip_convnext_large_trans.pth"
-train.init_checkpoint = "./pretrained_models/lami_convnext_large_12ep_lvis/model_final.pth"
+train.init_checkpoint = "/root/lami_convnext_large_12ep_lvis_20260419_132029/model_perturbed.pth"
 # Add timestamp to output directory
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 # resume training from the last checkpoint
