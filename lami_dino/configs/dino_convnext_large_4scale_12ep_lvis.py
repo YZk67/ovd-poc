@@ -53,7 +53,7 @@ train.max_iter = 85200 #85200  # Single GPU A100 4 epochs 12 epochs with batch s
 train.eval_period = 99999999  # Evaluate after each epoch 7100//2
 
 # log training infomation every 20 iters
-train.log_period = 50
+train.log_period = 200
 
 # save checkpoint every 3130 iters
 train.checkpointer.period = 7100  # 1 epoch worth of iterations
