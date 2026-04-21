@@ -96,6 +96,10 @@ class DINO(nn.Module):
         alpha: float =0.3,
         beta: float =0.7,
         novel_scale: float =5.0,
+        analogical_rerank: bool = False,
+        analogical_topk: int = 5,
+        analogical_gamma: float = 0.2,
+        analogical_tau: float = 0.07,
         clip_head_path=None,
         use_soft_attention: bool = True,
         soft_attention_tau: float = 0.1,
@@ -105,6 +109,10 @@ class DINO(nn.Module):
         self.alpha = alpha
         self.beta = beta
         self.novel_scale = novel_scale
+        self.analogical_rerank = analogical_rerank
+        self.analogical_topk = analogical_topk
+        self.analogical_gamma = analogical_gamma
+        self.analogical_tau = analogical_tau
         self.use_soft_attention = use_soft_attention
         self.soft_attention_tau = soft_attention_tau
         # define backbone and position embedding module
@@ -290,6 +298,66 @@ class DINO(nn.Module):
         
         else:
             raise ValueError(f"Unknown aggregation method: {method}")
+
+    def _apply_analogical_rerank(self, cls_score):
+        """Rerank only novel scores with a region-conditioned analogical text concept.
+
+        The rerank is conservative by design:
+        - only applied during score-ensemble inference;
+        - only applied to queries that already look novel-leaning;
+        - base-class scores remain exactly unchanged.
+        """
+        if not self.analogical_rerank or self.analogical_gamma <= 0:
+            return cls_score
+
+        base_scores = cls_score[:, :, self.base_idx]
+        novel_scores = cls_score[:, :, self.novel_idx]
+        if base_scores.shape[-1] == 0 or novel_scores.shape[-1] == 0:
+            return cls_score
+
+        novel_leaning = novel_scores.max(dim=-1).values >= base_scores.max(dim=-1).values
+        if not bool(novel_leaning.any()):
+            return cls_score
+
+        topk = min(int(self.analogical_topk), base_scores.shape[-1])
+        if topk <= 0:
+            return cls_score
+
+        tau = max(float(self.analogical_tau), 1e-6)
+        base_topk_scores, base_topk_idx = torch.topk(base_scores, topk, dim=-1)
+        base_weights = F.softmax(base_topk_scores / tau, dim=-1)
+
+        text_prototypes = self.eval_content_query_embedding
+        class_embed = getattr(self, "class_embed", None)
+        text_classifier = class_embed[-1] if isinstance(class_embed, nn.ModuleList) else None
+        if text_classifier is not None and hasattr(text_classifier, "eval_text_feats"):
+            text_prototypes = text_classifier.eval_text_feats
+            if text_prototypes.ndim == 3:
+                text_prototypes = text_prototypes.mean(dim=1)
+            text_prototypes = F.normalize(text_prototypes.to(cls_score.device), p=2, dim=-1)
+
+        base_text = text_prototypes[self.base_idx]
+        novel_text = text_prototypes[self.novel_idx]
+        analogical_text = base_text[base_topk_idx]
+        analogical_concept = F.normalize(
+            (base_weights.unsqueeze(-1) * analogical_text).sum(dim=-2), p=2, dim=-1
+        )
+
+        concept_sim = analogical_concept @ novel_text.t()
+        concept_prior = F.softmax(concept_sim / tau, dim=-1)
+
+        eps = torch.finfo(novel_scores.dtype).tiny
+        reranked_novel_scores = novel_scores.clamp_min(eps).pow(1.0 - self.analogical_gamma)
+        reranked_novel_scores = reranked_novel_scores * concept_prior.clamp_min(eps).pow(
+            self.analogical_gamma
+        )
+        updated_novel_scores = torch.where(
+            novel_leaning.unsqueeze(-1), reranked_novel_scores, novel_scores
+        )
+
+        cls_score = cls_score.clone()
+        cls_score[:, :, self.novel_idx] = updated_novel_scores
+        return cls_score
 
     def filter_content_info(self, batched_inputs):
         """
@@ -584,6 +652,7 @@ class DINO(nn.Module):
                         1 - self.alpha) * vlm_score[:, :, self.base_idx] ** self.alpha
                 cls_score[:, :, self.novel_idx] = cls_score[:, :, self.novel_idx] ** (
                         1 - self.beta) * vlm_score[:, :, self.novel_idx] ** self.beta 
+                cls_score = self._apply_analogical_rerank(cls_score)
                 cls_score[:, :, self.novel_idx] = cls_score[:, :, self.novel_idx] * self.novel_scale
                 box_cls = cls_score
                 results = self.inference(box_cls, box_pred, images.image_sizes, wo_sigmoid=True)
