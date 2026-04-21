@@ -16,8 +16,6 @@ model.vlm_temperature = 100.0 # keep same with f-vlm
 model.alpha = 0.0
 model.beta = 0.4
 model.novel_scale = 2.0  # was 5.0; ablation showed ns=2.0 gives AP 41.79 vs 39.00 at ns=5.0 on lvis_v1_val (ckpt=model_0042599)
-model.encoder_apr_weight = 1.0
-model.decoder_apr_weight = 0.2  # keep decoder APR active, but avoid over-regularizing decoder logits and hurting APr
 
 # get default config
 dataloader = get_config("common/data/lvis_detr.py").dataloader
@@ -31,7 +29,8 @@ train.seed = 42  # Fixed seed for fair comparison
 
 
 # modify training config
-train.init_checkpoint = "./pretrained_models/clip_convnext_large_trans.pth"
+# train.init_checkpoint = "clip_convnext_large_trans.pth"
+train.init_checkpoint = "./pretrained_models/lami_convnext_large_12ep_lvis/model_final.pth"
 # Add timestamp to output directory
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 # resume training from the last checkpoint
@@ -54,7 +53,7 @@ train.max_iter = 85200 #85200  # Single GPU A100 4 epochs 12 epochs with batch s
 train.eval_period = 99999999  # Evaluate after each epoch 7100//2
 
 # log training infomation every 20 iters
-train.log_period = 200
+train.log_period = 50
 
 # save checkpoint every 3130 iters
 train.checkpointer.period = 7100  # 1 epoch worth of iterations
