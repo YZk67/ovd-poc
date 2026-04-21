@@ -100,6 +100,8 @@ class DINO(nn.Module):
         analogical_topk: int = 5,
         analogical_gamma: float = 0.2,
         analogical_tau: float = 0.07,
+        analogical_tau_base: float = 0.1,
+        analogical_tau_concept: float = 0.2,
         clip_head_path=None,
         use_soft_attention: bool = True,
         soft_attention_tau: float = 0.1,
@@ -113,6 +115,8 @@ class DINO(nn.Module):
         self.analogical_topk = analogical_topk
         self.analogical_gamma = analogical_gamma
         self.analogical_tau = analogical_tau
+        self.analogical_tau_base = analogical_tau_base
+        self.analogical_tau_concept = analogical_tau_concept
         self.use_soft_attention = use_soft_attention
         self.soft_attention_tau = soft_attention_tau
         # define backbone and position embedding module
@@ -323,18 +327,29 @@ class DINO(nn.Module):
         if topk <= 0:
             return cls_score
 
-        tau = max(float(self.analogical_tau), 1e-6)
+        tau_base = max(float(self.analogical_tau_base), 1e-6)
+        tau_concept = max(float(self.analogical_tau_concept), 1e-6)
         base_topk_scores, base_topk_idx = torch.topk(base_scores, topk, dim=-1)
-        base_weights = F.softmax(base_topk_scores / tau, dim=-1)
+        base_weights = F.softmax(base_topk_scores / tau_base, dim=-1)
 
-        text_prototypes = self.eval_content_query_embedding
+        text_prototypes = None
         class_embed = getattr(self, "class_embed", None)
         text_classifier = class_embed[-1] if isinstance(class_embed, nn.ModuleList) else None
-        if text_classifier is not None and hasattr(text_classifier, "eval_text_feats"):
+        cached_eval = getattr(text_classifier, "_cached_eval", None) if text_classifier is not None else None
+        if cached_eval is not None:
+            text_prototypes = cached_eval
+            if text_prototypes.ndim == 3:
+                text_prototypes = text_prototypes.mean(dim=1)
+            text_prototypes = F.normalize(text_prototypes.to(cls_score.device), p=2, dim=-1)
+        elif text_classifier is not None and hasattr(text_classifier, "eval_text_feats"):
             text_prototypes = text_classifier.eval_text_feats
             if text_prototypes.ndim == 3:
                 text_prototypes = text_prototypes.mean(dim=1)
             text_prototypes = F.normalize(text_prototypes.to(cls_score.device), p=2, dim=-1)
+        else:
+            text_prototypes = F.normalize(
+                self.eval_content_query_embedding.to(cls_score.device), p=2, dim=-1
+            )
 
         base_text = text_prototypes[self.base_idx]
         novel_text = text_prototypes[self.novel_idx]
@@ -344,7 +359,7 @@ class DINO(nn.Module):
         )
 
         concept_sim = analogical_concept @ novel_text.t()
-        concept_prior = F.softmax(concept_sim / tau, dim=-1)
+        concept_prior = F.softmax(concept_sim / tau_concept, dim=-1)
 
         eps = torch.finfo(novel_scores.dtype).tiny
         reranked_novel_scores = novel_scores.clamp_min(eps).pow(1.0 - self.analogical_gamma)

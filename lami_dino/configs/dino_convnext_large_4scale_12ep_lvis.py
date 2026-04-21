@@ -20,6 +20,8 @@ model.analogical_rerank = True
 model.analogical_topk = 5
 model.analogical_gamma = 0.2
 model.analogical_tau = 0.07
+model.analogical_tau_base = 0.1
+model.analogical_tau_concept = 0.2
 
 # get default config
 dataloader = get_config("common/data/lvis_detr.py").dataloader

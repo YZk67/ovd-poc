@@ -47,6 +47,9 @@ def test_analogical_rerank_preserves_shape_and_base_scores():
     model.analogical_topk = 2
     model.analogical_gamma = 0.2
     model.analogical_tau = 0.07
+    model.analogical_tau_base = 0.1
+    model.analogical_tau_concept = 0.2
+    model.class_embed = None
     model.base_idx = torch.tensor([True, True, False, False])
     model.novel_idx = torch.tensor([False, False, True, True])
     model.eval_content_query_embedding = F.normalize(
