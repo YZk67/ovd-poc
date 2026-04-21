@@ -361,11 +361,13 @@ class DINO(nn.Module):
         concept_sim = analogical_concept @ novel_text.t()
         concept_prior = F.softmax(concept_sim / tau_concept, dim=-1)
 
-        eps = torch.finfo(novel_scores.dtype).tiny
-        reranked_novel_scores = novel_scores.clamp_min(eps).pow(1.0 - self.analogical_gamma)
-        reranked_novel_scores = reranked_novel_scores * concept_prior.clamp_min(eps).pow(
-            self.analogical_gamma
-        )
+        # Additive-relative boost: 1 + gamma * (prior / mean(prior) - 1).
+        # Uniform prior -> boost == 1 (no change), peaked prior -> boost > 1 on the
+        # favored classes and mildly < 1 elsewhere (bounded below by 1 - gamma).
+        num_novel = novel_scores.shape[-1]
+        prior_ratio = concept_prior * float(num_novel)  # equivalent to prior / (1/N)
+        boost = (1.0 + self.analogical_gamma * (prior_ratio - 1.0)).clamp_min(0.0)
+        reranked_novel_scores = novel_scores * boost
         updated_novel_scores = torch.where(
             novel_leaning.unsqueeze(-1), reranked_novel_scores, novel_scores
         )
