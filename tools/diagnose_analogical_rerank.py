@@ -143,25 +143,20 @@ def _install_captures(model):
 
     model._apply_analogical_rerank = types.MethodType(rerank_with_capture, model)
 
-    orig_inference = model.inference
+    orig_inference = model.inference  # already a bound method
 
     def inference_with_capture(*args, **kwargs):
-        # signature: (self, box_cls, box_pred, image_sizes, wo_sigmoid=...)
-        # When called as bound method via monkey-patch, args[0] is self; but we used
-        # types.MethodType below so args does NOT include self. Handle both.
-        if len(args) >= 3 and isinstance(args[0], torch.Tensor):
-            box_cls, box_pred, image_sizes = args[0], args[1], args[2]
-        else:
-            box_cls = kwargs.get("box_cls", args[1])
-            box_pred = kwargs.get("box_pred", args[2])
-            image_sizes = kwargs.get("image_sizes", args[3])
+        # Bound directly as an instance attribute (no MethodType) so no self is injected.
+        # Caller signature: inference(box_cls, box_pred, image_sizes, wo_sigmoid=...)
+        box_pred = kwargs.get("box_pred", args[1])
+        image_sizes = kwargs.get("image_sizes", args[2])
         pending["box_pred"] = box_pred.detach().cpu()
         pending["image_sizes"] = list(image_sizes)
         captures.append(dict(pending))
         pending.clear()
         return orig_inference(*args, **kwargs)
 
-    model.inference = types.MethodType(inference_with_capture, model)
+    model.inference = inference_with_capture  # instance attr shadows class method
     return captures
 
 
