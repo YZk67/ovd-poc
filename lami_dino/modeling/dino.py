@@ -96,6 +96,8 @@ class DINO(nn.Module):
         alpha: float =0.3,
         beta: float =0.7,
         novel_scale: float =5.0,
+        encoder_apr_weight: float = 1.0,
+        decoder_apr_weight: float = 1.0,
         clip_head_path=None,
         use_soft_attention: bool = True,
         soft_attention_tau: float = 0.1,
@@ -105,6 +107,8 @@ class DINO(nn.Module):
         self.alpha = alpha
         self.beta = beta
         self.novel_scale = novel_scale
+        self.encoder_apr_weight = float(encoder_apr_weight)
+        self.decoder_apr_weight = float(decoder_apr_weight)
         self.use_soft_attention = use_soft_attention
         self.soft_attention_tau = soft_attention_tau
         # define backbone and position embedding module
@@ -552,20 +556,22 @@ class DINO(nn.Module):
 
         if self.training:
             loss_dict = self.criterion(output, targets, dn_meta)
-            # Aggregate APR loss from every classifier head (encoder + 6 decoder layers),
-            # not just the encoder-side one. Previously only class_embed[-1].apr_loss
-            # flowed into the total loss, so the 6 decoder-layer TPAs received no direct
-            # APR gradient and their prototype_queries drifted toward collinearity under
-            # classification loss alone (diagnose_tpa_prototypes.py on 6-epoch LVIS ckpt
-            # showed |cos|=0.65-0.73 on class_embed[0..5] vs 0.36 on class_embed[6]).
-            # Mean (not sum) keeps total-loss magnitude stable while giving every TPA gradient.
-            apr_losses = [apr_loss] if apr_loss is not None else []
+            # Aggregate APR losses from every classifier head. The encoder-side TPA is
+            # the most directly relevant head for proposal scoring, so keep it at full
+            # weight by default and allow decoder TPAs to be down-weighted via config.
+            # This keeps the decoder regularizer from dominating score calibration.
+            apr_losses = []
+            apr_weight_sum = 0.0
+            if apr_loss is not None and self.encoder_apr_weight > 0:
+                apr_losses.append(apr_loss * self.encoder_apr_weight)
+                apr_weight_sum += self.encoder_apr_weight
             for lvl_cls in self.class_embed[:-1]:
                 lvl_apr = getattr(lvl_cls, "apr_loss", None)
-                if lvl_apr is not None:
-                    apr_losses.append(lvl_apr)
-            if apr_losses:
-                loss_dict["loss_apr"] = sum(apr_losses) / len(apr_losses)
+                if lvl_apr is not None and self.decoder_apr_weight > 0:
+                    apr_losses.append(lvl_apr * self.decoder_apr_weight)
+                    apr_weight_sum += self.decoder_apr_weight
+            if apr_losses and apr_weight_sum > 0:
+                loss_dict["loss_apr"] = sum(apr_losses) / apr_weight_sum
             weight_dict = self.criterion.weight_dict
             for k in loss_dict.keys():
                 if k in weight_dict:

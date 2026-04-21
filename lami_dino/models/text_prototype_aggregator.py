@@ -57,9 +57,9 @@ class TextPrototypeAggregator(nn.Module):
 
         # buffers
         self.register_buffer("_eye_buffer", torch.eye(num_prototypes), persistent=False)
+        self.register_buffer("_step_buffer", torch.zeros((), dtype=torch.long), persistent=True)
         self._logger = logging.getLogger("lami_dino.tpa")
         self.log_interval = int(log_interval)
-        self._step = 0
 
         # caches
         self.last_loss_terms: Dict[str, float] = {}
@@ -86,12 +86,16 @@ class TextPrototypeAggregator(nn.Module):
         if self.warmup_steps <= 0:
             return self.lambda_orth_base, self.lambda_div_base
 
-        progress = min(1.0, (self._step + 1) / float(self.warmup_steps))
+        progress = min(1.0, (self.step + 1) / float(self.warmup_steps))
         # cosine warm-up: 0 → 1
         factor = 0.5 * (1.0 - math.cos(math.pi * progress))
         lam_orth = self.lambda_orth_base * factor
         lam_div = self.lambda_div_base * factor
         return lam_orth, lam_div
+
+    @property
+    def step(self) -> int:
+        return int(self._step_buffer.item())
 
 
     # === forward ===
@@ -170,16 +174,16 @@ class TextPrototypeAggregator(nn.Module):
 
     # === logging ===
     def _maybe_log(self, apr_value):
-        self._step += 1
-        if (not self._logger) or (self.training and self._step % self.log_interval != 0):
+        self._step_buffer.add_(1)
+        if (not self._logger) or (self.training and self.step % self.log_interval != 0):
             return
         if not _is_main_process():
             return
-        monitor = monitor_prototype_metrics(self._last_prototypes, self._last_logits, step=self._step)
+        monitor = monitor_prototype_metrics(self._last_prototypes, self._last_logits, step=self.step)
         if monitor:
             self.last_monitor_terms.update(monitor)
         msg = (
-            f"[TPA] step={self._step:06d} "
+            f"[TPA] step={self.step:06d} "
             f"orth_off={monitor.get('orth_off_mse', 0):.4f} "
             f"diag_mse={monitor.get('diag_mse', 0):.4f} "
             f"usage_entropy={monitor.get('usage_entropy', 0):.4f} "

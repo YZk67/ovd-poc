@@ -16,6 +16,8 @@ model.vlm_temperature = 100.0 # keep same with f-vlm
 model.alpha = 0.0
 model.beta = 0.4
 model.novel_scale = 2.0  # was 5.0; ablation showed ns=2.0 gives AP 41.79 vs 39.00 at ns=5.0 on lvis_v1_val (ckpt=model_0042599)
+model.encoder_apr_weight = 1.0
+model.decoder_apr_weight = 0.2  # keep decoder APR active, but avoid over-regularizing decoder logits and hurting APr
 
 # get default config
 dataloader = get_config("common/data/lvis_detr.py").dataloader
