@@ -36,6 +36,8 @@ class TextPrototypeAggregator(nn.Module):
         *,
         lambda_orth: float = 0.10,     # ↑ from 0.08 → 0.10
         lambda_div: float = 0.03,      # ↑ from 0.02 → 0.03
+        apr_on_base_only: bool = False,
+        novel_anchor_weight: float = 0.0,
         warmup_steps: int = warmup_steps,      # new: smooth ramp-up
         log_interval: int = 200,
     ) -> None:
@@ -47,6 +49,8 @@ class TextPrototypeAggregator(nn.Module):
         self.tau = max(float(tau), 1e-6)
         self.lambda_orth_base = float(lambda_orth)
         self.lambda_div_base = float(lambda_div)
+        self.apr_on_base_only = bool(apr_on_base_only)
+        self.lambda_novel_anchor = float(novel_anchor_weight)
         self.warmup_steps = int(warmup_steps)
 
         # projections
@@ -57,6 +61,8 @@ class TextPrototypeAggregator(nn.Module):
 
         # buffers
         self.register_buffer("_eye_buffer", torch.eye(num_prototypes), persistent=False)
+        self.register_buffer("base_class_mask", torch.empty(0, dtype=torch.bool), persistent=False)
+        self.register_buffer("novel_class_mask", torch.empty(0, dtype=torch.bool), persistent=False)
         self._logger = logging.getLogger("lami_dino.tpa")
         self.log_interval = int(log_interval)
         self._step = 0
@@ -93,9 +99,43 @@ class TextPrototypeAggregator(nn.Module):
         lam_div = self.lambda_div_base * factor
         return lam_orth, lam_div
 
+    def set_class_splits(
+        self,
+        base_mask: Optional[torch.Tensor] = None,
+        novel_mask: Optional[torch.Tensor] = None,
+    ) -> None:
+        if base_mask is None or novel_mask is None:
+            self.base_class_mask = torch.empty(0, dtype=torch.bool, device=self.prototype_queries.device)
+            self.novel_class_mask = torch.empty(0, dtype=torch.bool, device=self.prototype_queries.device)
+            return
+        self.base_class_mask = torch.as_tensor(base_mask, dtype=torch.bool, device=self.prototype_queries.device).clone()
+        self.novel_class_mask = torch.as_tensor(novel_mask, dtype=torch.bool, device=self.prototype_queries.device).clone()
+
+    def _resolve_class_mask(
+        self,
+        mask: torch.Tensor,
+        class_inds: Optional[torch.Tensor],
+        *,
+        num_classes: int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if mask.numel() == 0:
+            return None
+        resolved = mask
+        if class_inds is not None:
+            class_inds = class_inds.to(device=resolved.device, dtype=torch.long)
+            resolved = resolved.index_select(0, class_inds.reshape(-1))
+        if resolved.numel() != num_classes:
+            return None
+        return resolved.to(device=device)
 
     # === forward ===
-    def forward(self, text_feats: torch.Tensor, with_loss: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        text_feats: torch.Tensor,
+        with_loss: bool = True,
+        class_inds: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert text_feats.ndim == 3, f"Expected [C,N,D], got {text_feats.shape}"
         C, N, D = text_feats.shape
 
@@ -114,25 +154,53 @@ class TextPrototypeAggregator(nn.Module):
 
         apr_loss = None
         if with_loss:
-            apr_loss = self.compute_apr_loss(prototypes_clean, logits)
+            apr_loss = self.compute_apr_loss(prototypes_clean, logits, text_feats, class_inds=class_inds)
             apr_value = apr_loss.detach()
         else:
-            apr_value = self._update_metrics_no_grad(prototypes_clean.detach(), logits.detach())
+            apr_value = self._update_metrics_no_grad(
+                prototypes_clean.detach(),
+                logits.detach(),
+                text_feats.detach(),
+                class_inds=class_inds,
+            )
 
         self._maybe_log(apr_value)
         return prototypes, apr_loss
 
     # === APR loss ===
-    def compute_apr_loss(self, prototypes: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
-        loss_orth = self._orthogonality_term(prototypes)
-        loss_div = self._diversity_term(logits)
+    def compute_apr_loss(
+        self,
+        prototypes: torch.Tensor,
+        logits: torch.Tensor,
+        text_feats: torch.Tensor,
+        *,
+        class_inds: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        scope_prototypes = prototypes
+        scope_logits = logits
+        if self.apr_on_base_only:
+            base_mask = self._resolve_class_mask(
+                self.base_class_mask,
+                class_inds,
+                num_classes=prototypes.shape[0],
+                device=prototypes.device,
+            )
+            if base_mask is not None:
+                scope_prototypes = prototypes[base_mask]
+                scope_logits = logits[base_mask]
+
+        loss_orth = self._orthogonality_term(scope_prototypes)
+        loss_div = self._diversity_term(scope_logits)
+        loss_novel_anchor = self._novel_anchor_term(prototypes, text_feats, class_inds=class_inds)
         lam_orth, lam_div = self._effective_lambdas()
-        apr_loss = lam_orth * loss_orth + lam_div * loss_div
-        self._store_loss_terms(loss_orth, loss_div, apr_loss, lam_orth, lam_div)
+        apr_loss = lam_orth * loss_orth + lam_div * loss_div + self.lambda_novel_anchor * loss_novel_anchor
+        self._store_loss_terms(loss_orth, loss_div, loss_novel_anchor, apr_loss, lam_orth, lam_div)
         return apr_loss
 
     # === orthogonality term ===
     def _orthogonality_term(self, prototypes: torch.Tensor) -> torch.Tensor:
+        if prototypes.numel() == 0 or prototypes.shape[0] == 0 or prototypes.shape[1] <= 1:
+            return prototypes.new_zeros(())
         P = F.normalize(prototypes, dim=-1)
         G = torch.einsum("ckd,cmd->ckm", P, P)
         K = G.size(-1)
@@ -142,6 +210,8 @@ class TextPrototypeAggregator(nn.Module):
 
     # === diversity term ===
     def _diversity_term(self, logits: torch.Tensor) -> torch.Tensor:
+        if logits.numel() == 0 or logits.shape[0] == 0 or logits.shape[1] <= 1:
+            return logits.new_zeros(())
         C, K, N = logits.shape
         w = torch.softmax(logits, dim=1)
         votes = w.sum(dim=-1)
@@ -149,23 +219,61 @@ class TextPrototypeAggregator(nn.Module):
         entropy = -(p * (p.clamp_min(1e-8)).log()).sum(dim=1) / math.log(K)
         return entropy.mean()
 
+    def _novel_anchor_term(
+        self,
+        prototypes: torch.Tensor,
+        text_feats: torch.Tensor,
+        *,
+        class_inds: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self.lambda_novel_anchor <= 0:
+            return prototypes.new_zeros(())
+        novel_mask = self._resolve_class_mask(
+            self.novel_class_mask,
+            class_inds,
+            num_classes=prototypes.shape[0],
+            device=prototypes.device,
+        )
+        if novel_mask is None or not bool(novel_mask.any()):
+            return prototypes.new_zeros(())
+        novel_proto = prototypes[novel_mask]
+        novel_text = text_feats[novel_mask].to(device=prototypes.device, dtype=prototypes.dtype)
+        proto_center = F.normalize(novel_proto.mean(dim=1), dim=-1)
+        raw_center = F.normalize(novel_text.mean(dim=1), dim=-1)
+        return F.mse_loss(proto_center, raw_center)
+
     # === bookkeeping ===
-    def _store_loss_terms(self, loss_orth, loss_div, apr_loss, lam_orth, lam_div):
+    def _store_loss_terms(self, loss_orth, loss_div, loss_novel_anchor, apr_loss, lam_orth, lam_div):
         self.last_loss_terms = {
             "loss_orth": float(loss_orth.item()),
             "loss_div": float(loss_div.item()),
+            "loss_novel_anchor": float(loss_novel_anchor.item()),
             "loss_apr": float(apr_loss.item()),
             "lambda_orth": float(lam_orth),
             "lambda_div": float(lam_div),
+            "lambda_novel_anchor": float(self.lambda_novel_anchor),
         }
 
-    def _update_metrics_no_grad(self, prototypes, logits):
+    def _update_metrics_no_grad(self, prototypes, logits, text_feats, *, class_inds=None):
         with torch.no_grad():
-            loss_orth = self._orthogonality_term(prototypes)
-            loss_div = self._diversity_term(logits)
+            scope_prototypes = prototypes
+            scope_logits = logits
+            if self.apr_on_base_only:
+                base_mask = self._resolve_class_mask(
+                    self.base_class_mask,
+                    class_inds,
+                    num_classes=prototypes.shape[0],
+                    device=prototypes.device,
+                )
+                if base_mask is not None:
+                    scope_prototypes = prototypes[base_mask]
+                    scope_logits = logits[base_mask]
+            loss_orth = self._orthogonality_term(scope_prototypes)
+            loss_div = self._diversity_term(scope_logits)
+            loss_novel_anchor = self._novel_anchor_term(prototypes, text_feats, class_inds=class_inds)
             lam_orth, lam_div = self._effective_lambdas()
-            apr_loss = lam_orth * loss_orth + lam_div * loss_div
-        self._store_loss_terms(loss_orth, loss_div, apr_loss, lam_orth, lam_div)
+            apr_loss = lam_orth * loss_orth + lam_div * loss_div + self.lambda_novel_anchor * loss_novel_anchor
+        self._store_loss_terms(loss_orth, loss_div, loss_novel_anchor, apr_loss, lam_orth, lam_div)
         return apr_loss.detach()
 
     # === logging ===

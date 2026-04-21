@@ -416,7 +416,11 @@ class DINOTransformer(nn.Module):
 
         # enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](output_memory, content_inds=content_inds)
         text_classifier = self.decoder.class_embed[self.decoder.num_layers]
-        enc_outputs_class = text_classifier(output_memory, content_inds=content_inds)
+        enc_outputs_class = text_classifier(
+            output_memory,
+            content_inds=content_inds,
+            force_full_tpa_loss=True,
+        )
         apr_loss = getattr(text_classifier, "apr_loss", None)
 
         enc_outputs_coord_unact = (

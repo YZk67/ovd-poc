@@ -132,6 +132,8 @@ model.classifier.tpa_hidden_dim = 256
 model.classifier.tpa_dropout = 0.05  # Add dropout for regularization
 model.classifier.tpa_tau = 0.07  # Optimal temperature for attention aggregation (τ ≈ 0.05–0.1 recommended) 0.1 is original
 model.classifier.tpa_log_interval = 200
+model.classifier.tpa_apr_on_base_only = True
+model.classifier.tpa_novel_anchor_weight = 0.05  # keep rare prototypes close to raw CLIP centroid
 
 
 # Soft-attention aggregation parameters for multi-prototype query initialization

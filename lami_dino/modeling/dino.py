@@ -119,6 +119,11 @@ class DINO(nn.Module):
         self.analogical_tau_concept = analogical_tau_concept
         self.use_soft_attention = use_soft_attention
         self.soft_attention_tau = soft_attention_tau
+        self.seen_classes = None
+        self.unseen_classes = None
+        self.all_classes = None
+        self.register_buffer("base_idx", torch.empty(0, dtype=torch.bool), persistent=False)
+        self.register_buffer("novel_idx", torch.empty(0, dtype=torch.bool), persistent=False)
         # define backbone and position embedding module
         self.backbone = backbone
         self.position_embedding = position_embedding
@@ -175,6 +180,11 @@ class DINO(nn.Module):
         # two-stage
         self.transformer.decoder.class_embed = self.class_embed
         self.transformer.decoder.bbox_embed = self.bbox_embed
+        self._configure_class_splits(
+            seen_classes=seen_classes,
+            unseen_classes=unseen_classes,
+            all_classes=all_classes,
+        )
 
         # hack implementation for two-stage
         for bbox_embed_layer in self.bbox_embed:
@@ -234,19 +244,6 @@ class DINO(nn.Module):
             clip_head = torch.load(clip_head_path)
             self.identical, self.thead = clip_head[0]
             self.head = clip_head[1]
-
-            self.seen_classes = json.load(open(seen_classes))
-            self.all_classes = json.load(open(all_classes))
-            idx = [self.all_classes.index(seen) for seen in self.seen_classes]
-            self.base_idx = torch.zeros(len(self.all_classes), dtype=bool)
-            self.base_idx[idx] = True
-            if unseen_classes:
-                self.unseen_classes = json.load(open(unseen_classes))
-                idx_novel = [self.all_classes.index(unseen) for unseen in self.unseen_classes]
-                self.novel_idx = torch.zeros(len(self.all_classes), dtype=bool)
-                self.novel_idx[idx_novel] = True
-            else:
-                self.novel_idx = self.base_idx == False
         self.save_dir = save_dir
         if self.save_dir:
             os.makedirs(self.save_dir, exist_ok=True)
@@ -302,6 +299,32 @@ class DINO(nn.Module):
         
         else:
             raise ValueError(f"Unknown aggregation method: {method}")
+
+    def _configure_class_splits(self, *, seen_classes=None, unseen_classes=None, all_classes=None):
+        if not seen_classes or not all_classes:
+            return
+
+        self.seen_classes = json.load(open(seen_classes))
+        self.all_classes = json.load(open(all_classes))
+
+        idx = [self.all_classes.index(seen) for seen in self.seen_classes]
+        base_idx = torch.zeros(len(self.all_classes), dtype=torch.bool)
+        base_idx[idx] = True
+
+        if unseen_classes:
+            self.unseen_classes = json.load(open(unseen_classes))
+            idx_novel = [self.all_classes.index(unseen) for unseen in self.unseen_classes]
+            novel_idx = torch.zeros(len(self.all_classes), dtype=torch.bool)
+            novel_idx[idx_novel] = True
+        else:
+            novel_idx = ~base_idx
+
+        self.base_idx = base_idx
+        self.novel_idx = novel_idx
+
+        for class_head in self.class_embed:
+            if hasattr(class_head, "set_class_splits"):
+                class_head.set_class_splits(base_idx, novel_idx)
 
     def _apply_analogical_rerank(self, cls_score):
         """Rerank only novel scores with a region-conditioned analogical text concept.

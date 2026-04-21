@@ -33,6 +33,8 @@ class TextClassifier(nn.Module):
         tpa_dropout: float = 0.1,
         tpa_tau: float = 0.1,
         tpa_log_interval: int = 200,
+        tpa_apr_on_base_only: bool = False,
+        tpa_novel_anchor_weight: float = 0.0,
     ) -> None:
         super().__init__()
 
@@ -77,6 +79,8 @@ class TextClassifier(nn.Module):
                 dropout=tpa_dropout,
                 tau=tpa_tau,
                 log_interval=tpa_log_interval,
+                apr_on_base_only=tpa_apr_on_base_only,
+                novel_anchor_weight=tpa_novel_anchor_weight,
             )
             self.num_prototypes = tpa_num_prototypes
             self._cached_eval = None
@@ -168,12 +172,19 @@ class TextClassifier(nn.Module):
         *,
         content_inds: Optional[torch.Tensor],
         additional_class: Optional[torch.Tensor],
+        force_full_tpa_loss: bool = False,
     ) -> torch.Tensor:
         if self.training:
-            text_feats = self._maybe_move_text_feats(training=True)
-            if content_inds is not None:
-                text_feats = text_feats[content_inds]
-            prototypes, apr_loss = self.tpa(text_feats, with_loss=True)
+            full_text_feats = self._maybe_move_text_feats(training=True)
+            loss_on_full_classes = force_full_tpa_loss and content_inds is not None
+            if loss_on_full_classes:
+                full_prototypes, apr_loss = self.tpa(full_text_feats, with_loss=True)
+                prototypes = full_prototypes[content_inds]
+            else:
+                text_feats = full_text_feats
+                if content_inds is not None:
+                    text_feats = text_feats[content_inds]
+                prototypes, apr_loss = self.tpa(text_feats, with_loss=True, class_inds=content_inds)
             self.apr_loss = apr_loss
         else:
             text_feats = self._maybe_move_text_feats(training=False)
@@ -207,12 +218,23 @@ class TextClassifier(nn.Module):
             logits = logits + self.cls_bias
         return logits
 
+    def set_class_splits(
+        self,
+        base_mask: Optional[torch.Tensor] = None,
+        novel_mask: Optional[torch.Tensor] = None,
+    ) -> None:
+        if not self.use_tpa:
+            return
+        self.tpa.set_class_splits(base_mask, novel_mask)
+        self._cached_eval = None
+
     def forward(
         self,
         x: torch.Tensor,
         classifier: Optional[torch.Tensor] = None,
         content_inds: Optional[torch.Tensor] = None,
         additional_class: Optional[torch.Tensor] = None,
+        force_full_tpa_loss: bool = False,
     ) -> torch.Tensor:
         x = self.linear(x)
         if self.use_tpa:
@@ -220,6 +242,7 @@ class TextClassifier(nn.Module):
                 x,
                 content_inds=content_inds,
                 additional_class=additional_class,
+                force_full_tpa_loss=force_full_tpa_loss,
             )
         return self._compute_static_logits(
             x,

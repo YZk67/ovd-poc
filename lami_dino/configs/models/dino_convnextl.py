@@ -114,6 +114,8 @@ model = L(DINO)(
         tpa_dropout=0.1,
         tpa_tau=0.07,
         tpa_log_interval=200,
+        tpa_apr_on_base_only=False,
+        tpa_novel_anchor_weight=0.0,
     ),
     query_path="dataset/metadata/coco_clip_convnextl_a+cname.npy",
     eval_query_path="dataset/metadata/coco_clip_convnextl_a+cname.npy",
