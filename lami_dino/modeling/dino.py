@@ -17,7 +17,7 @@ import os
 import copy
 import math
 import json
-from typing import List
+from typing import Dict, List, Optional
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -31,6 +31,8 @@ from detrex.utils import (inverse_sigmoid, is_dist_avail_and_initialized,
 
 from detectron2.modeling import detector_postprocess
 from detectron2.structures import Boxes, ImageList, Instances
+
+from .mda import ConfusableSetManager, PlainMarginLoss
 
 
 class DINO(nn.Module):
@@ -99,6 +101,7 @@ class DINO(nn.Module):
         clip_head_path=None,
         use_soft_attention: bool = True,
         soft_attention_tau: float = 0.1,
+        margin_config: Optional[Dict] = None,
     ):
         super().__init__()
         self.vlm_temperature = vlm_temperature
@@ -238,7 +241,20 @@ class DINO(nn.Module):
         self.save_dir = save_dir
         if self.save_dir:
             os.makedirs(self.save_dir, exist_ok=True)
-    
+
+        self.margin_config = margin_config
+        self.confusable_mgr = None
+        self.margin_loss_fn = None
+        if margin_config is not None:
+            self.confusable_mgr = ConfusableSetManager(
+                margin_config["confusable_index_path"],
+                num_negatives=margin_config.get("num_negatives", 3),
+            )
+            self.margin_loss_fn = PlainMarginLoss(
+                margin=margin_config.get("margin", 0.2)
+            )
+            self.margin_warmup_iters = margin_config.get("warmup_iters", 500)
+
     def _aggregate_prototypes(self, embeddings, method='mean', region_feats=None, tau=0.1):
         """
         Aggregate multiple prototypes into a single embedding.
@@ -350,12 +366,31 @@ class DINO(nn.Module):
                 )
             # 保证类型与设备
             content_inds = content_inds.to(device=device, dtype=torch.long)
-        else:
-            # 用固定长度占位，等会儿接收广播
-            content_inds = torch.zeros(self.fed_loss_num_cat, device=device, dtype=torch.long)
 
-        # 广播到所有 GPU（若未分布式则跳过）
+            # === Pure Margin: force-inject every GT's confusable negatives ===
+            if self.confusable_mgr is not None:
+                extra = set()
+                for gt_id in all_gt.tolist():
+                    extra.update(self.confusable_mgr.get_negatives(gt_id))
+                existing = set(content_inds.tolist())
+                new_ids = sorted(extra - existing)
+                if new_ids:
+                    extra_t = torch.tensor(new_ids, device=device, dtype=torch.long)
+                    content_inds = torch.cat([content_inds, extra_t])
+        else:
+            # 占位；长度由 rank 0 通过 broadcast 决定
+            content_inds = None
+
+        # Broadcast (length, then content) so confusable injection can grow it
         if is_dist_avail_and_initialized():
+            length_t = torch.tensor(
+                [content_inds.numel() if content_inds is not None else 0],
+                device=device, dtype=torch.long,
+            )
+            dist.broadcast(length_t, src=0)
+            length = int(length_t.item())
+            if content_inds is None:
+                content_inds = torch.zeros(length, device=device, dtype=torch.long)
             dist.broadcast(content_inds, src=0)
 
         # === 之后保持你原有的映射逻辑：将 gt_classes 映射到 [0..M-1] ===
@@ -365,6 +400,18 @@ class DINO(nn.Module):
 
         for idx, target in enumerate(batched_inputs):
             cats = target["instances"].gt_classes.to(device)
+            if self.confusable_mgr is not None:
+                K = self.confusable_mgr.num_negatives
+                neg_remapped = torch.full(
+                    (cats.numel(), K), -1, device=device, dtype=torch.long,
+                )
+                for j, c in enumerate(cats.tolist()):
+                    negs = self.confusable_mgr.get_negatives(c)
+                    for k, n in enumerate(negs[:K]):
+                        rid = int(convert_map[n].item())
+                        if rid >= 0:
+                            neg_remapped[j, k] = rid
+                target["instances"].set("confusable_neg_remapped", neg_remapped)
             batched_inputs[idx]["instances"].gt_classes = convert_map[cats]
         
         # DEBUG（可选）：多卡一致性哈希（仅前200 iter打印）
@@ -554,6 +601,12 @@ class DINO(nn.Module):
             loss_dict = self.criterion(output, targets, dn_meta)
             if apr_loss is not None:
                 loss_dict["loss_apr"] = apr_loss
+            if self.margin_loss_fn is not None:
+                self._train_iter = getattr(self, "_train_iter", 0) + 1
+                if self._train_iter > self.margin_warmup_iters:
+                    loss_dict["loss_margin"] = self._compute_margin_loss(output, targets)
+                else:
+                    loss_dict["loss_margin"] = output["pred_logits"].new_zeros(())
             weight_dict = self.criterion.weight_dict
             for k in loss_dict.keys():
                 if k in weight_dict:
@@ -631,6 +684,37 @@ class DINO(nn.Module):
         roi_features = nn.functional.normalize(roi_features, dim=-1)# [1, 900, 768]
         return roi_features
 
+
+    def _compute_margin_loss(self, output, targets):
+        """Last-layer pairwise margin loss over confusable negatives.
+
+        For each Hungarian-matched (query, GT), penalises when a confusable
+        negative score is within `margin` of the positive class score.
+        """
+        pred_logits = output["pred_logits"]
+        indices = self.criterion.matcher(
+            {"pred_logits": pred_logits, "pred_boxes": output["pred_boxes"]},
+            targets,
+        )
+        sigmoid = pred_logits.sigmoid()
+        K = self.confusable_mgr.num_negatives
+        pos_list, neg_list = [], []
+        for b, (qi, ti) in enumerate(indices):
+            if qi.numel() == 0 or "confusable_neg_remapped" not in targets[b]:
+                continue
+            confusable = targets[b]["confusable_neg_remapped"]
+            labels = targets[b]["labels"]
+            for j in range(qi.numel()):
+                t_id = int(ti[j])
+                neg = confusable[t_id]
+                if (neg < 0).any():
+                    continue
+                q_id = int(qi[j])
+                pos_list.append(sigmoid[b, q_id, int(labels[t_id])])
+                neg_list.append(sigmoid[b, q_id, neg])
+        if not pos_list:
+            return pred_logits.new_zeros(())
+        return self.margin_loss_fn(torch.stack(pos_list), torch.stack(neg_list))
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_coord):
@@ -875,5 +959,10 @@ class DINO(nn.Module):
             gt_scores = targets_per_image.gt_scores
             gt_boxes = targets_per_image.gt_boxes.tensor / image_size_xyxy
             gt_boxes = box_xyxy_to_cxcywh(gt_boxes)
-            new_targets.append({"labels": gt_classes, "boxes": gt_boxes, "scores": gt_scores})
+            t = {"labels": gt_classes, "boxes": gt_boxes, "scores": gt_scores}
+            if targets_per_image.has("confusable_neg_remapped"):
+                t["confusable_neg_remapped"] = targets_per_image.get(
+                    "confusable_neg_remapped"
+                )
+            new_targets.append(t)
         return new_targets
