@@ -103,6 +103,9 @@ class HungarianMatcher(nn.Module):
             For each batch element, it holds: `len(index_i) = len(index_j) = min(num_queries, num_target_boxes)`
         """
         bs, num_queries = outputs["pred_logits"].shape[:2]
+        if sum(len(v["boxes"]) for v in targets) == 0:
+            empty = torch.empty(0, dtype=torch.int64)
+            return [(empty, empty) for _ in range(bs)]
 
         # We flatten to compute the cost matrices in a batch
         if self.cost_class_type == "ce_cost":

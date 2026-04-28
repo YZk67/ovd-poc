@@ -99,6 +99,8 @@ class DINO(nn.Module):
         clip_head_path=None,
         use_soft_attention: bool = True,
         soft_attention_tau: float = 0.1,
+        heldout_class_ids_path=None,
+        heldout_ignore_iou: float = 0.5,
     ):
         super().__init__()
         self.vlm_temperature = vlm_temperature
@@ -107,6 +109,7 @@ class DINO(nn.Module):
         self.novel_scale = novel_scale
         self.use_soft_attention = use_soft_attention
         self.soft_attention_tau = soft_attention_tau
+        self.heldout_ignore_iou = float(heldout_ignore_iou)
         # define backbone and position embedding module
         self.backbone = backbone
         self.position_embedding = position_embedding
@@ -126,6 +129,11 @@ class DINO(nn.Module):
         self.class_embed = classifier
         self.bbox_embed = MLP(embed_dim, embed_dim, 4, 3)
         self.num_classes = num_classes
+        self.register_buffer(
+            "heldout_class_mask",
+            self._load_heldout_class_mask(heldout_class_ids_path, num_classes, device),
+            persistent=False,
+        )
 
         # where to calculate auxiliary loss in criterion
         self.aux_loss = aux_loss
@@ -235,9 +243,56 @@ class DINO(nn.Module):
                 self.novel_idx[idx_novel] = True
             else:
                 self.novel_idx = self.base_idx == False
+            if self.heldout_class_mask.numel() > 0 and bool(self.heldout_class_mask.any()):
+                heldout_mask = self.heldout_class_mask.detach().cpu()
+                self.base_idx[heldout_mask] = False
+                self.novel_idx[heldout_mask] = True
+                print("[HeldoutBase] treating pseudo-novel classes as novel during score ensemble")
         self.save_dir = save_dir
         if self.save_dir:
             os.makedirs(self.save_dir, exist_ok=True)
+
+    def _load_heldout_class_mask(self, heldout_class_ids_path, num_classes, device):
+        mask = torch.zeros(num_classes, dtype=torch.bool, device=device)
+        if not heldout_class_ids_path:
+            return mask
+
+        with open(heldout_class_ids_path, "r") as f:
+            payload = json.load(f)
+        class_ids = payload.get("class_ids", payload) if isinstance(payload, dict) else payload
+        if not isinstance(class_ids, list):
+            raise ValueError("heldout_class_ids_path must contain a JSON list or {'class_ids': [...]}")
+
+        ids = torch.as_tensor(class_ids, dtype=torch.long, device=device)
+        if ids.numel() > 0:
+            if int(ids.min().item()) < 0 or int(ids.max().item()) >= num_classes:
+                raise ValueError(f"heldout class id out of range [0, {num_classes})")
+            mask[ids] = True
+        print(f"[HeldoutBase] loaded {int(mask.sum().item())} pseudo-novel classes from {heldout_class_ids_path}")
+        return mask
+
+    def _mask_heldout_instances(self, batched_inputs):
+        if self.heldout_class_mask.numel() == 0 or not bool(self.heldout_class_mask.any()):
+            return batched_inputs
+
+        heldout_count = 0
+        for record in batched_inputs:
+            instances = record["instances"]
+            classes = instances.gt_classes.to(dtype=torch.long)
+            heldout_mask = self.heldout_class_mask.to(classes.device)[classes]
+            if not bool(heldout_mask.any()):
+                record["_heldout_ignore_boxes_xyxy"] = instances.gt_boxes.tensor.new_zeros((0, 4))
+                continue
+
+            heldout_count += int(heldout_mask.sum().item())
+            record["_heldout_ignore_boxes_xyxy"] = instances.gt_boxes.tensor[heldout_mask].clone()
+            record["instances"] = instances[~heldout_mask]
+
+        step = getattr(self, "_heldout_debug_step", 0)
+        if heldout_count > 0 and step % 200 == 0:
+            print(f"[HeldoutBase] step={step:06d} masked {heldout_count} pseudo-novel GT boxes")
+        self._heldout_debug_step = step + 1
+        return batched_inputs
     
     def _aggregate_prototypes(self, embeddings, method='mean', region_feats=None, tau=0.1):
         """
@@ -302,6 +357,9 @@ class DINO(nn.Module):
         device = self.device
         # 频率权重（保持与原逻辑一致）
         freq_weight = self.freq_weight if self.freq_weight is not None else torch.ones(self.num_classes, device=device)
+        if self.heldout_class_mask.numel() > 0 and bool(self.heldout_class_mask.any()):
+            freq_weight = freq_weight.clone()
+            freq_weight[self.heldout_class_mask.to(freq_weight.device)] = 0
 
         # 本 rank 的 GT 类
         local_gt = []
@@ -414,6 +472,7 @@ class DINO(nn.Module):
 
         content_inds = None
         if self.training:
+            batched_inputs = self._mask_heldout_instances(batched_inputs)
             batch_size, _, H, W = images.tensor.shape
             img_masks = images.tensor.new_ones(batch_size, H, W)
             for img_id in range(batch_size):
@@ -467,7 +526,7 @@ class DINO(nn.Module):
         # prepare label query embedding
         if self.training:
             gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
-            targets = self.prepare_targets(gt_instances)
+            targets = self.prepare_targets(gt_instances, batched_inputs)
             cdn_num_classes = self.fed_loss_num_cat if self.use_fed_loss else self.num_classes
             input_query_label, input_query_bbox, attn_mask, dn_meta = self.prepare_for_cdn(
                 targets,
@@ -866,14 +925,21 @@ class DINO(nn.Module):
             results.append(result)
         return results
 
-    def prepare_targets(self, targets):
+    def prepare_targets(self, targets, batched_inputs=None):
         new_targets = []
-        for targets_per_image in targets:
+        for image_idx, targets_per_image in enumerate(targets):
             h, w = targets_per_image.image_size
             image_size_xyxy = torch.as_tensor([w, h, w, h], dtype=torch.float, device=self.device)
             gt_classes = targets_per_image.gt_classes
             gt_scores = targets_per_image.gt_scores
             gt_boxes = targets_per_image.gt_boxes.tensor / image_size_xyxy
             gt_boxes = box_xyxy_to_cxcywh(gt_boxes)
-            new_targets.append({"labels": gt_classes, "boxes": gt_boxes, "scores": gt_scores})
+            target = {"labels": gt_classes, "boxes": gt_boxes, "scores": gt_scores}
+            if batched_inputs is not None:
+                ignore_xyxy = batched_inputs[image_idx].get("_heldout_ignore_boxes_xyxy")
+                if ignore_xyxy is not None and ignore_xyxy.numel() > 0:
+                    ignore_xyxy = ignore_xyxy.to(device=self.device, dtype=torch.float) / image_size_xyxy
+                    target["ignore_boxes"] = box_xyxy_to_cxcywh(ignore_xyxy)
+                    target["ignore_iou_thresh"] = self.heldout_ignore_iou
+            new_targets.append(target)
         return new_targets

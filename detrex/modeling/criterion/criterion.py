@@ -24,11 +24,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from detrex.layers import box_cxcywh_to_xyxy, generalized_box_iou
+from detrex.layers import box_cxcywh_to_xyxy, box_iou, generalized_box_iou
 from detrex.utils import get_world_size, is_dist_avail_and_initialized
 
 
-def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: float = 2):
+def sigmoid_focal_loss(
+    inputs,
+    targets,
+    num_boxes,
+    alpha: float = 0.25,
+    gamma: float = 2,
+    query_weights=None,
+):
     """
     Loss used in RetinaNet for dense detection: https://arxiv.org/abs/1708.02002.
 
@@ -55,6 +62,9 @@ def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: f
     if alpha >= 0:
         alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
         loss = alpha_t * loss
+
+    if query_weights is not None:
+        loss = loss * query_weights.unsqueeze(-1)
 
     return loss.mean(1).sum() / num_boxes
 
@@ -122,6 +132,7 @@ class SetCriterion(nn.Module):
             device=src_logits.device,
         )
         target_classes[idx] = target_classes_o
+        query_weights = self._get_query_weights(outputs, targets, target_classes, num_classes)
 
         # Computation classification loss
         if self.loss_class_type == "ce_loss":
@@ -147,6 +158,7 @@ class SetCriterion(nn.Module):
                     num_boxes=num_boxes,
                     alpha=self.alpha,
                     gamma=self.gamma,
+                    query_weights=query_weights,
                 )
                 * src_logits.shape[1]
             )
@@ -157,6 +169,34 @@ class SetCriterion(nn.Module):
         losses = {"loss_class": loss_class}
 
         return losses
+
+    def _get_query_weights(self, outputs, targets, target_classes, num_classes):
+        """Zero classification loss for background queries overlapping ignored GT boxes."""
+        if "pred_boxes" not in outputs:
+            return None
+
+        src_boxes = outputs["pred_boxes"]
+        ignore_mask = torch.zeros(
+            target_classes.shape,
+            dtype=torch.bool,
+            device=target_classes.device,
+        )
+        pred_xyxy = box_cxcywh_to_xyxy(src_boxes.detach()).clamp_(0, 1)
+
+        for batch_idx, target in enumerate(targets):
+            ignore_boxes = target.get("ignore_boxes")
+            if ignore_boxes is None or ignore_boxes.numel() == 0:
+                continue
+            ignore_boxes = ignore_boxes.to(device=src_boxes.device, dtype=src_boxes.dtype)
+            ignore_xyxy = box_cxcywh_to_xyxy(ignore_boxes).clamp_(0, 1)
+            ious, _ = box_iou(pred_xyxy[batch_idx], ignore_xyxy)
+            thresh = float(target.get("ignore_iou_thresh", 0.5))
+            ignore_mask[batch_idx] = ious.max(dim=1).values >= thresh
+
+        ignore_mask = ignore_mask & (target_classes == num_classes)
+        if not bool(ignore_mask.any()):
+            return None
+        return (~ignore_mask).to(dtype=src_boxes.dtype)
 
     def loss_boxes(self, outputs, targets, indices, num_boxes):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
