@@ -4,7 +4,7 @@ Extracts the live source of _compute_margin_loss from dino.py (so the test
 follows code edits without manual re-sync) and runs it against a mocked DINO
 instance. Verifies:
   - shape: pos[N], neg[N, K] match
-  - indexing: skips GT with any -1 in confusable_neg_remapped
+  - indexing: ignores -1 padded negatives while keeping valid negatives
   - non-zero loss when neg scores violate margin
   - zero loss when no valid (query, GT) pairs
   - device propagation
@@ -58,15 +58,15 @@ def case_1_basic_nonzero():
     pred_logits = torch.zeros(B, Q, M)
     # batch 0: GT label=3, matched to query 0; negs=[5,9,11]
     # set logit[0,0,3] high, but neg 5 even higher → should fire
-    pred_logits[0, 0, 3] = 1.0   # pos sigmoid ≈ 0.731
-    pred_logits[0, 0, 5] = 1.5   # neg sigmoid ≈ 0.818  margin=0.2 → 0.2+0.818-0.731=0.287 > 0
-    pred_logits[0, 0, 9] = 0.0   # neg sigmoid 0.5      margin: 0.2+0.5-0.731=-0.031 < 0 → 0
-    pred_logits[0, 0, 11] = -1.0 # neg sigmoid 0.269    margin: 0.2+0.269-0.731=-0.262 < 0 → 0
+    pred_logits[0, 0, 3] = 1.0
+    pred_logits[0, 0, 5] = 1.5   # 0.2 + 1.5 - 1.0 = 0.7
+    pred_logits[0, 0, 9] = 0.0   # below margin
+    pred_logits[0, 0, 11] = -1.0 # below margin
     # batch 1: GT label=7, matched to query 5; negs=[12,14,16]
-    pred_logits[1, 5, 7] = 0.5   # pos sigmoid 0.622
-    pred_logits[1, 5, 12] = 1.0  # neg sigmoid 0.731    margin: 0.2+0.731-0.622=0.309
-    pred_logits[1, 5, 14] = 0.6  # neg sigmoid 0.646    margin: 0.2+0.646-0.622=0.224
-    pred_logits[1, 5, 16] = -2.0 # neg sigmoid 0.119    margin: <0 → 0
+    pred_logits[1, 5, 7] = 0.5
+    pred_logits[1, 5, 12] = 1.0  # 0.2 + 1.0 - 0.5 = 0.7
+    pred_logits[1, 5, 14] = 0.6  # 0.2 + 0.6 - 0.5 = 0.3
+    pred_logits[1, 5, 16] = -2.0 # below margin
     pred_boxes = torch.zeros(B, Q, 4)
 
     output = {"pred_logits": pred_logits, "pred_boxes": pred_boxes}
@@ -92,26 +92,21 @@ def case_1_basic_nonzero():
 
     obj = make_obj(num_negatives=K, matcher=matcher)
     loss = compute_margin_loss(obj, output, targets)
-    # Expected manual:
-    # row 0 contributions: 0.287 + 0 + 0 = 0.287
-    # row 1 contributions: 0.309 + 0.224 + 0 = 0.533
-    # mean over 6 entries: (0.287 + 0.533) / 6 ≈ 0.1367
-    expected = (0.2 + torch.sigmoid(torch.tensor(1.5)) - torch.sigmoid(torch.tensor(1.0))).clamp(min=0)
-    expected = expected + (0.2 + torch.sigmoid(torch.tensor(1.0)) - torch.sigmoid(torch.tensor(0.5))).clamp(min=0)
-    expected = expected + (0.2 + torch.sigmoid(torch.tensor(0.6)) - torch.sigmoid(torch.tensor(0.5))).clamp(min=0)
-    expected = expected / 6
+    row0 = (torch.tensor([0.2 + 1.5 - 1.0, 0.2 + 0.0 - 1.0, 0.2 - 1.0 - 1.0]).clamp(min=0)).mean()
+    row1 = (torch.tensor([0.2 + 1.0 - 0.5, 0.2 + 0.6 - 0.5, 0.2 - 2.0 - 0.5]).clamp(min=0)).mean()
+    expected = (row0 + row1) / 2
     print(f"[case 1 basic non-zero]    loss = {loss.item():.6f}  expected = {expected.item():.6f}")
     assert loss.requires_grad is False  # no grad in this synthetic test
     assert abs(loss.item() - expected.item()) < 1e-5, "loss mismatch"
     assert loss.item() > 0, "should be non-zero"
 
 
-def case_2_skip_invalid_negs():
-    """GT with -1 in confusable_neg_remapped should be skipped."""
+def case_2_uses_available_negs():
+    """-1 padded negatives are ignored; valid negatives still contribute."""
     B, Q, M, K = 1, 5, 20, 3
     pred_logits = torch.full((B, Q, M), -10.0)
     pred_logits[0, 0, 3] = 1.0
-    pred_logits[0, 0, 5] = 5.0   # would normally violate margin, but this GT is skipped
+    pred_logits[0, 0, 5] = 5.0
     pred_logits[0, 1, 7] = 0.5
     pred_logits[0, 1, 12] = 1.5  # this one stays
     pred_logits[0, 1, 14] = 0.6
@@ -123,7 +118,7 @@ def case_2_skip_invalid_negs():
         {
             "labels": torch.tensor([3, 7]),
             "boxes": torch.zeros(2, 4),
-            # GT 0 has -1 → skipped; GT 1 valid
+            # GT 0 has -1 padding but still has valid negatives.
             "confusable_neg_remapped": torch.tensor([[5, -1, 11], [12, 14, 16]]),
         },
     ]
@@ -133,12 +128,10 @@ def case_2_skip_invalid_negs():
 
     obj = make_obj(num_negatives=K, matcher=matcher)
     loss = compute_margin_loss(obj, output, targets)
-    # Only GT 1 contributes
-    e1 = (0.2 + torch.sigmoid(torch.tensor(1.5)) - torch.sigmoid(torch.tensor(0.5))).clamp(min=0)
-    e2 = (0.2 + torch.sigmoid(torch.tensor(0.6)) - torch.sigmoid(torch.tensor(0.5))).clamp(min=0)
-    e3 = (0.2 + torch.sigmoid(torch.tensor(-2.0)) - torch.sigmoid(torch.tensor(0.5))).clamp(min=0)
-    expected = (e1 + e2 + e3) / 3
-    print(f"[case 2 skip invalid negs] loss = {loss.item():.6f}  expected = {expected.item():.6f}")
+    row0 = torch.tensor([0.2 + 5.0 - 1.0, 0.2 - 10.0 - 1.0]).clamp(min=0).mean()
+    row1 = torch.tensor([0.2 + 1.5 - 0.5, 0.2 + 0.6 - 0.5, 0.2 - 2.0 - 0.5]).clamp(min=0).mean()
+    expected = (row0 + row1) / 2
+    print(f"[case 2 valid neg padding] loss = {loss.item():.6f}  expected = {expected.item():.6f}")
     assert abs(loss.item() - expected.item()) < 1e-5
 
 
@@ -206,7 +199,7 @@ def case_5_grad_flows():
 
 if __name__ == "__main__":
     case_1_basic_nonzero()
-    case_2_skip_invalid_negs()
+    case_2_uses_available_negs()
     case_3_no_matches()
     case_4_no_confusable_key()
     case_5_grad_flows()

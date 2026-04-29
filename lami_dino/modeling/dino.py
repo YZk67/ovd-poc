@@ -349,9 +349,28 @@ class DINO(nn.Module):
         need_sample = (not is_dist_avail_and_initialized()) or (dist.get_rank() == 0)
 
         if need_sample:
+            sample_gt = all_gt
+            if self.confusable_mgr is not None:
+                forced = set()
+                gt_set = set(all_gt.tolist())
+                for gt_id in gt_set:
+                    for neg_id in self.confusable_mgr.get_negatives(gt_id):
+                        if 0 <= neg_id < self.num_classes and neg_id not in gt_set:
+                            forced.add(neg_id)
+
+                if forced:
+                    max_extra = max(self.fed_loss_num_cat - all_gt.numel(), 0)
+                    forced = torch.tensor(
+                        sorted(forced), device=device, dtype=torch.long,
+                    )
+                    if forced.numel() > max_extra:
+                        perm = torch.randperm(forced.numel(), device=device)[:max_extra]
+                        forced = forced[perm]
+                    sample_gt = torch.cat([all_gt, forced])
+
             if self.cluster_fed_loss:
                 content_inds = get_cluster_fed_loss_inds(
-                    all_gt,
+                    sample_gt,
                     num_sample_cats=self.fed_loss_num_cat,
                     C=self.num_classes,
                     weight=freq_weight,
@@ -359,24 +378,13 @@ class DINO(nn.Module):
                 )
             else:
                 content_inds = get_fed_loss_inds(
-                    all_gt,
+                    sample_gt,
                     num_sample_cats=self.fed_loss_num_cat,
                     C=self.num_classes,
                     weight=freq_weight,
                 )
             # 保证类型与设备
             content_inds = content_inds.to(device=device, dtype=torch.long)
-
-            # === Pure Margin: force-inject every GT's confusable negatives ===
-            if self.confusable_mgr is not None:
-                extra = set()
-                for gt_id in all_gt.tolist():
-                    extra.update(self.confusable_mgr.get_negatives(gt_id))
-                existing = set(content_inds.tolist())
-                new_ids = sorted(extra - existing)
-                if new_ids:
-                    extra_t = torch.tensor(new_ids, device=device, dtype=torch.long)
-                    content_inds = torch.cat([content_inds, extra_t])
         else:
             # 占位；长度由 rank 0 通过 broadcast 决定
             content_inds = None
@@ -515,7 +523,11 @@ class DINO(nn.Module):
         if self.training:
             gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
             targets = self.prepare_targets(gt_instances)
-            cdn_num_classes = self.fed_loss_num_cat if self.use_fed_loss else self.num_classes
+            cdn_num_classes = (
+                int(content_inds.numel())
+                if self.use_fed_loss and content_inds is not None
+                else self.num_classes
+            )
             input_query_label, input_query_bbox, attn_mask, dn_meta = self.prepare_for_cdn(
                 targets,
                 dn_number=self.dn_number,
@@ -696,9 +708,7 @@ class DINO(nn.Module):
             {"pred_logits": pred_logits, "pred_boxes": output["pred_boxes"]},
             targets,
         )
-        sigmoid = pred_logits.sigmoid()
-        K = self.confusable_mgr.num_negatives
-        pos_list, neg_list = [], []
+        loss_list = []
         for b, (qi, ti) in enumerate(indices):
             if qi.numel() == 0 or "confusable_neg_remapped" not in targets[b]:
                 continue
@@ -707,14 +717,18 @@ class DINO(nn.Module):
             for j in range(qi.numel()):
                 t_id = int(ti[j])
                 neg = confusable[t_id]
-                if (neg < 0).any():
+                neg = neg[neg >= 0]
+                if neg.numel() == 0:
                     continue
                 q_id = int(qi[j])
-                pos_list.append(sigmoid[b, q_id, int(labels[t_id])])
-                neg_list.append(sigmoid[b, q_id, neg])
-        if not pos_list:
+                s_pos = pred_logits[b, q_id, int(labels[t_id])]
+                s_neg = pred_logits[b, q_id, neg]
+                loss_list.append(
+                    self.margin_loss_fn(s_pos.unsqueeze(0), s_neg.unsqueeze(0))
+                )
+        if not loss_list:
             return pred_logits.new_zeros(())
-        return self.margin_loss_fn(torch.stack(pos_list), torch.stack(neg_list))
+        return torch.stack(loss_list).mean()
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_coord):

@@ -12,7 +12,7 @@ Usage:
     python tools/mda/build_confusable_index.py \
         --candidates /path/to/lvis_clip_candidates.json \
         --out data/mda/confusable_index.json \
-        [--top-k 3]
+        [--top-k 3] [--exclude-rare-negatives]
 """
 import argparse
 import importlib.util
@@ -43,11 +43,17 @@ def main():
     parser.add_argument(
         "--out", default="data/mda/confusable_index.json")
     parser.add_argument("--top-k", type=int, default=3)
+    parser.add_argument(
+        "--exclude-rare-negatives",
+        action="store_true",
+        help="OV-LVIS mode: never use rare/novel classes as margin negatives.",
+    )
     args = parser.parse_args()
 
     cats = load_lvis_categories()
     name_to_cont = {c["name"]: c["id"] - 1 for c in cats}
     base_conts = [c["id"] - 1 for c in cats if c["frequency"] in ("c", "f")]
+    rare_conts = {c["id"] - 1 for c in cats if c["frequency"] == "r"}
 
     with open(args.candidates) as f:
         cand = json.load(f)
@@ -68,6 +74,8 @@ def main():
             if n_cont is None:
                 miss_neg += 1
                 continue
+            if args.exclude_rare_negatives and n_cont in rare_conts:
+                continue
             negs.append(n_cont)
             if len(negs) == args.top_k:
                 break
@@ -78,6 +86,10 @@ def main():
     with open(args.out, "w") as f:
         json.dump(result, f, indent=2)
     print(f"Built {len(result)} entries (skipped pos={miss_pos}, neg={miss_neg})")
+    if args.exclude_rare_negatives:
+        all_negs = [n for v in result.values() for n in v]
+        rare_hits = sum(1 for n in all_negs if n in rare_conts)
+        print(f"Rare negatives: {rare_hits}/{len(all_negs)}")
     print(f"Saved to {args.out}")
     print("\nSample:")
     cont_to_name = {c["id"] - 1: c["name"] for c in cats}
