@@ -83,6 +83,8 @@ class TextClassifier(nn.Module):
             self.zs_weight = None
             self.eval_zs_weight = None
             self.tpa.log_owner = True
+            self._external_prototypes = None
+            self._external_apr_loss = None
         else:
             if zs_weight_path == "rand":
                 zs_weight = torch.randn((zs_weight_dim, num_classes))
@@ -115,6 +117,8 @@ class TextClassifier(nn.Module):
         super().train(mode)
         if mode:
             self._cached_eval = None
+        self._external_prototypes = None
+        self._external_apr_loss = None
         return self
 
     def _maybe_move_text_feats(self, training: bool) -> torch.Tensor:
@@ -162,6 +166,18 @@ class TextClassifier(nn.Module):
             x = self.norm_temperature * F.normalize(x, p=2, dim=-1)
         return x
 
+    def set_external_prototypes(
+        self,
+        prototypes: Optional[torch.Tensor],
+        apr_loss: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Inject prototypes computed once outside (e.g. by DINO.forward) so that
+        every class_embed layer reuses the same TPA output instead of running TPA
+        with independent dropout draws."""
+        self._external_prototypes = prototypes
+        self._external_apr_loss = apr_loss
+        self.apr_loss = apr_loss
+
     def _compute_tpa_logits(
         self,
         x: torch.Tensor,
@@ -169,7 +185,10 @@ class TextClassifier(nn.Module):
         content_inds: Optional[torch.Tensor],
         additional_class: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        if self.training:
+        if self._external_prototypes is not None:
+            prototypes = self._external_prototypes
+            self.apr_loss = self._external_apr_loss
+        elif self.training:
             text_feats = self._maybe_move_text_feats(training=True)
             if content_inds is not None:
                 text_feats = text_feats[content_inds]

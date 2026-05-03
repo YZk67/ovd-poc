@@ -164,6 +164,18 @@ class DINO(nn.Module):
         self.bbox_embed = nn.ModuleList([copy.deepcopy(self.bbox_embed) for i in range(num_pred)])
         nn.init.constant_(self.bbox_embed[0].layers[-1].bias.data[2:], -2.0)
 
+        # Share TPA across every class_embed copy so the deepcopy above does not
+        # produce num_pred independent sets of TPA parameters / text buffers.
+        if getattr(self.class_embed[0], "use_tpa", False):
+            shared_tpa = self.class_embed[0].tpa
+            shared_train_feats = self.class_embed[0].train_text_feats
+            shared_eval_feats = self.class_embed[0].eval_text_feats
+            for i in range(1, len(self.class_embed)):
+                self.class_embed[i].tpa = shared_tpa
+                self.class_embed[i].train_text_feats = shared_train_feats
+                self.class_embed[i].eval_text_feats = shared_eval_feats
+                self.class_embed[i].tpa.log_owner = (i == 0)
+
         # two-stage
         self.transformer.decoder.class_embed = self.class_embed
         self.transformer.decoder.bbox_embed = self.bbox_embed
@@ -447,20 +459,27 @@ class DINO(nn.Module):
             multi_level_position_embeddings.append(self.position_embedding(multi_level_masks[-1]))
         
         # === Build content_query_embeds using TPA prototypes (replacing .npy embeddings) ===
+        # Run TPA exactly once per forward and broadcast the same prototypes (same dropout
+        # draw) to every class_embed layer + the query-init path. This ensures every
+        # consumer sees an identical prototype tensor and APR is accumulated only once.
         if hasattr(self.transformer.decoder.class_embed[0], 'use_tpa') and self.transformer.decoder.class_embed[0].use_tpa:
             text_classifier = self.transformer.decoder.class_embed[0]
             text_feats = text_classifier._maybe_move_text_feats(training=self.training)
             if content_inds is not None:
                 text_feats = text_feats[content_inds]
             # [C,K,D_text]
-            proto_ckd, _ = text_classifier.tpa(text_feats, with_loss=False)
-            # Project to decoder dim
-            proto_ckd = self.content_layer(proto_ckd.view(-1, proto_ckd.size(-1))).view(
-                proto_ckd.size(0), proto_ckd.size(1), -1
+            with_loss = self.training
+            shared_prototypes, shared_apr_loss = text_classifier.tpa(text_feats, with_loss=with_loss)
+            # Broadcast to every class_embed copy so they reuse the same prototype tensor.
+            for ce in self.transformer.decoder.class_embed:
+                ce.set_external_prototypes(shared_prototypes, shared_apr_loss)
+
+            # Project to decoder dim for query init
+            proto_ckd = self.content_layer(shared_prototypes.view(-1, shared_prototypes.size(-1))).view(
+                shared_prototypes.size(0), shared_prototypes.size(1), -1
             )
             proto_ckd = F.normalize(proto_ckd, p=2, dim=-1)
             raw_content_query_embeds = proto_ckd  # [C,K,embed_dim]
-            # print(f"[TPA Mode] Using TPA to aggregate prompts into {proto_ckd.shape[1]} prototypes with shape {proto_ckd.shape}")
         else:
             # Fallback to aggregated version
             content_query_embedding = self.content_layer(self.content_query_embedding)

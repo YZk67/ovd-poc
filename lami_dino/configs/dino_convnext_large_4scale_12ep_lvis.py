@@ -49,8 +49,10 @@ train.output_dir = f"/root/lami_convnext_large_12ep_lvis_{timestamp}"
 # - LR scheduler: use lr_multiplier_12ep_warmup for batch size 32
 train.max_iter = 92300 #85200 #85200  # Single GPU A100 4 epochs 12 epochs with batch size 32: 100170/32*12 -- 85200
 
-# run evaluation every 3130 iters
-train.eval_period = 99999999  # Evaluate after each epoch 7100//2
+# run evaluation every ~4 epochs (28400 ≈ 4 × 7100)
+# was 99999999 (never) — without intermediate eval there is no signal that the
+# auxiliary heads are actually helping until training finishes.
+train.eval_period = 28400
 
 # log training infomation every 20 iters
 train.log_period = 50
@@ -59,8 +61,10 @@ train.log_period = 50
 train.checkpointer.period = 7100  # 1 epoch worth of iterations
 
 # gradient clipping for training
+# was 0.1 — too tight once APR + RPSA are added on top of the DETR losses.
+# 0.5 keeps DETR-style stability while letting the auxiliary heads actually learn.
 train.clip_grad.enabled = True
-train.clip_grad.params.max_norm = 0.1
+train.clip_grad.params.max_norm = 0.5
 train.clip_grad.params.norm_type = 2
 
 train.sync_batchnorm = True
@@ -75,10 +79,11 @@ model.query_path = "dataset/metadata/lvis_claude_prompts_convnextl.npy"
 model.eval_query_path = "dataset/metadata/lvis_claude_prompts_convnextl.npy"
 
 # modify optimizer config
-# 假设你单卡用 1e-4 (1GPU); 1e-4 使用原来成功的学习率
+# was: base_lr * world_size with world_size=1.5 (= 1.5e-4) — the 1.5 was a hand-tuned
+# multiplier with no clear linear-scaling justification and made auxiliary losses
+# more likely to blow up early. Use the LaMI-DETR default 1e-4 for total_batch_size=16.
 base_lr = 1e-4
-world_size = 1.5  # GPU 数
-optimizer.lr = base_lr * world_size
+optimizer.lr = base_lr
 optimizer.betas = (0.9, 0.999)
 optimizer.weight_decay = 1e-4
 optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 1
@@ -113,13 +118,17 @@ model.classifier.text_embed_path = "dataset/metadata/lvis_claude_prompts_convnex
 model.classifier.eval_text_embed_path = "dataset/metadata/lvis_claude_prompts_convnextl.npy"
 model.classifier.tpa_num_prototypes = 5  # 8 prompts -> 5 prototypes (better utilization)
 model.classifier.tpa_hidden_dim = 256
-model.classifier.tpa_dropout = 0.05  # Add dropout for regularization
+# was 0.05 — bumped to 0.1 (the value PRIORITY_DECISION.md recommends) for stronger
+# prototype regularization and to discourage attention collapse onto a single prompt.
+model.classifier.tpa_dropout = 0.1
 model.classifier.tpa_tau = 0.07  # Optimal temperature for attention aggregation (τ ≈ 0.05–0.1 recommended) 0.1 is original
 model.classifier.tpa_log_interval = 200
 
 # Query initialization: Soft-attention aggregation parameters for multi-prototype query initialization
 model.use_soft_attention = True  # Enable soft-attention aggregation in query initialization
-model.soft_attention_tau = 0.08  # Temperature parameter for soft-attention (τ ≈ 0.05–0.1 recommended)
+# was 0.08 — too sharp, caused soft-attention to behave like top-1 and waste the
+# extra prototypes. 0.15 keeps attention soft enough to actually mix prototypes.
+model.soft_attention_tau = 0.15
 
 
 # ========================= RPSA V1 =========================
@@ -176,9 +185,9 @@ model.soft_attention_tau = 0.08  # Temperature parameter for soft-attention (τ 
 # model.transformer.rpsa_warmup_power = 1.0
 
 
-# ========================= RPSA V3 =========================
+# ========================= RPSA V3 (stable preset) =========================
 model.transformer.use_rpsa = True
-model.criterion.weight_dict["loss_rpsa"] = 0.05      # 稍弱
+model.criterion.weight_dict["loss_rpsa"] = 0.05
 model.transformer.rpsa_module.K = 8
 model.transformer.rpsa_module.tau_align = 0.06
 model.transformer.rpsa_module.sigma = 1.0
@@ -186,7 +195,10 @@ model.transformer.rpsa_module.bg_thresh = 0.05
 model.transformer.rpsa_module.bg_percentile = 0.60
 model.transformer.rpsa_module.subsample_tokens = 2048
 model.transformer.rpsa_module.subsample_method = "confidence"
-model.transformer.rpsa_module.detach_pi = False      # 允许部分梯度
+# was False — letting π gradients flow back through the encoder pseudo-mask is
+# unstable when enc_outputs_class is still noisy. Detach for the first stable run;
+# flip to False later only if it clearly helps.
+model.transformer.rpsa_module.detach_pi = True
 model.transformer.rpsa_module.stop_grad_vision = False
 model.transformer.rpsa_module.stop_grad_text = False
 model.transformer.rpsa_token_topk = 1024
@@ -196,6 +208,13 @@ model.transformer.rpsa_warmup_start = 20000
 model.transformer.rpsa_warmup_iters = 8000
 model.transformer.rpsa_warmup_init_scale = 0.0
 model.transformer.rpsa_warmup_power = 1.0
+
+# ========================= APR weight tune =========================
+# was 1.0 (inherited from dino_convnextl.py). The TPA already applies internal
+# λ_orth=0.10 and λ_div=0.03 with cosine warmup; multiplying by 1.0 again pushes
+# the regularizer to the same magnitude as loss_class and crowds out the main
+# task. 0.1 keeps the regularizer present without dominating.
+model.criterion.weight_dict["loss_apr"] = 0.1
 
 
 # Enable Automatic Mixed Precision (AMP) for faster training
