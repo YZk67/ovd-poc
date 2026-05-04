@@ -47,10 +47,10 @@ _PREDEFINED_SPLITS_COCO["coco"] = {
     "coco_2017_val_100": ("coco/val2017", "coco/annotations/instances_val2017_100.json"),
 }
 
-# _PREDEFINED_SPLITS_COCO["obj365v2"] = {
-#     "obj365v2_train": ("object365/train/", "object365/annotations/obj365v2_train_filtered.json"),
-#     "obj365v2_val": ("object365/val/", "object365/annotations/zhiyuan_objv2_val.json")
-# }
+_PREDEFINED_SPLITS_COCO["obj365v2"] = {
+    "obj365v2_train": ("object365/train/", "object365/annotations/obj365v2_train_filtered.json"),
+    "obj365v2_val": ("object365/val/", "object365/annotations/zhiyuan_objv2_val.json"),
+}
 
 _PREDEFINED_SPLITS_COCO["coco_zeroshot"] = {
     "zeroshot_coco_2017_train": ("coco/train2017", "coco/zero-shot/instances_train2017_seen_2_proposal.json"),
