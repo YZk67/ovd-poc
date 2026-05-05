@@ -82,8 +82,10 @@ def overlay_clusters_on_image(img_rgb, cluster_grid, K, alpha):
     return overlay.clip(0, 255).astype(np.uint8)
 
 
-def fig_for_image(img_rgb, all_level_grids, K, alpha, file_label, out_pdf):
-    """Compose: original | overlay@level0 | overlay@level1 | ... in one row."""
+def fig_for_image(img_rgb, all_level_grids, level_indices, K, alpha,
+                  file_label, out_pdf):
+    """Compose: original | overlay@level_i | overlay@level_j | ... in one row.
+    level_indices gives the *true* encoder level number for each grid."""
     import matplotlib.pyplot as plt
 
     n_panels = 1 + len(all_level_grids)
@@ -95,11 +97,11 @@ def fig_for_image(img_rgb, all_level_grids, K, alpha, file_label, out_pdf):
     axes[0].set_title(f"input ({file_label})", fontsize=7)
     axes[0].axis("off")
 
-    for j, grid in enumerate(all_level_grids):
+    for j, (grid, lvl) in enumerate(zip(all_level_grids, level_indices)):
         overlay = overlay_clusters_on_image(img_rgb, grid, K, alpha)
         H_l, W_l = grid.shape
         axes[j + 1].imshow(overlay)
-        axes[j + 1].set_title(f"level {j} ({H_l}x{W_l}, K={K})", fontsize=7)
+        axes[j + 1].set_title(f"level {lvl} ({H_l}x{W_l}, K={K})", fontsize=7)
         axes[j + 1].axis("off")
 
     fig.tight_layout()
@@ -134,6 +136,9 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--skip-images", type=int, default=0,
                    help="skip first N images (useful to find diverse examples)")
+    p.add_argument("--image-ids", type=int, nargs="+", default=None,
+                   help="if set, only render images whose COCO id (parsed from "
+                        "file_name) matches one of these. Overrides --skip/--num.")
     p.add_argument("--output-dir", default="/root/autodl-tmp/rpsa_figs")
     args = p.parse_args()
 
@@ -168,8 +173,24 @@ def main():
     dataset_dicts = get_detection_dataset_dicts(
         names="lvis_v1_val", filter_empty=False
     )
-    end = args.skip_images + args.num_images
-    dataset_dicts = dataset_dicts[args.skip_images:end]
+    if args.image_ids:
+        wanted = set(args.image_ids)
+        def _img_id(d):
+            stem = Path(d["file_name"]).stem
+            try:
+                return int(stem)
+            except ValueError:
+                return None
+        dataset_dicts = [d for d in dataset_dicts if _img_id(d) in wanted]
+        # preserve user's requested order
+        order = {iid: i for i, iid in enumerate(args.image_ids)}
+        dataset_dicts.sort(key=lambda d: order.get(_img_id(d), 1e9))
+        if len(dataset_dicts) != len(wanted):
+            missing = wanted - {_img_id(d) for d in dataset_dicts}
+            print(f"[warn] missing image_ids in lvis_v1_val: {sorted(missing)}")
+    else:
+        end = args.skip_images + args.num_images
+        dataset_dicts = dataset_dicts[args.skip_images:end]
     loader = build_detection_test_loader(
         dataset=dataset_dicts,
         mapper=instantiate(cfg.dataloader.test.mapper),
@@ -206,10 +227,14 @@ def main():
             if args.feature_level >= 0:
                 lvl = min(args.feature_level, len(level_grids) - 1)
                 level_grids = [level_grids[lvl]]
+                level_indices = [lvl]
+            else:
+                level_indices = list(range(len(level_grids)))
 
             outpath = out_dir / f"rpsa_overlay_{i:02d}_{file_label}.pdf"
             fig_for_image(
-                img_rgb, level_grids, args.K, args.alpha, file_label, outpath
+                img_rgb, level_grids, level_indices,
+                args.K, args.alpha, file_label, outpath,
             )
             unique_per_level = [int(np.unique(g).size) for g in level_grids]
             print(f"  [{i+1}/{len(dataset_dicts)}] {file_label}: "
