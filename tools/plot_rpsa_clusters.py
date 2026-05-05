@@ -193,7 +193,7 @@ def main():
 
             r, _ = soft_kmeans_assign(
                 output_memory, K=args.K,
-                sigma=args.sigma, em_iters=args.em_iters,
+                sigma=args.sigma, iters=args.em_iters,
             )
             r_cpu = r.detach().cpu()  # [1, N, K]
 
