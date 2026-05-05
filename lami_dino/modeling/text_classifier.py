@@ -3,7 +3,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from detectron2.layers import ShapeSpec
-from typing import Optional
+from typing import Optional, Tuple
 
 from lami_dino.models import TextPrototypeAggregator
 
@@ -86,17 +86,29 @@ class TextClassifier(nn.Module):
             self._external_prototypes = None
             self._external_apr_loss = None
         else:
+            self.static_multi_prototype = False
             if zs_weight_path == "rand":
                 zs_weight = torch.randn((zs_weight_dim, num_classes))
                 nn.init.normal_(zs_weight, std=0.01)
                 self.zs_weight = nn.Parameter(zs_weight)
                 self.eval_zs_weight = None
             else:
-                zs_weight = torch.tensor(np.load(zs_weight_path), dtype=torch.float32).permute(1, 0).contiguous()
-                eval_zs_weight = torch.tensor(
-                    np.load(eval_zs_weight_path),
-                    dtype=torch.float32,
-                ).permute(1, 0).contiguous()
+                zs_weight, static_multi = self._load_static_embeddings(zs_weight_path)
+                eval_zs_weight, eval_static_multi = self._load_static_embeddings(eval_zs_weight_path)
+                if static_multi != eval_static_multi:
+                    raise ValueError(
+                        "Train and eval static embeddings must both be single- or multi-prototype, "
+                        f"got {zs_weight.shape} and {eval_zs_weight.shape}."
+                    )
+                train_dim = zs_weight.shape[-1] if static_multi else zs_weight.shape[0]
+                eval_dim = eval_zs_weight.shape[-1] if eval_static_multi else eval_zs_weight.shape[0]
+                if train_dim != eval_dim:
+                    raise ValueError(
+                        "Train and eval static embeddings must share the same feature dimension, "
+                        f"got {train_dim} vs {eval_dim}."
+                    )
+                zs_weight_dim = train_dim
+                self.static_multi_prototype = static_multi
                 self.register_buffer("zs_weight", zs_weight)
                 self.register_buffer("eval_zs_weight", eval_zs_weight)
 
@@ -112,6 +124,17 @@ class TextClassifier(nn.Module):
         if arr.ndim != 3:
             raise ValueError(f"Expected text embedding array with 2 or 3 dimensions, got shape {arr.shape}.")
         return torch.from_numpy(arr).to(dtype=torch.float32)
+
+    @staticmethod
+    def _load_static_embeddings(path: str) -> Tuple[torch.Tensor, bool]:
+        arr = np.load(path)
+        if arr.ndim == 2:
+            weight = torch.from_numpy(arr).to(dtype=torch.float32).permute(1, 0).contiguous()
+            return weight, False
+        if arr.ndim == 3:
+            weight = torch.from_numpy(arr).to(dtype=torch.float32).contiguous()
+            return weight, True
+        raise ValueError(f"Expected static embedding array with 2 or 3 dimensions, got shape {arr.shape}.")
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -144,9 +167,29 @@ class TextClassifier(nn.Module):
             zs_weight = classifier.permute(1, 0).contiguous()
         else:
             if self.training:
-                zs_weight = self.zs_weight[:, content_inds] if content_inds is not None else self.zs_weight
+                if self.static_multi_prototype:
+                    zs_weight = self.zs_weight[content_inds] if content_inds is not None else self.zs_weight
+                else:
+                    zs_weight = self.zs_weight[:, content_inds] if content_inds is not None else self.zs_weight
             else:
                 zs_weight = self.eval_zs_weight if self.eval_zs_weight is not None else self.zs_weight
+                if self.static_multi_prototype and content_inds is not None:
+                    zs_weight = zs_weight[content_inds]
+        if self.static_multi_prototype and classifier is None:
+            if self.norm_weight:
+                zs_weight = F.normalize(zs_weight, p=2, dim=-1)
+            features = self._normalize_features(x)
+            logits = torch.einsum("bqd,ckd->bqck", features, zs_weight)
+            logits = torch.logsumexp(logits, dim=-1)
+            if additional_class is not None:
+                additional = additional_class.to(device=features.device, dtype=features.dtype)
+                if self.norm_weight:
+                    additional = F.normalize(additional, p=2, dim=-1)
+                additional_logits = torch.einsum("bqd,nd->bqn", features, additional)
+                logits = torch.cat([logits, additional_logits], dim=-1)
+            if self.use_bias:
+                logits = logits + self.cls_bias
+            return logits
         if self.norm_weight:
             zs_weight = F.normalize(zs_weight, p=2, dim=0)
         if additional_class is not None:

@@ -147,7 +147,7 @@ class TextPrototypeAggregator(nn.Module):
         votes = w.sum(dim=-1)
         p = votes / (votes.sum(dim=1, keepdim=True) + 1e-8)
         entropy = -(p * (p.clamp_min(1e-8)).log()).sum(dim=1) / math.log(K)
-        return entropy.mean()
+        return 1.0 - entropy.mean()
 
     # === bookkeeping ===
     def _store_loss_terms(self, loss_orth, loss_div, apr_loss, lam_orth, lam_div):
