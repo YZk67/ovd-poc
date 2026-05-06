@@ -113,6 +113,38 @@ def clamp_aspect(img_rgb, min_aspect, max_aspect, pad_value=255):
     return img_rgb
 
 
+def center_crop_to_aspect(img_rgb, target_aspect):
+    """Center-crop img_rgb to target W/H aspect (loses content but produces
+    uniform panel shapes with no padding). Use when uniform layout
+    matters more than content preservation."""
+    H, W = img_rgb.shape[:2]
+    cur = W / H
+    if abs(cur - target_aspect) < 1e-3:
+        return img_rgb
+    if cur > target_aspect:
+        new_w = int(round(H * target_aspect))
+        x0 = (W - new_w) // 2
+        return img_rgb[:, x0:x0 + new_w]
+    new_h = int(round(W / target_aspect))
+    y0 = (H - new_h) // 2
+    return img_rgb[y0:y0 + new_h]
+
+
+def center_crop_grid(grid, target_aspect):
+    """Same center-crop as center_crop_to_aspect but for the cluster grid."""
+    H, W = grid.shape[:2]
+    cur = W / H
+    if abs(cur - target_aspect) < 1e-3:
+        return grid
+    if cur > target_aspect:
+        new_w = max(1, int(round(H * target_aspect)))
+        x0 = (W - new_w) // 2
+        return grid[:, x0:x0 + new_w]
+    new_h = max(1, int(round(W / target_aspect)))
+    y0 = (H - new_h) // 2
+    return grid[y0:y0 + new_h]
+
+
 def reconstruct_image(batched_input):
     img = batched_input["image"]
     if isinstance(img, torch.Tensor):
@@ -126,7 +158,8 @@ def reconstruct_image(batched_input):
 def compose_figure(panels, captions, K, alpha, out_pdf,
                    target_aspect, panel_height_in, hspace, vspace,
                    max_fig_width_in=None,
-                   min_aspect=None, max_aspect=None):
+                   min_aspect=None, max_aspect=None,
+                   crop_to_aspect=None):
     """Compose 2 x N grid (input row, overlay row) and save as vector PDF.
 
     Each panel uses its native aspect ratio (no cropping, no padding); all
@@ -145,18 +178,25 @@ def compose_figure(panels, captions, K, alpha, out_pdf,
     cmap = plt.cm.get_cmap("tab10", K)
     palette = (np.array([cmap(i)[:3] for i in range(K)]) * 255).astype(np.uint8)
 
-    # Compute (potentially padded) image arrays + each panel's W/H.
+    # Compute (potentially padded / cropped) image arrays + each panel's W/H.
     rendered = []
     for img_rgb, cluster_grid in panels:
-        ov = overlay_clusters(img_rgb, cluster_grid, K, alpha, palette)
-        if target_aspect and target_aspect > 0:
-            img_rgb = letterbox(img_rgb, target_aspect)
-            ov = letterbox(ov, target_aspect)
-        elif min_aspect is not None or max_aspect is not None:
-            mn = min_aspect if min_aspect is not None else -float("inf")
-            mx = max_aspect if max_aspect is not None else float("inf")
-            img_rgb = clamp_aspect(img_rgb, mn, mx)
-            ov = clamp_aspect(ov, mn, mx)
+        if crop_to_aspect is not None and crop_to_aspect > 0:
+            # Crop image AND cluster grid to the same target aspect, then
+            # compute the overlay so cluster colors align with cropped pixels.
+            img_rgb = center_crop_to_aspect(img_rgb, crop_to_aspect)
+            cluster_grid = center_crop_grid(cluster_grid, crop_to_aspect)
+            ov = overlay_clusters(img_rgb, cluster_grid, K, alpha, palette)
+        else:
+            ov = overlay_clusters(img_rgb, cluster_grid, K, alpha, palette)
+            if target_aspect and target_aspect > 0:
+                img_rgb = letterbox(img_rgb, target_aspect)
+                ov = letterbox(ov, target_aspect)
+            elif min_aspect is not None or max_aspect is not None:
+                mn = min_aspect if min_aspect is not None else -float("inf")
+                mx = max_aspect if max_aspect is not None else float("inf")
+                img_rgb = clamp_aspect(img_rgb, mn, mx)
+                ov = clamp_aspect(ov, mn, mx)
         H, W = img_rgb.shape[:2]
         rendered.append((img_rgb, ov, W / H))
 
@@ -230,6 +270,11 @@ def main():
                    help="if --target-aspect=0, panels wider than this (e.g. "
                         "panoramas) are letterboxed to this aspect. "
                         "Default 2.0 caps very wide images.")
+    p.add_argument("--crop-to-aspect", type=float, default=0.0,
+                   help="if >0, center-CROP every panel to this W/H aspect "
+                        "(loses content at the edges, but produces uniform "
+                        "panel widths with no padding). Overrides "
+                        "--target-aspect / --min-aspect / --max-aspect.")
     p.add_argument("--panel-height-in", type=float, default=1.30)
     p.add_argument("--max-fig-width-in", type=float, default=5.5,
                    help="cap total figure width (NeurIPS single-column ~5.5in)")
@@ -323,6 +368,7 @@ def main():
         hspace=args.hspace, vspace=args.vspace,
         max_fig_width_in=args.max_fig_width_in,
         min_aspect=args.min_aspect, max_aspect=args.max_aspect,
+        crop_to_aspect=args.crop_to_aspect if args.crop_to_aspect > 0 else None,
     )
     print(f"[save] {out_path}")
 
