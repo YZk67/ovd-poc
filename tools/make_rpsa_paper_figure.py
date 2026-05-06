@@ -99,17 +99,22 @@ def letterbox(img_rgb, target_aspect, pad_value=255):
         return out
 
 
-def clamp_aspect(img_rgb, min_aspect, max_aspect, pad_value=255):
-    """Letterbox `img_rgb` only if its W/H aspect falls outside
-    [min_aspect, max_aspect]; otherwise return it unchanged. This brings
-    extreme panels (e.g. very wide panoramas or very tall portraits)
-    closer to the others while leaving moderate panels untouched."""
+def clamp_aspect(img_rgb, min_aspect, max_aspect, pad_value=255, mode="letterbox"):
+    """Bring `img_rgb` into [min_aspect, max_aspect] (W/H), or leave it
+    unchanged if already inside. mode controls how the clamp is done:
+        "letterbox": pad with `pad_value` (preserves geometry, adds bars)
+        "stretch":   non-uniformly resize (no padding, mild distortion)
+    """
     H, W = img_rgb.shape[:2]
     cur = W / H
     if cur < min_aspect:
-        return letterbox(img_rgb, min_aspect, pad_value)
+        return (letterbox(img_rgb, min_aspect, pad_value)
+                if mode == "letterbox"
+                else stretch_to_aspect(img_rgb, min_aspect))
     if cur > max_aspect:
-        return letterbox(img_rgb, max_aspect, pad_value)
+        return (letterbox(img_rgb, max_aspect, pad_value)
+                if mode == "letterbox"
+                else stretch_to_aspect(img_rgb, max_aspect))
     return img_rgb
 
 
@@ -179,7 +184,8 @@ def compose_figure(panels, captions, K, alpha, out_pdf,
                    max_fig_width_in=None,
                    min_aspect=None, max_aspect=None,
                    crop_to_aspect=None,
-                   stretch_to_aspect_val=None):
+                   stretch_to_aspect_val=None,
+                   clamp_mode="letterbox"):
     """Compose 2 x N grid (input row, overlay row) and save as vector PDF.
 
     Each panel uses its native aspect ratio (no cropping, no padding); all
@@ -212,15 +218,19 @@ def compose_figure(panels, captions, K, alpha, out_pdf,
             cluster_grid = center_crop_grid(cluster_grid, crop_to_aspect)
             ov = overlay_clusters(img_rgb, cluster_grid, K, alpha, palette)
         else:
-            ov = overlay_clusters(img_rgb, cluster_grid, K, alpha, palette)
             if target_aspect and target_aspect > 0:
+                # uniform letterbox to a fixed aspect
                 img_rgb = letterbox(img_rgb, target_aspect)
-                ov = letterbox(ov, target_aspect)
+                ov = overlay_clusters(img_rgb, cluster_grid, K, alpha, palette)
             elif min_aspect is not None or max_aspect is not None:
                 mn = min_aspect if min_aspect is not None else -float("inf")
                 mx = max_aspect if max_aspect is not None else float("inf")
-                img_rgb = clamp_aspect(img_rgb, mn, mx)
-                ov = clamp_aspect(ov, mn, mx)
+                img_rgb = clamp_aspect(img_rgb, mn, mx, mode=clamp_mode)
+                # overlay is computed AFTER any clamp resize/letterbox so
+                # the cluster grid is rendered at the new image dimensions.
+                ov = overlay_clusters(img_rgb, cluster_grid, K, alpha, palette)
+            else:
+                ov = overlay_clusters(img_rgb, cluster_grid, K, alpha, palette)
         H, W = img_rgb.shape[:2]
         rendered.append((img_rgb, ov, W / H))
 
@@ -304,6 +314,12 @@ def main():
                         "W/H aspect (preserves all content, no padding, no "
                         "cropping; cost is image distortion). Overrides "
                         "--crop-to-aspect / --target-aspect / --min/max-aspect.")
+    p.add_argument("--clamp-via", choices=["letterbox", "stretch"],
+                   default="letterbox",
+                   help="how clamp_aspect (driven by --min-aspect / "
+                        "--max-aspect) reshapes out-of-range panels. "
+                        "'letterbox' pads with white (default); 'stretch' "
+                        "non-uniformly resizes (no padding, mild distortion).")
     p.add_argument("--panel-height-in", type=float, default=1.30)
     p.add_argument("--max-fig-width-in", type=float, default=5.5,
                    help="cap total figure width (NeurIPS single-column ~5.5in)")
@@ -400,6 +416,7 @@ def main():
         crop_to_aspect=args.crop_to_aspect if args.crop_to_aspect > 0 else None,
         stretch_to_aspect_val=args.stretch_to_aspect
             if args.stretch_to_aspect > 0 else None,
+        clamp_mode=args.clamp_via,
     )
     print(f"[save] {out_path}")
 
