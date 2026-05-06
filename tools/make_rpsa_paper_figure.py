@@ -99,6 +99,20 @@ def letterbox(img_rgb, target_aspect, pad_value=255):
         return out
 
 
+def clamp_aspect(img_rgb, min_aspect, max_aspect, pad_value=255):
+    """Letterbox `img_rgb` only if its W/H aspect falls outside
+    [min_aspect, max_aspect]; otherwise return it unchanged. This brings
+    extreme panels (e.g. very wide panoramas or very tall portraits)
+    closer to the others while leaving moderate panels untouched."""
+    H, W = img_rgb.shape[:2]
+    cur = W / H
+    if cur < min_aspect:
+        return letterbox(img_rgb, min_aspect, pad_value)
+    if cur > max_aspect:
+        return letterbox(img_rgb, max_aspect, pad_value)
+    return img_rgb
+
+
 def reconstruct_image(batched_input):
     img = batched_input["image"]
     if isinstance(img, torch.Tensor):
@@ -111,7 +125,8 @@ def reconstruct_image(batched_input):
 
 def compose_figure(panels, captions, K, alpha, out_pdf,
                    target_aspect, panel_height_in, hspace, vspace,
-                   max_fig_width_in=None):
+                   max_fig_width_in=None,
+                   min_aspect=None, max_aspect=None):
     """Compose 2 x N grid (input row, overlay row) and save as vector PDF.
 
     Each panel uses its native aspect ratio (no cropping, no padding); all
@@ -137,6 +152,11 @@ def compose_figure(panels, captions, K, alpha, out_pdf,
         if target_aspect and target_aspect > 0:
             img_rgb = letterbox(img_rgb, target_aspect)
             ov = letterbox(ov, target_aspect)
+        elif min_aspect is not None or max_aspect is not None:
+            mn = min_aspect if min_aspect is not None else -float("inf")
+            mx = max_aspect if max_aspect is not None else float("inf")
+            img_rgb = clamp_aspect(img_rgb, mn, mx)
+            ov = clamp_aspect(ov, mn, mx)
         H, W = img_rgb.shape[:2]
         rendered.append((img_rgb, ov, W / H))
 
@@ -202,6 +222,14 @@ def main():
     p.add_argument("--target-aspect", type=float, default=0.0,
                    help="W/H aspect ratio to letterbox each panel to. "
                         "0 (default) = use native aspect per panel (no padding).")
+    p.add_argument("--min-aspect", type=float, default=1.0,
+                   help="if --target-aspect=0, panels narrower than this "
+                        "(e.g. portrait images) are letterboxed to this aspect. "
+                        "Default 1.0 brings tall portraits to square.")
+    p.add_argument("--max-aspect", type=float, default=2.0,
+                   help="if --target-aspect=0, panels wider than this (e.g. "
+                        "panoramas) are letterboxed to this aspect. "
+                        "Default 2.0 caps very wide images.")
     p.add_argument("--panel-height-in", type=float, default=1.30)
     p.add_argument("--max-fig-width-in", type=float, default=5.5,
                    help="cap total figure width (NeurIPS single-column ~5.5in)")
@@ -294,6 +322,7 @@ def main():
         panel_height_in=args.panel_height_in,
         hspace=args.hspace, vspace=args.vspace,
         max_fig_width_in=args.max_fig_width_in,
+        min_aspect=args.min_aspect, max_aspect=args.max_aspect,
     )
     print(f"[save] {out_path}")
 
