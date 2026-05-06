@@ -73,6 +73,32 @@ def overlay_clusters(img_rgb, cluster_grid, K, alpha, palette):
     return out.clip(0, 255).astype(np.uint8)
 
 
+def letterbox(img_rgb, target_aspect, pad_value=255):
+    """Pad img_rgb to target_aspect (W/H) with `pad_value`.
+    Preserves all content; never crops. Used to make panels uniform size
+    in the figure while keeping every pixel of the original image."""
+    H, W = img_rgb.shape[:2]
+    cur = W / H
+    if abs(cur - target_aspect) < 1e-3:
+        return img_rgb
+    if cur > target_aspect:
+        new_h = int(round(W / target_aspect))
+        pad_total = new_h - H
+        top = pad_total // 2
+        bot = pad_total - top
+        out = np.full((new_h, W, 3), pad_value, dtype=img_rgb.dtype)
+        out[top:top + H] = img_rgb
+        return out
+    else:
+        new_w = int(round(H * target_aspect))
+        pad_total = new_w - W
+        left = pad_total // 2
+        right = pad_total - left
+        out = np.full((H, new_w, 3), pad_value, dtype=img_rgb.dtype)
+        out[:, left:left + W] = img_rgb
+        return out
+
+
 def reconstruct_image(batched_input):
     img = batched_input["image"]
     if isinstance(img, torch.Tensor):
@@ -109,26 +135,17 @@ def compose_figure(panels, captions, K, alpha, out_pdf,
         axes = axes.reshape(2, 1)
 
     for col, (img_rgb, cluster_grid) in enumerate(panels):
-        # crop / letterbox to the target aspect for visual consistency
-        H, W = img_rgb.shape[:2]
-        cur = W / H
-        if cur > target_aspect:
-            new_w = int(round(H * target_aspect))
-            x0 = (W - new_w) // 2
-            img_rgb = img_rgb[:, x0:x0 + new_w]
-        elif cur < target_aspect:
-            new_h = int(round(W / target_aspect))
-            y0 = (H - new_h) // 2
-            img_rgb = img_rgb[y0:y0 + new_h]
-
-        # recompute overlay on the cropped region. Easier: re-resize cluster_grid to match.
-        H2, W2 = img_rgb.shape[:2]
+        # Compute overlay at the original image size (no cropping).
         ov = overlay_clusters(img_rgb, cluster_grid, K, alpha, palette)
+        # Letterbox both panels to target aspect with white padding so
+        # every pixel of the original image is preserved.
+        img_padded = letterbox(img_rgb, target_aspect)
+        ov_padded = letterbox(ov, target_aspect)
 
-        axes[0, col].imshow(img_rgb)
+        axes[0, col].imshow(img_padded)
         axes[0, col].axis("off")
 
-        axes[1, col].imshow(ov)
+        axes[1, col].imshow(ov_padded)
         axes[1, col].axis("off")
 
         cap = captions[col] if col < len(captions) else ""
@@ -160,7 +177,7 @@ def main():
     p.add_argument("--feature-level", type=int, default=0)
     p.add_argument("--K", type=int, default=8)
     p.add_argument("--sigma", type=float, default=1.0)
-    p.add_argument("--em-iters", type=int, default=3)
+    p.add_argument("--em-iters", type=int, default=5)
     p.add_argument("--alpha", type=float, default=0.55)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--target-aspect", type=float, default=1.33,
