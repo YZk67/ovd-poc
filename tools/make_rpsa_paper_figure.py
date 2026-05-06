@@ -171,8 +171,9 @@ def compose_figure(panels, captions, K, alpha, out_pdf,
 
         cap = captions[col] if col < len(captions) else ""
         ax_bot.text(
-            0.5, -0.06, cap, transform=ax_bot.transAxes,
-            ha="center", va="top", fontsize=8,
+            0.5, -0.04, cap, transform=ax_bot.transAxes,
+            ha="center", va="top", fontsize=7,
+            linespacing=1.05,
         )
 
     fig.savefig(out_pdf, bbox_inches="tight", dpi=300)
