@@ -145,6 +145,25 @@ def center_crop_grid(grid, target_aspect):
     return grid[y0:y0 + new_h]
 
 
+def stretch_to_aspect(img_rgb, target_aspect):
+    """Non-uniformly resize img_rgb to target W/H aspect. Preserves all
+    content and produces no padding, but distorts the image. Choose the
+    axis that needs the smaller relative change (to minimize distortion).
+    The cluster grid is rendered at image resolution by overlay_clusters,
+    so we only need to resize the image itself; the overlay step will
+    resize the cluster grid to match the new image dimensions naturally."""
+    from PIL import Image
+
+    H, W = img_rgb.shape[:2]
+    cur = W / H
+    if abs(cur - target_aspect) < 1e-3:
+        return img_rgb
+    # Always keep H, change W. Keeps height bar aligned across panels in
+    # the figure and lets matplotlib render uniform panel heights.
+    new_w = max(1, int(round(H * target_aspect)))
+    return np.array(Image.fromarray(img_rgb).resize((new_w, H), Image.BILINEAR))
+
+
 def reconstruct_image(batched_input):
     img = batched_input["image"]
     if isinstance(img, torch.Tensor):
@@ -159,7 +178,8 @@ def compose_figure(panels, captions, K, alpha, out_pdf,
                    target_aspect, panel_height_in, hspace, vspace,
                    max_fig_width_in=None,
                    min_aspect=None, max_aspect=None,
-                   crop_to_aspect=None):
+                   crop_to_aspect=None,
+                   stretch_to_aspect_val=None):
     """Compose 2 x N grid (input row, overlay row) and save as vector PDF.
 
     Each panel uses its native aspect ratio (no cropping, no padding); all
@@ -178,12 +198,16 @@ def compose_figure(panels, captions, K, alpha, out_pdf,
     cmap = plt.cm.get_cmap("tab10", K)
     palette = (np.array([cmap(i)[:3] for i in range(K)]) * 255).astype(np.uint8)
 
-    # Compute (potentially padded / cropped) image arrays + each panel's W/H.
+    # Compute (potentially padded / cropped / stretched) image arrays
+    # + each panel's W/H aspect for the gridspec width_ratios.
     rendered = []
     for img_rgb, cluster_grid in panels:
-        if crop_to_aspect is not None and crop_to_aspect > 0:
-            # Crop image AND cluster grid to the same target aspect, then
-            # compute the overlay so cluster colors align with cropped pixels.
+        if stretch_to_aspect_val is not None and stretch_to_aspect_val > 0:
+            # Non-uniform resize: distorts but preserves content with no
+            # padding or cropping.
+            img_rgb = stretch_to_aspect(img_rgb, stretch_to_aspect_val)
+            ov = overlay_clusters(img_rgb, cluster_grid, K, alpha, palette)
+        elif crop_to_aspect is not None and crop_to_aspect > 0:
             img_rgb = center_crop_to_aspect(img_rgb, crop_to_aspect)
             cluster_grid = center_crop_grid(cluster_grid, crop_to_aspect)
             ov = overlay_clusters(img_rgb, cluster_grid, K, alpha, palette)
@@ -275,6 +299,11 @@ def main():
                         "(loses content at the edges, but produces uniform "
                         "panel widths with no padding). Overrides "
                         "--target-aspect / --min-aspect / --max-aspect.")
+    p.add_argument("--stretch-to-aspect", type=float, default=0.0,
+                   help="if >0, non-uniformly STRETCH every panel to this "
+                        "W/H aspect (preserves all content, no padding, no "
+                        "cropping; cost is image distortion). Overrides "
+                        "--crop-to-aspect / --target-aspect / --min/max-aspect.")
     p.add_argument("--panel-height-in", type=float, default=1.30)
     p.add_argument("--max-fig-width-in", type=float, default=5.5,
                    help="cap total figure width (NeurIPS single-column ~5.5in)")
@@ -369,6 +398,8 @@ def main():
         max_fig_width_in=args.max_fig_width_in,
         min_aspect=args.min_aspect, max_aspect=args.max_aspect,
         crop_to_aspect=args.crop_to_aspect if args.crop_to_aspect > 0 else None,
+        stretch_to_aspect_val=args.stretch_to_aspect
+            if args.stretch_to_aspect > 0 else None,
     )
     print(f"[save] {out_path}")
 
