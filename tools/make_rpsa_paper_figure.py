@@ -110,11 +110,19 @@ def reconstruct_image(batched_input):
 
 
 def compose_figure(panels, captions, K, alpha, out_pdf,
-                   target_aspect, panel_height_in, hspace, vspace):
+                   target_aspect, panel_height_in, hspace, vspace,
+                   max_fig_width_in=None):
     """Compose 2 x N grid (input row, overlay row) and save as vector PDF.
 
-    panels: list of (img_rgb, cluster_grid). All in same orientation.
-    captions: list of strings, one per column (placed under overlay row).
+    Each panel uses its native aspect ratio (no cropping, no padding); all
+    panels share the same height so the two rows align vertically. If
+    target_aspect is provided (>0), images that differ from it are
+    letterboxed instead, producing perfectly uniform panel widths at the
+    cost of some white space.
+
+    If `max_fig_width_in` is given, panel_height_in is reduced so the total
+    figure width fits within that limit (useful for NeurIPS single-column
+    where text is ~5.5 inches wide).
     """
     import matplotlib.pyplot as plt
 
@@ -122,43 +130,53 @@ def compose_figure(panels, captions, K, alpha, out_pdf,
     cmap = plt.cm.get_cmap("tab10", K)
     palette = (np.array([cmap(i)[:3] for i in range(K)]) * 255).astype(np.uint8)
 
-    panel_w_in = panel_height_in * target_aspect
-    fig_w = n * panel_w_in + (n - 1) * hspace
-    fig_h = 2 * panel_height_in + vspace + 0.25  # bottom space for captions
-
-    fig, axes = plt.subplots(
-        2, n, figsize=(fig_w, fig_h),
-        gridspec_kw={"wspace": hspace / panel_w_in,
-                     "hspace": vspace / panel_height_in},
-    )
-    if n == 1:
-        axes = axes.reshape(2, 1)
-
-    for col, (img_rgb, cluster_grid) in enumerate(panels):
-        # Compute overlay at the original image size (no cropping).
+    # Compute (potentially padded) image arrays + each panel's W/H.
+    rendered = []
+    for img_rgb, cluster_grid in panels:
         ov = overlay_clusters(img_rgb, cluster_grid, K, alpha, palette)
-        # Letterbox both panels to target aspect with white padding so
-        # every pixel of the original image is preserved.
-        img_padded = letterbox(img_rgb, target_aspect)
-        ov_padded = letterbox(ov, target_aspect)
+        if target_aspect and target_aspect > 0:
+            img_rgb = letterbox(img_rgb, target_aspect)
+            ov = letterbox(ov, target_aspect)
+        H, W = img_rgb.shape[:2]
+        rendered.append((img_rgb, ov, W / H))
 
-        axes[0, col].imshow(img_padded)
-        axes[0, col].axis("off")
+    aspects = [a for _, _, a in rendered]
+    panel_widths_in = [panel_height_in * a for a in aspects]
+    fig_w = sum(panel_widths_in) + (n - 1) * hspace
+    fig_h = 2 * panel_height_in + vspace + 0.25
 
-        axes[1, col].imshow(ov_padded)
-        axes[1, col].axis("off")
+    if max_fig_width_in is not None and fig_w > max_fig_width_in:
+        scale = max_fig_width_in / fig_w
+        panel_height_in *= scale
+        panel_widths_in = [w * scale for w in panel_widths_in]
+        fig_w = sum(panel_widths_in) + (n - 1) * hspace
+        fig_h = 2 * panel_height_in + vspace + 0.25
+
+    fig = plt.figure(figsize=(fig_w, fig_h))
+    gs = fig.add_gridspec(
+        2, n,
+        width_ratios=panel_widths_in,
+        wspace=hspace / max(np.mean(panel_widths_in), 1e-6),
+        hspace=vspace / max(panel_height_in, 1e-6),
+    )
+
+    for col, (img_rgb, ov, _) in enumerate(rendered):
+        ax_top = fig.add_subplot(gs[0, col])
+        ax_top.imshow(img_rgb)
+        ax_top.axis("off")
+
+        ax_bot = fig.add_subplot(gs[1, col])
+        ax_bot.imshow(ov)
+        ax_bot.axis("off")
 
         cap = captions[col] if col < len(captions) else ""
-        axes[1, col].text(
-            0.5, -0.06, cap,
-            transform=axes[1, col].transAxes,
-            ha="center", va="top",
-            fontsize=8,
+        ax_bot.text(
+            0.5, -0.06, cap, transform=ax_bot.transAxes,
+            ha="center", va="top", fontsize=8,
         )
 
     fig.savefig(out_pdf, bbox_inches="tight", dpi=300)
-    import matplotlib.pyplot as _plt
-    _plt.close(fig)
+    plt.close(fig)
 
 
 def main():
@@ -180,9 +198,12 @@ def main():
     p.add_argument("--em-iters", type=int, default=5)
     p.add_argument("--alpha", type=float, default=0.55)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--target-aspect", type=float, default=1.33,
-                   help="W/H aspect ratio to crop each panel to (default 4:3)")
+    p.add_argument("--target-aspect", type=float, default=0.0,
+                   help="W/H aspect ratio to letterbox each panel to. "
+                        "0 (default) = use native aspect per panel (no padding).")
     p.add_argument("--panel-height-in", type=float, default=1.30)
+    p.add_argument("--max-fig-width-in", type=float, default=5.5,
+                   help="cap total figure width (NeurIPS single-column ~5.5in)")
     p.add_argument("--hspace", type=float, default=0.06)
     p.add_argument("--vspace", type=float, default=0.05)
     p.add_argument("--output", default="figs/rpsa_clusters.pdf")
@@ -271,6 +292,7 @@ def main():
         target_aspect=args.target_aspect,
         panel_height_in=args.panel_height_in,
         hspace=args.hspace, vspace=args.vspace,
+        max_fig_width_in=args.max_fig_width_in,
     )
     print(f"[save] {out_path}")
 
