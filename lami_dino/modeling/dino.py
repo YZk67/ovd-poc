@@ -167,13 +167,21 @@ class DINO(nn.Module):
         self.select_box_nums_for_evaluation = select_box_nums_for_evaluation
 
         content_query_embedding = torch.tensor(np.load(query_path), dtype=torch.float32, device=device).contiguous()
+        if content_query_embedding.ndim == 3:
+            # For multi-prototype phrase banks we keep the classifier-side bank intact,
+            # but use the mean pooled prototype to initialize decoder-side content queries.
+            content_query_embedding = content_query_embedding.mean(dim=1)
         self.content_query_embedding = F.normalize(content_query_embedding, p=2, dim=1)
 
         eval_content_query_embedding = torch.tensor(np.load(eval_query_path), dtype=torch.float32, device=device).contiguous()
+        if eval_content_query_embedding.ndim == 3:
+            eval_content_query_embedding = eval_content_query_embedding.mean(dim=1)
         self.eval_content_query_embedding = F.normalize(eval_content_query_embedding, p=2, dim=1)
         # self.eval_content_id = torch.tensor(np.load(eval_id_path), dtype=torch.int64, device=device)
         if vlm_query_path:
             vlm_content_query_embedding = torch.tensor(np.load(vlm_query_path), dtype=torch.float32, device=device).contiguous()# [1203, 768]
+            if vlm_content_query_embedding.ndim == 3:
+                vlm_content_query_embedding = vlm_content_query_embedding.mean(dim=1)
             self.vlm_content_query_embedding = F.normalize(vlm_content_query_embedding, p=2, dim=1)
         
         _, feat_dim = self.content_query_embedding.shape
