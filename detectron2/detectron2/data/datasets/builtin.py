@@ -52,6 +52,16 @@ _PREDEFINED_SPLITS_COCO["obj365v2"] = {
     "obj365v2_val": ("object365/val/", "object365/annotations/zhiyuan_objv2_val.json"),
 }
 
+_D3_IMAGE_ROOT = os.getenv("D3_IMAGE_ROOT", "d3/images")
+_PREDEFINED_SPLITS_COCO["d3"] = {
+    "d3_inter_full": (_D3_IMAGE_ROOT, os.getenv("D3_INTER_FULL_JSON", "d3/annotations/d3_inter_full.json")),
+    "d3_inter_pres": (_D3_IMAGE_ROOT, os.getenv("D3_INTER_PRES_JSON", "d3/annotations/d3_inter_pres.json")),
+    "d3_inter_abs": (_D3_IMAGE_ROOT, os.getenv("D3_INTER_ABS_JSON", "d3/annotations/d3_inter_abs.json")),
+    "d3_intra_full": (_D3_IMAGE_ROOT, os.getenv("D3_INTRA_FULL_JSON", "d3/annotations/d3_intra_full.json")),
+    "d3_intra_pres": (_D3_IMAGE_ROOT, os.getenv("D3_INTRA_PRES_JSON", "d3/annotations/d3_intra_pres.json")),
+    "d3_intra_abs": (_D3_IMAGE_ROOT, os.getenv("D3_INTRA_ABS_JSON", "d3/annotations/d3_intra_abs.json")),
+}
+
 _PREDEFINED_SPLITS_COCO["coco_zeroshot"] = {
     "zeroshot_coco_2017_train": ("coco/train2017", "coco/zero-shot/instances_train2017_seen_2_proposal.json"),
     # "zeroshot_coco_2017_train": ("coco/train2017", "coco/zero-shot/instances_train2017_seen.json"),

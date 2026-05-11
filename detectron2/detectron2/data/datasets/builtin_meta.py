@@ -420,6 +420,8 @@ def _get_builtin_metadata(dataset_name):
         return _get_coco_instances_meta()
     if dataset_name == "obj365v2":
         return _get_obj365_instances_meta()
+    if dataset_name == "d3":
+        return {}
     if dataset_name == "coco_zeroshot":
         return _get_coco_zeroshot_meta()
     if dataset_name == "coco_zeroshot_seen":
