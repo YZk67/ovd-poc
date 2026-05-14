@@ -55,3 +55,35 @@ def test_static_multi_prototype_classifier(tmp_path):
 
     assert logits.shape == (2, 5, num_classes)
     assert subset_logits.shape == (2, 5, 2)
+
+
+def test_static_multi_prototype_classifier_aggregation_modes(tmp_path):
+    pytest.importorskip("detectron2.layers")
+    from lami_dino.modeling.text_classifier import TextClassifier
+
+    num_classes, num_prototypes, dim = 2, 3, 4
+    train_path = tmp_path / "train.npy"
+    eval_path = tmp_path / "eval.npy"
+    embeddings = np.random.randn(num_classes, num_prototypes, dim).astype("float32")
+    np.save(train_path, embeddings)
+    np.save(eval_path, embeddings)
+
+    classifiers = {
+        mode: TextClassifier(
+            input_shape=dim,
+            num_classes=num_classes,
+            zs_weight_path=str(train_path),
+            eval_zs_weight_path=str(eval_path),
+            zs_weight_dim=dim,
+            use_tpa=False,
+            norm_temperature=1.0,
+            static_multi_prototype_agg=mode,
+        )
+        for mode in ("logsumexp", "max", "mean")
+    }
+    x = torch.randn(1, 2, dim)
+
+    outputs = {mode: classifier(x) for mode, classifier in classifiers.items()}
+
+    assert all(logits.shape == (1, 2, num_classes) for logits in outputs.values())
+    assert not torch.allclose(outputs["max"], outputs["mean"])

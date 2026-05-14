@@ -135,6 +135,7 @@ model = L(DINO)(
         tpa_dropout=0.1,
         tpa_tau=0.07,
         tpa_log_interval=200,
+        static_multi_prototype_agg="logsumexp",
     ),
     query_path="dataset/metadata/coco_clip_convnextl_a+cname.npy",
     eval_query_path="dataset/metadata/coco_clip_convnextl_a+cname.npy",

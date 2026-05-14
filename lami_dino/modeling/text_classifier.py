@@ -33,6 +33,7 @@ class TextClassifier(nn.Module):
         tpa_dropout: float = 0.1,
         tpa_tau: float = 0.1,
         tpa_log_interval: int = 200,
+        static_multi_prototype_agg: str = "logsumexp",
     ) -> None:
         super().__init__()
 
@@ -49,6 +50,12 @@ class TextClassifier(nn.Module):
 
         self.use_tpa = use_tpa
         self.num_classes = num_classes
+        if static_multi_prototype_agg not in {"logsumexp", "max", "mean"}:
+            raise ValueError(
+                "static_multi_prototype_agg must be one of "
+                f"'logsumexp', 'max', or 'mean', got {static_multi_prototype_agg!r}."
+            )
+        self.static_multi_prototype_agg = static_multi_prototype_agg
 
         if self.use_tpa:
             train_feats = self._load_text_embeddings(text_embed_path or zs_weight_path)
@@ -180,7 +187,12 @@ class TextClassifier(nn.Module):
                 zs_weight = F.normalize(zs_weight, p=2, dim=-1)
             features = self._normalize_features(x)
             logits = torch.einsum("bqd,ckd->bqck", features, zs_weight)
-            logits = torch.logsumexp(logits, dim=-1)
+            if self.static_multi_prototype_agg == "logsumexp":
+                logits = torch.logsumexp(logits, dim=-1)
+            elif self.static_multi_prototype_agg == "max":
+                logits = logits.max(dim=-1).values
+            elif self.static_multi_prototype_agg == "mean":
+                logits = logits.mean(dim=-1)
             if additional_class is not None:
                 additional = additional_class.to(device=features.device, dtype=features.dtype)
                 if self.norm_weight:

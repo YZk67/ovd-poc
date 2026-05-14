@@ -104,3 +104,44 @@ output/lami_convnext_large_12ep_lvis_zeroshot_d3_inter_full
 ```
 
 这个阶段只验证最小闭环，不包含 D3 finetune、phrase-aware DN 或 alias aggregation。
+
+## 5. 跑 description-bank multi-prototype eval
+
+先从 D3 phrase 列表生成每类 6 条描述 prompt：
+
+```bash
+python tools/prepare_d3_description_prompts.py \
+  --phrases-json dataset/metadata/d3_phrases.json \
+  --output dataset/metadata/d3_description_prompts.json
+```
+
+再用同一个 ConvNeXt-L OpenCLIP text encoder 生成 3D bank：
+
+```bash
+python tools/generate_text_embeddings.py \
+  --prompt-json dataset/metadata/d3_description_prompts.json \
+  --output dataset/metadata/d3_description_bank_convnextl.npy \
+  --aggregate none \
+  --batch-size 128 \
+  --normalize
+```
+
+期望输出 shape：
+
+```text
+(422, 6, 768)
+```
+
+然后跑 multi-prototype max 聚合版本：
+
+```bash
+python tools/train_net.py \
+  --config-file lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_desc_bank_max.py \
+  --eval-only
+```
+
+这个配置默认仍评测 `d3_intra_full`，输出到：
+
+```text
+output/lami_convnext_large_12ep_lvis_zeroshot_d3_desc_bank_max
+```
