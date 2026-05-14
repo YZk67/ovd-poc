@@ -13,8 +13,10 @@ from detrex.data import DetrDatasetMapper
 
 dataloader = OmegaConf.create()
 
+d3_default_dataset = "d3_intra_full"
+
 dataloader.train = L(build_detection_train_loader)(
-    dataset=L(get_detection_dataset_dicts)(names="d3_inter_full"),
+    dataset=L(get_detection_dataset_dicts)(names=d3_default_dataset),
     mapper=L(DetrDatasetMapper)(
         augmentation=[
             L(T.RandomFlip)(),
@@ -49,7 +51,7 @@ dataloader.train = L(build_detection_train_loader)(
 )
 
 dataloader.test = L(build_detection_test_loader)(
-    dataset=L(get_detection_dataset_dicts)(names="d3_inter_full", filter_empty=False),
+    dataset=L(get_detection_dataset_dicts)(names=d3_default_dataset, filter_empty=False),
     mapper=L(DetrDatasetMapper)(
         augmentation=[
             L(T.ResizeShortestEdge)(

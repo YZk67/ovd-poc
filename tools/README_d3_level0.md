@@ -25,7 +25,7 @@ dataset/d3/annotations/d3_intra_abs.json
 
 ```bash
 export D3_IMAGE_ROOT=/path/to/d3_images
-export D3_INTER_FULL_JSON=/path/to/d3_inter_full.json
+export D3_INTRA_FULL_JSON=/path/to/d3_intra_full.json
 ```
 
 ## 2. 导出 phrase 列表
@@ -34,28 +34,28 @@ export D3_INTER_FULL_JSON=/path/to/d3_inter_full.json
 
 ```bash
 python tools/prepare_d3_metadata.py \
-  --coco-json dataset/d3/annotations/d3_inter_full.json \
+  --coco-json dataset/d3/annotations/d3_intra_full.json \
   --metadata-output dataset/metadata/d3_sentences.json \
   --phrases-output dataset/metadata/d3_phrases.json
 ```
 
-如果你只有 `d3_pkl`，可以直接转成 inter-group FULL COCO JSON：
+如果你只有 `d3_pkl`，可以直接转成默认的 intra-group FULL COCO JSON：
 
 ```bash
 python tools/prepare_d3_metadata.py \
   --pkl-root /path/to/d3_pkl \
   --split full \
-  --setting inter \
-  --coco-output dataset/d3/annotations/d3_inter_full.json \
+  --setting intra \
+  --coco-output dataset/d3/annotations/d3_intra_full.json \
   --metadata-output dataset/metadata/d3_sentences.json \
   --phrases-output dataset/metadata/d3_phrases.json
 ```
 
-同理可生成 PRES / ABS：
+主表常用的 PRES / ABS 同样用 intra setting 生成：
 
 ```bash
-python tools/prepare_d3_metadata.py --pkl-root /path/to/d3_pkl --split pres --setting inter --coco-output dataset/d3/annotations/d3_inter_pres.json
-python tools/prepare_d3_metadata.py --pkl-root /path/to/d3_pkl --split abs --setting inter --coco-output dataset/d3/annotations/d3_inter_abs.json
+python tools/prepare_d3_metadata.py --pkl-root /path/to/d3_pkl --split pres --setting intra --coco-output dataset/d3/annotations/d3_intra_pres.json
+python tools/prepare_d3_metadata.py --pkl-root /path/to/d3_pkl --split abs --setting intra --coco-output dataset/d3/annotations/d3_intra_abs.json
 ```
 
 ## 3. 生成 D3 text embedding bank
@@ -83,10 +83,24 @@ python tools/train_net.py \
   --eval-only
 ```
 
-默认评测 split 是 `d3_inter_full`，输出目录是：
+默认评测 split 是 `d3_intra_full`，对应论文主表常用的 D3/DOD Full AP。输出目录是：
 
 ```text
-output/lami_convnext_large_12ep_lvis_zeroshot_d3
+output/lami_convnext_large_12ep_lvis_zeroshot_d3_full
+```
+
+如果要跑更难的 inter-scenario 压力测试，使用：
+
+```bash
+python tools/train_net.py \
+  --config-file lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_inter_full.py \
+  --eval-only
+```
+
+它会评测 `d3_inter_full`，输出到：
+
+```text
+output/lami_convnext_large_12ep_lvis_zeroshot_d3_inter_full
 ```
 
 这个阶段只验证最小闭环，不包含 D3 finetune、phrase-aware DN 或 alias aggregation。

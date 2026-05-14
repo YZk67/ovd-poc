@@ -247,8 +247,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--setting",
         choices=("inter", "intra"),
-        default="inter",
-        help="COCO conversion setting when --coco-output is used with --pkl-root.",
+        default="intra",
+        help=(
+            "COCO conversion setting when --coco-output is used with --pkl-root. "
+            "Defaults to intra, the D3/DOD Full AP setting used in most paper main tables."
+        ),
     )
     parser.add_argument(
         "--metadata-output",
