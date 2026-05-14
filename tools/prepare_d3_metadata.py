@@ -215,7 +215,10 @@ def _convert_pkl_to_coco(
                         float(coord)
                         for coord in _to_builtin(_first_scalar(ann["bbox"]))
                     ],
-                    "iscrowd": int(_first_scalar(ann.get("iscrowd", 0))),
+                    # D3 pkl annotations mark masks as crowd-like, but D3/DOD
+                    # bbox evaluation treats them as normal described objects.
+                    # Keeping iscrowd=1 makes COCOeval ignore every GT box.
+                    "iscrowd": 0,
                 }
             )
             output_ann_id += 1
