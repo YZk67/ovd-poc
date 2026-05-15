@@ -146,6 +146,13 @@ def _build_anchored_prompts(phrase: str, prompt_count: int) -> List[str]:
     return prompts[:prompt_count]
 
 
+def _build_fallback_prompts(phrase: str, prompt_count: int) -> List[str]:
+    prompts = [phrase]
+    for template in ANCHOR_FALLBACK_TEMPLATES:
+        _add_unique(prompts, template.format(phrase=phrase))
+    return prompts[:prompt_count]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -162,9 +169,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--preset",
-        choices=("anchored", "generic6"),
+        choices=("anchored", "fallback", "generic6"),
         default="anchored",
-        help="Prompt recipe. anchored keeps the original phrase dominant; generic6 is the older broad-template bank.",
+        help=(
+            "Prompt recipe. anchored mixes heuristic paraphrases and fallback anchors; "
+            "fallback uses only the original phrase plus fallback anchors; "
+            "generic6 is the older broad-template bank."
+        ),
     )
     parser.add_argument(
         "--prompt-count",
@@ -184,6 +195,8 @@ def main() -> None:
     for idx, phrase in enumerate(phrases, start=1):
         if args.preset == "generic6":
             prompts = _build_prompts(phrase, GENERIC_TEMPLATES)
+        elif args.preset == "fallback":
+            prompts = _build_fallback_prompts(phrase, args.prompt_count)
         else:
             prompts = _build_anchored_prompts(phrase, args.prompt_count)
         if expected_count is None:
