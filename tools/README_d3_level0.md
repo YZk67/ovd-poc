@@ -192,6 +192,44 @@ python tools/train_net.py \
   --eval-only
 ```
 
+紧邻 ablation 4：把两个 fallback prompt 拆开，分别测试 `the described target is ...` 和 `a visible region matching ...`：
+
+```bash
+python tools/prepare_d3_description_prompts.py \
+  --phrases-json dataset/metadata/d3_phrases.json \
+  --output dataset/metadata/d3_description_anchor_target_prompts.json \
+  --preset fallback_target \
+  --prompt-count 2
+
+python tools/generate_text_embeddings.py \
+  --prompt-json dataset/metadata/d3_description_anchor_target_prompts.json \
+  --output dataset/metadata/d3_description_anchor_target_bank_convnextl.npy \
+  --aggregate none \
+  --batch-size 128 \
+  --normalize
+
+python tools/train_net.py \
+  --config-file lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_desc_anchor_target_mean_cls_only.py \
+  --eval-only
+
+python tools/prepare_d3_description_prompts.py \
+  --phrases-json dataset/metadata/d3_phrases.json \
+  --output dataset/metadata/d3_description_anchor_region_prompts.json \
+  --preset fallback_region \
+  --prompt-count 2
+
+python tools/generate_text_embeddings.py \
+  --prompt-json dataset/metadata/d3_description_anchor_region_prompts.json \
+  --output dataset/metadata/d3_description_anchor_region_bank_convnextl.npy \
+  --aggregate none \
+  --batch-size 128 \
+  --normalize
+
+python tools/train_net.py \
+  --config-file lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_desc_anchor_region_mean_cls_only.py \
+  --eval-only
+```
+
 如果要复现旧的泛模板 max 聚合版本，先用 `--preset generic6` 生成：
 
 ```bash

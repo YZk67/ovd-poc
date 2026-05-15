@@ -26,9 +26,11 @@ GENERIC_TEMPLATES = [
     "visual attributes and relations: {phrase}",
 ]
 
+TARGET_FALLBACK_TEMPLATE = "the described target is {phrase}"
+REGION_FALLBACK_TEMPLATE = "a visible region matching {phrase}"
 ANCHOR_FALLBACK_TEMPLATES = [
-    "the described target is {phrase}",
-    "a visible region matching {phrase}",
+    TARGET_FALLBACK_TEMPLATE,
+    REGION_FALLBACK_TEMPLATE,
 ]
 
 
@@ -146,9 +148,13 @@ def _build_anchored_prompts(phrase: str, prompt_count: int) -> List[str]:
     return prompts[:prompt_count]
 
 
-def _build_fallback_prompts(phrase: str, prompt_count: int) -> List[str]:
+def _build_fallback_prompts(
+    phrase: str,
+    prompt_count: int,
+    templates: Iterable[str] = ANCHOR_FALLBACK_TEMPLATES,
+) -> List[str]:
     prompts = [phrase]
-    for template in ANCHOR_FALLBACK_TEMPLATES:
+    for template in templates:
         _add_unique(prompts, template.format(phrase=phrase))
     return prompts[:prompt_count]
 
@@ -169,11 +175,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--preset",
-        choices=("anchored", "fallback", "generic6"),
+        choices=("anchored", "fallback", "fallback_target", "fallback_region", "generic6"),
         default="anchored",
         help=(
             "Prompt recipe. anchored mixes heuristic paraphrases and fallback anchors; "
             "fallback uses only the original phrase plus fallback anchors; "
+            "fallback_target and fallback_region isolate one fallback anchor each; "
             "generic6 is the older broad-template bank."
         ),
     )
@@ -197,6 +204,10 @@ def main() -> None:
             prompts = _build_prompts(phrase, GENERIC_TEMPLATES)
         elif args.preset == "fallback":
             prompts = _build_fallback_prompts(phrase, args.prompt_count)
+        elif args.preset == "fallback_target":
+            prompts = _build_fallback_prompts(phrase, args.prompt_count, [TARGET_FALLBACK_TEMPLATE])
+        elif args.preset == "fallback_region":
+            prompts = _build_fallback_prompts(phrase, args.prompt_count, [REGION_FALLBACK_TEMPLATE])
         else:
             prompts = _build_anchored_prompts(phrase, args.prompt_count)
         if expected_count is None:
