@@ -230,6 +230,37 @@ python tools/train_net.py \
   --eval-only
 ```
 
+紧邻 ablation 5：固定 `phrase` 和 `the described target is {phrase}` 两个 embedding，直接合成单 prototype 并扫描 target prompt 权重：
+
+```bash
+python tools/mix_text_prototype_weights.py \
+  --input dataset/metadata/d3_description_anchor_target_bank_convnextl.npy \
+  --weights 0.25 0.5 0.75 1.0
+```
+
+这会生成：
+
+```text
+dataset/metadata/d3_description_anchor_target_w025_bank_convnextl.npy
+dataset/metadata/d3_description_anchor_target_w050_bank_convnextl.npy
+dataset/metadata/d3_description_anchor_target_w075_bank_convnextl.npy
+dataset/metadata/d3_description_anchor_target_w100_bank_convnextl.npy
+```
+
+每个输出都是单 prototype bank，shape 为 `(422, 768)`。评测时用同一个 weighted config，并通过 override 指定不同 bank 和 output dir：
+
+```bash
+python tools/train_net.py \
+  --config-file lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_desc_anchor_target_weighted_cls_only.py \
+  --eval-only \
+  model.classifier.zs_weight_path=dataset/metadata/d3_description_anchor_target_w025_bank_convnextl.npy \
+  model.classifier.eval_zs_weight_path=dataset/metadata/d3_description_anchor_target_w025_bank_convnextl.npy \
+  model.classifier.text_embed_path=dataset/metadata/d3_description_anchor_target_w025_bank_convnextl.npy \
+  model.classifier.eval_text_embed_path=dataset/metadata/d3_description_anchor_target_w025_bank_convnextl.npy \
+  train.output_dir=./output/lami_convnext_large_12ep_lvis_zeroshot_d3_desc_anchor_target_w025_cls_only \
+  dataloader.evaluator.output_dir=./output/lami_convnext_large_12ep_lvis_zeroshot_d3_desc_anchor_target_w025_cls_only
+```
+
 如果要复现旧的泛模板 max 聚合版本，先用 `--preset generic6` 生成：
 
 ```bash
