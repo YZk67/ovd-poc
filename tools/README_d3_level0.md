@@ -107,20 +107,22 @@ output/lami_convnext_large_12ep_lvis_zeroshot_d3_inter_full
 
 ## 5. 跑 description-bank multi-prototype eval
 
-先从 D3 phrase 列表生成每类 6 条描述 prompt：
+先从 D3 phrase 列表生成每类 3 条 anchored description prompt。这个版本保留原始 phrase，并只加少量语义等价或弱锚定改写：
 
 ```bash
 python tools/prepare_d3_description_prompts.py \
   --phrases-json dataset/metadata/d3_phrases.json \
-  --output dataset/metadata/d3_description_prompts.json
+  --output dataset/metadata/d3_description_anchor_prompts.json \
+  --preset anchored \
+  --prompt-count 3
 ```
 
 再用同一个 ConvNeXt-L OpenCLIP text encoder 生成 3D bank：
 
 ```bash
 python tools/generate_text_embeddings.py \
-  --prompt-json dataset/metadata/d3_description_prompts.json \
-  --output dataset/metadata/d3_description_bank_convnextl.npy \
+  --prompt-json dataset/metadata/d3_description_anchor_prompts.json \
+  --output dataset/metadata/d3_description_anchor_bank_convnextl.npy \
   --aggregate none \
   --batch-size 128 \
   --normalize
@@ -129,10 +131,27 @@ python tools/generate_text_embeddings.py \
 期望输出 shape：
 
 ```text
-(422, 6, 768)
+(422, 3, 768)
 ```
 
-然后跑 multi-prototype max 聚合版本：
+然后跑 classifier-only multi-prototype mean 聚合版本。query init 和 VLM score ensemble 仍使用原始单句 phrase bank：
+
+```bash
+python tools/train_net.py \
+  --config-file lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_desc_anchor_mean_cls_only.py \
+  --eval-only
+```
+
+如果要复现旧的泛模板 max 聚合版本，先用 `--preset generic6` 生成：
+
+```bash
+python tools/prepare_d3_description_prompts.py \
+  --phrases-json dataset/metadata/d3_phrases.json \
+  --output dataset/metadata/d3_description_prompts.json \
+  --preset generic6
+```
+
+再生成 `dataset/metadata/d3_description_bank_convnextl.npy` 并运行：
 
 ```bash
 python tools/train_net.py \
