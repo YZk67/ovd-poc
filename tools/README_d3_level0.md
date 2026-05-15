@@ -142,6 +142,35 @@ python tools/train_net.py \
   --eval-only
 ```
 
+紧邻 ablation 1：只保留原始 phrase + 第一条 anchored 改写，检查第 3 条 fallback prompt 是否真的有贡献：
+
+```bash
+python tools/prepare_d3_description_prompts.py \
+  --phrases-json dataset/metadata/d3_phrases.json \
+  --output dataset/metadata/d3_description_anchor2_prompts.json \
+  --preset anchored \
+  --prompt-count 2
+
+python tools/generate_text_embeddings.py \
+  --prompt-json dataset/metadata/d3_description_anchor2_prompts.json \
+  --output dataset/metadata/d3_description_anchor2_bank_convnextl.npy \
+  --aggregate none \
+  --batch-size 128 \
+  --normalize
+
+python tools/train_net.py \
+  --config-file lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_desc_anchor2_mean_cls_only.py \
+  --eval-only
+```
+
+紧邻 ablation 2：使用同一个 3-prompt anchored bank，把 classifier 聚合从 `mean` 换成 `logsumexp`：
+
+```bash
+python tools/train_net.py \
+  --config-file lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_desc_anchor_logsumexp_cls_only.py \
+  --eval-only
+```
+
 如果要复现旧的泛模板 max 聚合版本，先用 `--preset generic6` 生成：
 
 ```bash
