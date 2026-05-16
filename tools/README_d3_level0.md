@@ -261,6 +261,48 @@ python tools/train_net.py \
   dataloader.evaluator.output_dir=./output/lami_convnext_large_12ep_lvis_zeroshot_d3_desc_anchor_target_w025_cls_only
 ```
 
+## 6. Crop-level description rerank pilot
+
+如果 `w075` 是当前最优 first-stage detector，可以直接复用它保存的 COCO predictions 做离线 crop rerank，不需要重新跑 detector：
+
+```bash
+python tools/rerank_d3_predictions_with_clip_crops.py \
+  --predictions output/lami_convnext_large_12ep_lvis_zeroshot_d3_desc_anchor_target_w075_cls_only/coco_instances_results.json \
+  --annotation dataset/d3/annotations/d3_intra_full.json \
+  --image-root dataset/d3/images \
+  --phrases-json dataset/metadata/d3_phrases.json \
+  --output output/d3_crop_rerank_w075_top50_l025_m025.json \
+  --rerank-topk-per-image 50 \
+  --keep-topk-per-image 100 \
+  --crop-margin 0.25 \
+  --fusion logit_add \
+  --fusion-weight 0.25 \
+  --clip-scale 10.0 \
+  --clip-center 0.25 \
+  --eval
+```
+
+建议先用 `--max-images 100` 做 smoke test，确认图片路径和 OpenCLIP 环境正常：
+
+```bash
+python tools/rerank_d3_predictions_with_clip_crops.py \
+  --predictions output/lami_convnext_large_12ep_lvis_zeroshot_d3_desc_anchor_target_w075_cls_only/coco_instances_results.json \
+  --annotation dataset/d3/annotations/d3_intra_full.json \
+  --image-root dataset/d3/images \
+  --output /tmp/d3_crop_rerank_smoke.json \
+  --rerank-topk-per-image 20 \
+  --keep-topk-per-image 100 \
+  --max-images 100
+```
+
+这个阶段的核心观察不是最终 SOTA，而是 region-level text verification 是否能在 `w075 AP 9.16` 之上继续涨。若默认参数涨，下一步再扫：
+
+```text
+fusion-weight: 0.1, 0.25, 0.5
+crop-margin:   0.1, 0.25, 0.5
+rerank top-k:  20, 50, 100
+```
+
 如果要复现旧的泛模板 max 聚合版本，先用 `--preset generic6` 生成：
 
 ```bash

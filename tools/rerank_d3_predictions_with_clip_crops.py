@@ -1,0 +1,456 @@
+#!/usr/bin/env python3
+"""
+Post-hoc D3 crop reranking with OpenCLIP.
+
+This is a lightweight pilot for region-level description verification:
+
+1. Load detector COCO-format predictions.
+2. For each image, crop the top scoring boxes.
+3. Score each crop against the predicted D3 phrase prompt.
+4. Fuse detector score and crop-text score.
+5. Save reranked COCO-format predictions and optionally run COCO bbox eval.
+
+The script intentionally runs outside the detector so a saved
+coco_instances_results.json can be reused for multiple fusion sweeps.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+from collections import defaultdict
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from PIL import Image
+from tqdm import tqdm
+
+
+def _load_json(path: Path) -> Any:
+    with path.open("r") as f:
+        return json.load(f)
+
+
+def _save_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as f:
+        json.dump(data, f, separators=(",", ":"))
+
+
+def _load_categories(annotation: Mapping[str, Any], phrases_json: Optional[Path]) -> Dict[int, str]:
+    if phrases_json is not None:
+        phrases = _load_json(phrases_json)
+        if not isinstance(phrases, list):
+            raise ValueError(f"Expected phrase JSON list, got {type(phrases).__name__}.")
+        return {idx + 1: str(phrase) for idx, phrase in enumerate(phrases)}
+
+    categories = annotation.get("categories")
+    if not categories:
+        raise ValueError("Annotation JSON has no categories; pass --phrases-json explicitly.")
+    return {int(cat["id"]): str(cat.get("name", cat.get("raw_sent", cat["id"]))) for cat in categories}
+
+
+def _group_predictions(predictions: Sequence[Mapping[str, Any]]) -> Dict[int, List[Dict[str, Any]]]:
+    grouped: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for pred in predictions:
+        grouped[int(pred["image_id"])].append(dict(pred))
+    for preds in grouped.values():
+        preds.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
+    return grouped
+
+
+def _limit_predictions(predictions: Sequence[Dict[str, Any]], keep_topk: int) -> List[Dict[str, Any]]:
+    if keep_topk <= 0:
+        return list(predictions)
+    return list(predictions[:keep_topk])
+
+
+def _resolve_image_path(image_root: Path, file_name: str) -> Path:
+    file_path = Path(file_name)
+    if file_path.is_absolute() and file_path.exists():
+        return file_path
+
+    candidates = [
+        image_root / file_name,
+        image_root / file_path.name,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def _expanded_xyxy(
+    bbox_xywh: Sequence[float],
+    *,
+    width: int,
+    height: int,
+    margin: float,
+) -> Optional[Tuple[int, int, int, int]]:
+    x, y, w, h = [float(v) for v in bbox_xywh]
+    if w <= 1 or h <= 1:
+        return None
+
+    pad_x = w * margin
+    pad_y = h * margin
+    x0 = max(0.0, x - pad_x)
+    y0 = max(0.0, y - pad_y)
+    x1 = min(float(width), x + w + pad_x)
+    y1 = min(float(height), y + h + pad_y)
+    if x1 <= x0 + 1 or y1 <= y0 + 1:
+        return None
+    return int(math.floor(x0)), int(math.floor(y0)), int(math.ceil(x1)), int(math.ceil(y1))
+
+
+def _sigmoid(value: float) -> float:
+    if value >= 0:
+        z = math.exp(-value)
+        return 1.0 / (1.0 + z)
+    z = math.exp(value)
+    return z / (1.0 + z)
+
+
+def _logit(score: float) -> float:
+    score = min(max(score, 1e-6), 1.0 - 1e-6)
+    return math.log(score / (1.0 - score))
+
+
+def _fuse_score(
+    detector_score: float,
+    clip_score: float,
+    *,
+    mode: str,
+    fusion_weight: float,
+    clip_scale: float,
+    clip_center: float,
+) -> float:
+    clip_logit = clip_scale * (clip_score - clip_center)
+    clip_prob = _sigmoid(clip_logit)
+
+    if mode == "logit_add":
+        return _sigmoid(_logit(detector_score) + fusion_weight * clip_logit)
+    if mode == "linear":
+        return (1.0 - fusion_weight) * detector_score + fusion_weight * clip_prob
+    if mode == "replace":
+        return clip_prob
+    raise ValueError(f"Unsupported fusion mode: {mode}")
+
+
+def _load_openclip(model_name: str, pretrained: str, device: str):
+    try:
+        import open_clip
+    except ImportError as exc:
+        raise ImportError("open_clip is required. Run this script in the lami env.") from exc
+
+    model, _, preprocess = open_clip.create_model_and_transforms(
+        model_name,
+        pretrained=pretrained,
+        device=device,
+    )
+    tokenizer = open_clip.tokenize
+    model.eval()
+    return model, preprocess, tokenizer
+
+
+@torch.no_grad()
+def _encode_texts(
+    model,
+    tokenizer,
+    texts: Sequence[str],
+    *,
+    batch_size: int,
+    device: str,
+) -> torch.Tensor:
+    features = []
+    for start in range(0, len(texts), batch_size):
+        batch = list(texts[start : start + batch_size])
+        tokens = tokenizer(batch).to(device)
+        feats = model.encode_text(tokens)
+        feats = F.normalize(feats.float(), p=2, dim=-1)
+        features.append(feats.cpu())
+    return torch.cat(features, dim=0)
+
+
+@torch.no_grad()
+def _encode_crops(
+    model,
+    tensors: Sequence[torch.Tensor],
+    *,
+    batch_size: int,
+    device: str,
+) -> torch.Tensor:
+    features = []
+    for start in range(0, len(tensors), batch_size):
+        batch = torch.stack(list(tensors[start : start + batch_size]), dim=0).to(device)
+        feats = model.encode_image(batch)
+        feats = F.normalize(feats.float(), p=2, dim=-1)
+        features.append(feats.cpu())
+    return torch.cat(features, dim=0)
+
+
+def _evaluate_coco(annotation_path: Path, results: Sequence[Mapping[str, Any]]) -> None:
+    from pycocotools.coco import COCO
+    from pycocotools.cocoeval import COCOeval
+
+    coco_gt = COCO(str(annotation_path))
+    coco_dt = coco_gt.loadRes(list(results))
+    evaluator = COCOeval(coco_gt, coco_dt, "bbox")
+    evaluator.params.maxDets = [1, 10, 100]
+    evaluator.evaluate()
+    evaluator.accumulate()
+    evaluator.summarize()
+
+
+def rerank(args: argparse.Namespace) -> List[Dict[str, Any]]:
+    annotation = _load_json(args.annotation)
+    predictions = _load_json(args.predictions)
+    if not isinstance(predictions, list):
+        raise ValueError(f"Expected prediction JSON list, got {type(predictions).__name__}.")
+
+    image_infos = {int(item["id"]): item for item in annotation["images"]}
+    categories = _load_categories(annotation, args.phrases_json)
+    category_ids = sorted(categories)
+    category_to_row = {cat_id: row for row, cat_id in enumerate(category_ids)}
+    prompts = [args.prompt_template.format(phrase=categories[cat_id]) for cat_id in category_ids]
+
+    grouped = _group_predictions(predictions)
+    image_ids = sorted(grouped)
+    if args.max_images is not None:
+        image_ids = image_ids[: args.max_images]
+
+    device = args.device
+    model, preprocess, tokenizer = _load_openclip(args.model, args.pretrained, device)
+    text_features = _encode_texts(
+        model,
+        tokenizer,
+        prompts,
+        batch_size=args.text_batch_size,
+        device=device,
+    )
+
+    reranked_results: List[Dict[str, Any]] = []
+    missing_images = 0
+    invalid_crops = 0
+    processed_crops = 0
+
+    for image_id in tqdm(image_ids, desc="reranking images"):
+        preds = grouped[image_id]
+        image_info = image_infos.get(image_id)
+        if image_info is None:
+            continue
+
+        image_path = _resolve_image_path(args.image_root, str(image_info["file_name"]))
+        if not image_path.exists():
+            missing_images += 1
+            if not args.drop_unreranked:
+                reranked_results.extend(_limit_predictions(preds, args.keep_topk_per_image))
+            continue
+
+        image = Image.open(image_path).convert("RGB")
+        width, height = image.size
+
+        output_preds = [dict(pred) for pred in preds]
+        crop_tensors: List[torch.Tensor] = []
+        crop_positions: List[int] = []
+        crop_cat_rows: List[int] = []
+
+        for position, pred in enumerate(output_preds[: args.rerank_topk_per_image]):
+            cat_id = int(pred["category_id"])
+            if cat_id not in category_to_row:
+                continue
+            xyxy = _expanded_xyxy(pred["bbox"], width=width, height=height, margin=args.crop_margin)
+            if xyxy is None:
+                invalid_crops += 1
+                continue
+            crop = image.crop(xyxy)
+            crop_tensors.append(preprocess(crop))
+            crop_positions.append(position)
+            crop_cat_rows.append(category_to_row[cat_id])
+
+        if crop_tensors:
+            image_features = _encode_crops(
+                model,
+                crop_tensors,
+                batch_size=args.image_batch_size,
+                device=device,
+            )
+            text_for_crops = text_features[torch.tensor(crop_cat_rows, dtype=torch.long)]
+            clip_scores = (image_features * text_for_crops).sum(dim=-1).numpy()
+            processed_crops += len(crop_tensors)
+
+            for position, clip_score in zip(crop_positions, clip_scores):
+                pred = output_preds[position]
+                old_score = float(pred["score"])
+                new_score = _fuse_score(
+                    old_score,
+                    float(clip_score),
+                    mode=args.fusion,
+                    fusion_weight=args.fusion_weight,
+                    clip_scale=args.clip_scale,
+                    clip_center=args.clip_center,
+                )
+                pred["score"] = float(new_score)
+                if args.include_debug_fields:
+                    pred["det_score"] = old_score
+                    pred["clip_score"] = float(clip_score)
+
+        if args.drop_unreranked:
+            output_preds = output_preds[: args.rerank_topk_per_image]
+
+        output_preds.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
+        output_preds = _limit_predictions(output_preds, args.keep_topk_per_image)
+        reranked_results.extend(output_preds)
+
+    print(f"input predictions: {len(predictions)}")
+    print(f"output predictions: {len(reranked_results)}")
+    print(f"processed crops: {processed_crops}")
+    print(f"missing images: {missing_images}")
+    print(f"invalid crops: {invalid_crops}")
+    return reranked_results
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--predictions",
+        type=Path,
+        required=True,
+        help="Detector COCO-format result JSON, e.g. coco_instances_results.json.",
+    )
+    parser.add_argument(
+        "--annotation",
+        type=Path,
+        default=Path("dataset/d3/annotations/d3_intra_full.json"),
+        help="D3 COCO annotation JSON for evaluation and image metadata.",
+    )
+    parser.add_argument(
+        "--image-root",
+        type=Path,
+        default=Path("dataset/d3/images"),
+        help="Root directory containing D3 images.",
+    )
+    parser.add_argument(
+        "--phrases-json",
+        type=Path,
+        default=Path("dataset/metadata/d3_phrases.json"),
+        help="Optional ordered phrase list. Defaults to D3 phrase metadata.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Output reranked COCO-format result JSON.",
+    )
+    parser.add_argument(
+        "--prompt-template",
+        default="the described target is {phrase}",
+        help="Text prompt used for crop-text scoring.",
+    )
+    parser.add_argument(
+        "--model",
+        default="convnext_large_d_320",
+        help="OpenCLIP model name.",
+    )
+    parser.add_argument(
+        "--pretrained",
+        default="laion2b_s29b_b131k_ft_soup",
+        help="OpenCLIP pretrained tag.",
+    )
+    parser.add_argument(
+        "--rerank-topk-per-image",
+        type=int,
+        default=50,
+        help="Only crop-rerank this many highest detector-score predictions per image.",
+    )
+    parser.add_argument(
+        "--keep-topk-per-image",
+        type=int,
+        default=100,
+        help="Keep at most this many predictions per image in the output. Use 0 to keep all.",
+    )
+    parser.add_argument(
+        "--drop-unreranked",
+        action="store_true",
+        help="Drop predictions outside --rerank-topk-per-image instead of keeping original scores.",
+    )
+    parser.add_argument(
+        "--crop-margin",
+        type=float,
+        default=0.25,
+        help="Relative bbox margin added before cropping.",
+    )
+    parser.add_argument(
+        "--fusion",
+        choices=("logit_add", "linear", "replace"),
+        default="logit_add",
+        help="How to fuse detector score and CLIP crop-text score.",
+    )
+    parser.add_argument(
+        "--fusion-weight",
+        type=float,
+        default=0.25,
+        help="Weight of the CLIP term in fusion.",
+    )
+    parser.add_argument(
+        "--clip-scale",
+        type=float,
+        default=10.0,
+        help="Scale applied to centered CLIP cosine before fusion.",
+    )
+    parser.add_argument(
+        "--clip-center",
+        type=float,
+        default=0.25,
+        help="Center subtracted from CLIP cosine before scaling.",
+    )
+    parser.add_argument(
+        "--image-batch-size",
+        type=int,
+        default=64,
+        help="Batch size for crop image encoding.",
+    )
+    parser.add_argument(
+        "--text-batch-size",
+        type=int,
+        default=256,
+        help="Batch size for prompt text encoding.",
+    )
+    parser.add_argument(
+        "--device",
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Torch device.",
+    )
+    parser.add_argument(
+        "--max-images",
+        type=int,
+        default=None,
+        help="Optional smoke-test limit on number of images.",
+    )
+    parser.add_argument(
+        "--eval",
+        action="store_true",
+        help="Run COCO bbox evaluation after writing output.",
+    )
+    parser.add_argument(
+        "--include-debug-fields",
+        action="store_true",
+        help="Store det_score and clip_score in output predictions.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    results = rerank(args)
+    _save_json(args.output, results)
+    print(f"saved reranked predictions to {args.output}")
+    if args.eval:
+        _evaluate_coco(args.annotation, results)
+
+
+if __name__ == "__main__":
+    main()
