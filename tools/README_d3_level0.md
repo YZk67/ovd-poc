@@ -400,3 +400,60 @@ label=0 wrong_phrase_same_region: 对上的 box 配另一个不匹配 phrase
 ```
 
 这是后续训练 `Description-Conditioned Target Verifier` 的输入；先固定这个样本集，再训练 MLP 或 cross-attention verifier。
+
+## 8. 训练 crop-description verifier
+
+先不要接回 detector。先用 frozen OpenCLIP crop/text feature 训练一个小 MLP verifier，并看验证集上是否能区分：
+
+```text
+positive: region 和 phrase 匹配
+same_phrase_bad_box: phrase 对，但 box 没对上
+wrong_phrase_same_region: box 是真实目标，但 phrase 换成了不匹配描述
+```
+
+建议先跑一个小 smoke，确认缓存和训练链路正常：
+
+```bash
+python tools/train_d3_crop_verifier.py \
+  --train-jsonl dataset/d3/verifier_pairs_w075/train.jsonl \
+  --val-jsonl dataset/d3/verifier_pairs_w075/val.jsonl \
+  --image-root dataset/d3/images \
+  --output-dir output/d3_crop_verifier_w075_smoke \
+  --cache-dir output/d3_crop_verifier_w075_smoke/cache \
+  --same-phrase-neg-per-pos 1 \
+  --wrong-phrase-neg-per-pos 2 \
+  --max-train-samples 2000 \
+  --max-val-samples 1000 \
+  --crop-margin 0.1 \
+  --epochs 1 \
+  --batch-size 256
+```
+
+再跑完整 balanced 版本：
+
+```bash
+python tools/train_d3_crop_verifier.py \
+  --train-jsonl dataset/d3/verifier_pairs_w075/train.jsonl \
+  --val-jsonl dataset/d3/verifier_pairs_w075/val.jsonl \
+  --image-root dataset/d3/images \
+  --output-dir output/d3_crop_verifier_w075_balanced \
+  --cache-dir output/d3_crop_verifier_w075_balanced/cache \
+  --same-phrase-neg-per-pos 1 \
+  --wrong-phrase-neg-per-pos 2 \
+  --crop-margin 0.1 \
+  --epochs 5 \
+  --batch-size 512 \
+  --image-batch-size 64 \
+  --lr 1e-3
+```
+
+输出：
+
+```text
+output/d3_crop_verifier_w075_balanced/cache/train_features.pt
+output/d3_crop_verifier_w075_balanced/cache/val_features.pt
+output/d3_crop_verifier_w075_balanced/verifier_best.pt
+output/d3_crop_verifier_w075_balanced/metrics.json
+```
+
+先重点看 `metrics.json` 里 `val.wrong_phrase_same_region.ap/auc`。如果这个子集明显高于随机，说明 verifier 确实学到了“同一个 region 是否满足目标描述”，再把 `verifier_best.pt` 接回 rerank。
