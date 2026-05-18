@@ -295,6 +295,46 @@ python tools/rerank_d3_predictions_with_clip_crops.py \
   --max-images 100
 ```
 
+小范围参数趋势检查先只跑 500 张图。`--max-images` 会让 eval 自动限制在输出中的 image ids；先用 `--skip-rerank` 得到同一 500 张图上的 detector-only baseline：
+
+```bash
+python tools/rerank_d3_predictions_with_clip_crops.py \
+  --predictions output/lami_convnext_large_12ep_lvis_zeroshot_d3_desc_anchor_target_w075_cls_only/coco_instances_results.json \
+  --annotation dataset/d3/annotations/d3_intra_full.json \
+  --image-root dataset/d3/images \
+  --phrases-json dataset/metadata/d3_phrases.json \
+  --output output/d3_crop_rerank_subset500_detector_only.json \
+  --keep-topk-per-image 100 \
+  --max-images 500 \
+  --skip-rerank \
+  --eval
+```
+
+然后只扫四个紧邻组合：
+
+```bash
+for margin in 0.1 0.5; do
+  for weight in 0.1 0.5; do
+    tag="m${margin/./}_l${weight/./}"
+    python tools/rerank_d3_predictions_with_clip_crops.py \
+      --predictions output/lami_convnext_large_12ep_lvis_zeroshot_d3_desc_anchor_target_w075_cls_only/coco_instances_results.json \
+      --annotation dataset/d3/annotations/d3_intra_full.json \
+      --image-root dataset/d3/images \
+      --phrases-json dataset/metadata/d3_phrases.json \
+      --output output/d3_crop_rerank_subset500_top20_${tag}.json \
+      --rerank-topk-per-image 20 \
+      --keep-topk-per-image 100 \
+      --crop-margin "$margin" \
+      --fusion logit_add \
+      --fusion-weight "$weight" \
+      --clip-scale 10.0 \
+      --clip-center 0.25 \
+      --max-images 500 \
+      --eval
+  done
+done
+```
+
 这个阶段的核心观察不是最终 SOTA，而是 region-level text verification 是否能在 `w075 AP 9.16` 之上继续涨。若默认参数涨，下一步再扫：
 
 ```text

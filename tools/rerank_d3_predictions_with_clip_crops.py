@@ -192,7 +192,12 @@ def _encode_crops(
     return torch.cat(features, dim=0)
 
 
-def _evaluate_coco(annotation_path: Path, results: Sequence[Mapping[str, Any]]) -> None:
+def _evaluate_coco(
+    annotation_path: Path,
+    results: Sequence[Mapping[str, Any]],
+    *,
+    image_ids: Optional[Sequence[int]] = None,
+) -> None:
     from pycocotools.coco import COCO
     from pycocotools.cocoeval import COCOeval
 
@@ -202,6 +207,9 @@ def _evaluate_coco(annotation_path: Path, results: Sequence[Mapping[str, Any]]) 
     coco_dt = coco_gt.loadRes(list(results))
     evaluator = COCOeval(coco_gt, coco_dt, "bbox")
     evaluator.params.maxDets = [1, 10, 100]
+    if image_ids is not None:
+        evaluator.params.imgIds = sorted(set(int(image_id) for image_id in image_ids))
+        print(f"evaluating image ids: {len(evaluator.params.imgIds)}")
     evaluator.evaluate()
     evaluator.accumulate()
     evaluator.summarize()
@@ -223,6 +231,18 @@ def rerank(args: argparse.Namespace) -> List[Dict[str, Any]]:
     image_ids = sorted(grouped)
     if args.max_images is not None:
         image_ids = image_ids[: args.max_images]
+
+    if args.skip_rerank:
+        reranked_results = []
+        for image_id in tqdm(image_ids, desc="selecting detector predictions"):
+            preds = [dict(pred) for pred in grouped[image_id]]
+            reranked_results.extend(_limit_predictions(preds, args.keep_topk_per_image))
+        print(f"input predictions: {len(predictions)}")
+        print(f"output predictions: {len(reranked_results)}")
+        print("processed crops: 0")
+        print("missing images: 0")
+        print("invalid crops: 0")
+        return reranked_results
 
     device = args.device
     model, preprocess, tokenizer = _load_openclip(args.model, args.pretrained, device)
@@ -380,6 +400,11 @@ def parse_args() -> argparse.Namespace:
         help="Drop predictions outside --rerank-topk-per-image instead of keeping original scores.",
     )
     parser.add_argument(
+        "--skip-rerank",
+        action="store_true",
+        help="Only select/limit detector predictions. Useful for subset baseline evaluation.",
+    )
+    parser.add_argument(
         "--crop-margin",
         type=float,
         default=0.25,
@@ -438,6 +463,14 @@ def parse_args() -> argparse.Namespace:
         help="Run COCO bbox evaluation after writing output.",
     )
     parser.add_argument(
+        "--eval-output-images-only",
+        action="store_true",
+        help=(
+            "Restrict COCO evaluation to image ids present in the output. "
+            "This is automatically enabled when --max-images is set."
+        ),
+    )
+    parser.add_argument(
         "--include-debug-fields",
         action="store_true",
         help="Store det_score and clip_score in output predictions.",
@@ -451,7 +484,10 @@ def main() -> None:
     _save_json(args.output, results)
     print(f"saved reranked predictions to {args.output}")
     if args.eval:
-        _evaluate_coco(args.annotation, results)
+        eval_image_ids = None
+        if args.eval_output_images_only or args.max_images is not None:
+            eval_image_ids = sorted({int(result["image_id"]) for result in results})
+        _evaluate_coco(args.annotation, results, image_ids=eval_image_ids)
 
 
 if __name__ == "__main__":
