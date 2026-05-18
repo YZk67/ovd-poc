@@ -197,6 +197,8 @@ def _evaluate_coco(annotation_path: Path, results: Sequence[Mapping[str, Any]]) 
     from pycocotools.cocoeval import COCOeval
 
     coco_gt = COCO(str(annotation_path))
+    coco_gt.dataset.setdefault("info", {})
+    coco_gt.dataset.setdefault("licenses", [])
     coco_dt = coco_gt.loadRes(list(results))
     evaluator = COCOeval(coco_gt, coco_dt, "bbox")
     evaluator.params.maxDets = [1, 10, 100]
