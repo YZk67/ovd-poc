@@ -457,3 +457,43 @@ output/d3_crop_verifier_w075_balanced/metrics.json
 ```
 
 先重点看 `metrics.json` 里 `val.wrong_phrase_same_region.ap/auc`。如果这个子集明显高于随机，说明 verifier 确实学到了“同一个 region 是否满足目标描述”，再把 `verifier_best.pt` 接回 rerank。
+
+接回离线 rerank 时，先还是只跑 500 张图扫融合权重。`--verifier-checkpoint` 会让脚本使用 verifier logit，而不是裸 CLIP cosine：
+
+```bash
+for weight in 0.25 0.5 1.0; do
+  tag="vw${weight/./}"
+  python tools/rerank_d3_predictions_with_clip_crops.py \
+    --predictions output/lami_convnext_large_12ep_lvis_zeroshot_d3_desc_anchor_target_w075_cls_only/coco_instances_results.json \
+    --annotation dataset/d3/annotations/d3_intra_full.json \
+    --image-root dataset/d3/images \
+    --phrases-json dataset/metadata/d3_phrases.json \
+    --output output/d3_verifier_rerank_subset500_top20_${tag}.json \
+    --rerank-topk-per-image 20 \
+    --keep-topk-per-image 100 \
+    --crop-margin 0.1 \
+    --verifier-checkpoint output/d3_crop_verifier_w075_balanced/verifier_best.pt \
+    --verifier-fusion logit_add \
+    --verifier-fusion-weight "$weight" \
+    --max-images 500 \
+    --eval
+done
+```
+
+如果 subset 上涨，再跑全量：
+
+```bash
+python tools/rerank_d3_predictions_with_clip_crops.py \
+  --predictions output/lami_convnext_large_12ep_lvis_zeroshot_d3_desc_anchor_target_w075_cls_only/coco_instances_results.json \
+  --annotation dataset/d3/annotations/d3_intra_full.json \
+  --image-root dataset/d3/images \
+  --phrases-json dataset/metadata/d3_phrases.json \
+  --output output/d3_verifier_rerank_w075_top20_vw05.json \
+  --rerank-topk-per-image 20 \
+  --keep-topk-per-image 100 \
+  --crop-margin 0.1 \
+  --verifier-checkpoint output/d3_crop_verifier_w075_balanced/verifier_best.pt \
+  --verifier-fusion logit_add \
+  --verifier-fusion-weight 0.5 \
+  --eval
+```

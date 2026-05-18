@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from tqdm import tqdm
@@ -140,6 +141,83 @@ def _fuse_score(
     raise ValueError(f"Unsupported fusion mode: {mode}")
 
 
+def _fuse_logit_score(
+    detector_score: float,
+    verifier_logit: float,
+    *,
+    mode: str,
+    fusion_weight: float,
+) -> float:
+    verifier_prob = _sigmoid(verifier_logit)
+
+    if mode == "logit_add":
+        return _sigmoid(_logit(detector_score) + fusion_weight * verifier_logit)
+    if mode == "linear":
+        return (1.0 - fusion_weight) * detector_score + fusion_weight * verifier_prob
+    if mode == "replace":
+        return verifier_prob
+    raise ValueError(f"Unsupported verifier fusion mode: {mode}")
+
+
+class CropDescriptionVerifier(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, dropout: float) -> None:
+        super().__init__()
+        second_hidden = max(64, hidden_dim // 2)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, second_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(second_hidden, 1),
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.net(features).squeeze(-1)
+
+
+def _load_torch_checkpoint(path: Path, device: str) -> Mapping[str, Any]:
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
+def _load_verifier(path: Path, device: str) -> CropDescriptionVerifier:
+    checkpoint = _load_torch_checkpoint(path, device)
+    input_dim = int(checkpoint["input_dim"])
+    hidden_dim = int(checkpoint.get("hidden_dim", 512))
+    dropout = float(checkpoint.get("dropout", 0.0))
+    verifier = CropDescriptionVerifier(input_dim=input_dim, hidden_dim=hidden_dim, dropout=dropout)
+    verifier.load_state_dict(checkpoint["model_state"])
+    verifier.to(device)
+    verifier.eval()
+    print(
+        f"loaded verifier: {path} "
+        f"(epoch={checkpoint.get('epoch')}, score={checkpoint.get('score')})"
+    )
+    return verifier
+
+
+def _build_verifier_features(
+    image_features: torch.Tensor,
+    text_features: torch.Tensor,
+    detector_scores: Sequence[float],
+) -> torch.Tensor:
+    score_tensor = torch.tensor(detector_scores, dtype=image_features.dtype).view(-1, 1)
+    return torch.cat(
+        [
+            image_features,
+            text_features,
+            image_features * text_features,
+            torch.abs(image_features - text_features),
+            score_tensor,
+        ],
+        dim=-1,
+    )
+
+
 def _load_openclip(model_name: str, pretrained: str, device: str):
     try:
         import open_clip
@@ -246,6 +324,7 @@ def rerank(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
     device = args.device
     model, preprocess, tokenizer = _load_openclip(args.model, args.pretrained, device)
+    verifier = _load_verifier(args.verifier_checkpoint, device) if args.verifier_checkpoint else None
     text_features = _encode_texts(
         model,
         tokenizer,
@@ -279,6 +358,7 @@ def rerank(args: argparse.Namespace) -> List[Dict[str, Any]]:
         crop_tensors: List[torch.Tensor] = []
         crop_positions: List[int] = []
         crop_cat_rows: List[int] = []
+        crop_detector_scores: List[float] = []
 
         for position, pred in enumerate(output_preds[: args.rerank_topk_per_image]):
             cat_id = int(pred["category_id"])
@@ -292,6 +372,7 @@ def rerank(args: argparse.Namespace) -> List[Dict[str, Any]]:
             crop_tensors.append(preprocess(crop))
             crop_positions.append(position)
             crop_cat_rows.append(category_to_row[cat_id])
+            crop_detector_scores.append(float(pred.get("score", 0.0)))
 
         if crop_tensors:
             image_features = _encode_crops(
@@ -302,23 +383,43 @@ def rerank(args: argparse.Namespace) -> List[Dict[str, Any]]:
             )
             text_for_crops = text_features[torch.tensor(crop_cat_rows, dtype=torch.long)]
             clip_scores = (image_features * text_for_crops).sum(dim=-1).numpy()
+            verifier_logits = None
+            if verifier is not None:
+                verifier_features = _build_verifier_features(
+                    image_features,
+                    text_for_crops,
+                    crop_detector_scores,
+                ).to(device)
+                with torch.no_grad():
+                    verifier_logits = verifier(verifier_features).float().cpu().numpy()
             processed_crops += len(crop_tensors)
 
-            for position, clip_score in zip(crop_positions, clip_scores):
+            for score_idx, (position, clip_score) in enumerate(zip(crop_positions, clip_scores)):
                 pred = output_preds[position]
                 old_score = float(pred["score"])
-                new_score = _fuse_score(
-                    old_score,
-                    float(clip_score),
-                    mode=args.fusion,
-                    fusion_weight=args.fusion_weight,
-                    clip_scale=args.clip_scale,
-                    clip_center=args.clip_center,
-                )
+                if verifier_logits is None:
+                    new_score = _fuse_score(
+                        old_score,
+                        float(clip_score),
+                        mode=args.fusion,
+                        fusion_weight=args.fusion_weight,
+                        clip_scale=args.clip_scale,
+                        clip_center=args.clip_center,
+                    )
+                else:
+                    new_score = _fuse_logit_score(
+                        old_score,
+                        float(verifier_logits[score_idx]),
+                        mode=args.verifier_fusion,
+                        fusion_weight=args.verifier_fusion_weight,
+                    )
                 pred["score"] = float(new_score)
                 if args.include_debug_fields:
                     pred["det_score"] = old_score
                     pred["clip_score"] = float(clip_score)
+                    if verifier_logits is not None:
+                        pred["verifier_logit"] = float(verifier_logits[score_idx])
+                        pred["verifier_score"] = float(_sigmoid(float(verifier_logits[score_idx])))
 
         if args.drop_unreranked:
             output_preds = output_preds[: args.rerank_topk_per_image]
@@ -433,6 +534,24 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.25,
         help="Center subtracted from CLIP cosine before scaling.",
+    )
+    parser.add_argument(
+        "--verifier-checkpoint",
+        type=Path,
+        default=None,
+        help="Optional verifier_best.pt from train_d3_crop_verifier.py. If set, use verifier logits for fusion.",
+    )
+    parser.add_argument(
+        "--verifier-fusion",
+        choices=("logit_add", "linear", "replace"),
+        default="logit_add",
+        help="How to fuse detector score and verifier probability/logit.",
+    )
+    parser.add_argument(
+        "--verifier-fusion-weight",
+        type=float,
+        default=0.5,
+        help="Weight of verifier logit/probability in verifier fusion.",
     )
     parser.add_argument(
         "--image-batch-size",
