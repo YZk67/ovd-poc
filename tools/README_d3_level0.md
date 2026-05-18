@@ -596,3 +596,88 @@ verifier top-k: 20 flat query-class pairs per image
 ```
 
 如果这个内部版接近离线 no-score rerank，就可以把它作为下一阶段主实现；如果低很多，说明内部 ROI feature 和外部 crop OpenCLIP feature 分布不一致，下一步就要训练一个真正基于 detector ROI feature 的 verifier。
+
+## 10. 训练真正的 detector-ROI verifier
+
+如果 crop-trained verifier 接进 `DINO.forward()` 后明显低于离线 rerank，说明训练特征和推理特征分布不一致。下一步改成用 detector 自己的 ROI feature 训练 verifier：
+
+```text
+detector predicted box -> extract_region_feature -> ROI feature
+```
+
+先用同一个 `w075` first-stage detector 保存每张图的 query box 和 `roi_features_ori`：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python tools/train_net.py \
+  --config-file lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_desc_anchor_target_w075_save_roi_features.py \
+  --num-gpus 1 \
+  --eval-only \
+  train.init_checkpoint=/root/autodl-tmp/model_final_ovd_lvis_kang.pth
+```
+
+输出目录：
+
+```text
+output/d3_roi_features_w075/pth
+```
+
+每个 `.pth` 至少包含：
+
+```text
+pred_boxes
+roi_features_ori
+pred_logits
+```
+
+然后把固定的 `verifier_pairs_w075` 匹配回这些 query，导出 trainer 可直接读取的 ROI-feature cache。建议先 smoke 2000/1000 样本，确认 bbox 到 query 的匹配 IoU 基本接近 1：
+
+```bash
+python tools/export_d3_roi_verifier_features.py \
+  --train-jsonl dataset/d3/verifier_pairs_w075/train.jsonl \
+  --val-jsonl dataset/d3/verifier_pairs_w075/val.jsonl \
+  --saved-output-dir output/d3_roi_features_w075/pth \
+  --text-embedding dataset/metadata/d3_description_anchor_target_w100_bank_convnextl.npy \
+  --output-dir output/d3_roi_verifier_features_w075_smoke/cache \
+  --same-phrase-neg-per-pos 1 \
+  --wrong-phrase-neg-per-pos 2 \
+  --max-train-samples 2000 \
+  --max-val-samples 1000
+```
+
+完整导出：
+
+```bash
+python tools/export_d3_roi_verifier_features.py \
+  --train-jsonl dataset/d3/verifier_pairs_w075/train.jsonl \
+  --val-jsonl dataset/d3/verifier_pairs_w075/val.jsonl \
+  --saved-output-dir output/d3_roi_features_w075/pth \
+  --text-embedding dataset/metadata/d3_description_anchor_target_w100_bank_convnextl.npy \
+  --output-dir output/d3_roi_verifier_features_w075/cache \
+  --same-phrase-neg-per-pos 1 \
+  --wrong-phrase-neg-per-pos 2
+```
+
+再复用同一个 MLP trainer，训练 no-score ROI verifier。这里的 `crop_feats` 实际上已经是 detector ROI feature：
+
+```bash
+python tools/train_d3_crop_verifier.py \
+  --train-cache output/d3_roi_verifier_features_w075/cache/train_features.pt \
+  --val-cache output/d3_roi_verifier_features_w075/cache/val_features.pt \
+  --output-dir output/d3_roi_verifier_w075_no_score \
+  --feature-mode no_detector_score \
+  --epochs 5 \
+  --batch-size 512 \
+  --lr 1e-3
+```
+
+最后接回 `DINO.forward()` eval：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python tools/train_net.py \
+  --config-file lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_internal_roi_verifier_w075.py \
+  --num-gpus 1 \
+  --eval-only \
+  train.init_checkpoint=/root/autodl-tmp/model_final_ovd_lvis_kang.pth
+```
+
+这一步才是 “真正内部 verifier” 的关键检查：如果比 crop-trained internal verifier 高，说明之前主要问题是 feature distribution mismatch；如果还不高，再考虑把 verifier 从 MLP 升级成 query/text cross-attention 或直接训练进 detector。
