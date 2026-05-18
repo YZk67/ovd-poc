@@ -551,3 +551,48 @@ python tools/rerank_d3_predictions_with_clip_crops.py \
   --verifier-fusion-weight 0.5 \
   --eval
 ```
+
+## 9. Detector-internal no-score verifier
+
+离线 rerank 验证有效后，可以把 `no_detector_score` verifier 接进 `DINO.forward()` 推理内部。这个版本不再裁图跑外部 OpenCLIP；它复用 detector 预测框上的 ConvNeXt/CLIP-head region feature，再和 target-prompt text feature 进入 verifier MLP。
+
+先确认这些文件存在：
+
+```bash
+ls -lh output/d3_crop_verifier_w075_no_score/verifier_best.pt
+ls -lh dataset/metadata/d3_description_anchor_target_w075_bank_convnextl.npy
+ls -lh dataset/metadata/d3_description_anchor_target_w100_bank_convnextl.npy
+ls -lh dataset/metadata/d3_seen_empty.json
+```
+
+如果 `d3_seen_empty.json` 不存在，创建一个空 seen-class 列表：
+
+```bash
+python - <<'PY'
+import json
+json.dump([], open('dataset/metadata/d3_seen_empty.json', 'w'))
+PY
+```
+
+然后直接 eval：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python tools/train_net.py \
+  --config-file lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_internal_verifier_w075.py \
+  --num-gpus 1 \
+  --eval-only \
+  train.init_checkpoint=/root/autodl-tmp/model_final_ovd_lvis_kang.pth
+```
+
+这个内部版默认设置：
+
+```text
+first-stage classifier: d3_description_anchor_target_w075_bank_convnextl.npy
+score ensemble: enabled, beta=0.1
+verifier checkpoint: output/d3_crop_verifier_w075_no_score/verifier_best.pt
+verifier text: d3_description_anchor_target_w100_bank_convnextl.npy
+verifier fusion: logit_add, weight=0.25
+verifier top-k: 20 flat query-class pairs per image
+```
+
+如果这个内部版接近离线 no-score rerank，就可以把它作为下一阶段主实现；如果低很多，说明内部 ROI feature 和外部 crop OpenCLIP feature 分布不一致，下一步就要训练一个真正基于 detector ROI feature 的 verifier。
