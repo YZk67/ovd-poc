@@ -621,12 +621,17 @@ CUDA_VISIBLE_DEVICES=0 python tools/train_net.py \
 output/d3_roi_features_w075/pth
 ```
 
-每个 `.pth` 至少包含：
+这个 config 只保存 verifier 需要的轻量内容，并把 ROI feature 以 fp16 落盘，避免全量 `pred_logits` 把磁盘打满。每个 `.pth` 包含：
 
 ```text
 pred_boxes
 roi_features_ori
-pred_logits
+```
+
+如果之前保存中途因为磁盘满或 `torch.save` 写失败中断，先清掉旧的半截目录再重跑：
+
+```bash
+rm -rf output/d3_roi_features_w075/pth
 ```
 
 然后把固定的 `verifier_pairs_w075` 匹配回这些 query，导出 trainer 可直接读取的 ROI-feature cache。建议先 smoke 2000/1000 样本，确认 bbox 到 query 的匹配 IoU 基本接近 1：

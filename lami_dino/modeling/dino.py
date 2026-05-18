@@ -116,6 +116,8 @@ class DINO(nn.Module):
         seen_classes=None,
         all_classes=None,
         save_dir=None,
+        save_roi_features_only: bool = False,
+        save_roi_features_fp16: bool = False,
         vlm_temperature: float =100.0,
         alpha: float =0.3,
         beta: float =0.7,
@@ -307,6 +309,8 @@ class DINO(nn.Module):
             else:
                 self.novel_idx = self.base_idx == False
         self.save_dir = save_dir
+        self.save_roi_features_only = bool(save_roi_features_only)
+        self.save_roi_features_fp16 = bool(save_roi_features_fp16)
         if self.save_dir:
             os.makedirs(self.save_dir, exist_ok=True)
 
@@ -876,9 +880,13 @@ class DINO(nn.Module):
             if self.score_ensemble:
                 if self.save_dir:
                     save_output = {}
-                    save_output["pred_logits"] = copy.deepcopy(output["pred_logits"]).cpu()
-                    save_output["roi_features_ori"] = copy.deepcopy(roi_features_ori).cpu()# [1, 900, 768]
-                    save_output["pred_boxes"] = copy.deepcopy(output["pred_boxes"]).cpu()
+                    if not self.save_roi_features_only:
+                        save_output["pred_logits"] = output["pred_logits"].detach().cpu()
+                    roi_features_to_save = roi_features_ori.detach().cpu()
+                    if self.save_roi_features_fp16:
+                        roi_features_to_save = roi_features_to_save.half()
+                    save_output["roi_features_ori"] = roi_features_to_save# [1, 900, 768]
+                    save_output["pred_boxes"] = output["pred_boxes"].detach().cpu()
                     torch.save(save_output, os.path.join(self.save_dir, filename))
 
                 cls_score = box_cls.sigmoid()

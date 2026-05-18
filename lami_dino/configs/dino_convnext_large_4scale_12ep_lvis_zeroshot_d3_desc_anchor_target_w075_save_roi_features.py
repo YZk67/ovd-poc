@@ -27,6 +27,8 @@ model.alpha = 0.0
 model.beta = 0.1
 model.novel_scale = 1.0
 model.save_dir = "output/d3_roi_features_w075/pth"
+model.save_roi_features_only = True
+model.save_roi_features_fp16 = True
 
 train.output_dir = "./output/lami_convnext_large_12ep_lvis_zeroshot_d3_desc_anchor_target_w075_save_roi_features"
 dataloader.evaluator.output_dir = train.output_dir
