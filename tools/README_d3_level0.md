@@ -365,3 +365,38 @@ python tools/train_net.py \
 ```text
 output/lami_convnext_large_12ep_lvis_zeroshot_d3_desc_bank_max
 ```
+
+## 7. 构建 description verifier 训练样本
+
+如果要从 text prototype calibration 进入真正的 region-description verification，先把 first-stage detector predictions 和 D3 GT 匹配成二分类 pair：
+
+```bash
+python tools/build_d3_verifier_pairs.py \
+  --predictions output/lami_convnext_large_12ep_lvis_zeroshot_d3_desc_anchor_target_w075_cls_only/coco_instances_results.json \
+  --annotation dataset/d3/annotations/d3_intra_full.json \
+  --phrases-json dataset/metadata/d3_phrases.json \
+  --output-dir dataset/d3/verifier_pairs_w075 \
+  --pred-topk-per-image 100 \
+  --pos-iou-thresh 0.5 \
+  --neg-iou-thresh 0.3 \
+  --wrong-phrase-neg-per-pos 2
+```
+
+输出：
+
+```text
+dataset/d3/verifier_pairs_w075/train.jsonl
+dataset/d3/verifier_pairs_w075/val.jsonl
+dataset/d3/verifier_pairs_w075/all.jsonl
+dataset/d3/verifier_pairs_w075/summary.json
+```
+
+样本语义：
+
+```text
+label=1: predicted box 和同 phrase GT IoU >= 0.5
+label=0 same_phrase_bad_box: 同 phrase 但 box 没对上
+label=0 wrong_phrase_same_region: 对上的 box 配另一个不匹配 phrase
+```
+
+这是后续训练 `Description-Conditioned Target Verifier` 的输入；先固定这个样本集，再训练 MLP 或 cross-attention verifier。
