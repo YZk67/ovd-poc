@@ -282,6 +282,60 @@ python tools/rerank_d3_predictions_with_clip_crops.py \
   --eval
 ```
 
+更严谨的检查是只在 verifier held-out val images 上比较 detector-only 和 verifier rerank，避免 verifier 训练图像泄漏影响结论：
+
+```bash
+python tools/rerank_d3_predictions_with_clip_crops.py \
+  --predictions output/lami_convnext_large_12ep_lvis_zeroshot_d3_desc_anchor_target_w075_cls_only/coco_instances_results.json \
+  --annotation dataset/d3/annotations/d3_intra_full.json \
+  --image-root dataset/d3/images \
+  --phrases-json dataset/metadata/d3_phrases.json \
+  --image-id-jsonl dataset/d3/verifier_pairs_w075/val.jsonl \
+  --output output/d3_verifier_val_detector_only.json \
+  --keep-topk-per-image 100 \
+  --skip-rerank \
+  --eval
+
+python tools/rerank_d3_predictions_with_clip_crops.py \
+  --predictions output/lami_convnext_large_12ep_lvis_zeroshot_d3_desc_anchor_target_w075_cls_only/coco_instances_results.json \
+  --annotation dataset/d3/annotations/d3_intra_full.json \
+  --image-root dataset/d3/images \
+  --phrases-json dataset/metadata/d3_phrases.json \
+  --image-id-jsonl dataset/d3/verifier_pairs_w075/val.jsonl \
+  --output output/d3_verifier_val_rerank_top20_vw025.json \
+  --rerank-topk-per-image 20 \
+  --keep-topk-per-image 100 \
+  --crop-margin 0.1 \
+  --verifier-checkpoint output/d3_crop_verifier_w075_balanced/verifier_best.pt \
+  --verifier-fusion logit_add \
+  --verifier-fusion-weight 0.25 \
+  --eval
+```
+
+最后做 verifier feature ablation，证明收益不是只来自 detector score calibration 或 box-quality 判断。这里复用 full verifier 已经编码好的 feature cache，不重新跑 OpenCLIP：
+
+```bash
+python tools/train_d3_crop_verifier.py \
+  --train-cache output/d3_crop_verifier_w075_balanced/cache/train_features.pt \
+  --val-cache output/d3_crop_verifier_w075_balanced/cache/val_features.pt \
+  --output-dir output/d3_crop_verifier_w075_no_text \
+  --feature-mode no_text \
+  --epochs 5 \
+  --batch-size 512 \
+  --lr 1e-3
+
+python tools/train_d3_crop_verifier.py \
+  --train-cache output/d3_crop_verifier_w075_balanced/cache/train_features.pt \
+  --val-cache output/d3_crop_verifier_w075_balanced/cache/val_features.pt \
+  --output-dir output/d3_crop_verifier_w075_no_score \
+  --feature-mode no_detector_score \
+  --epochs 5 \
+  --batch-size 512 \
+  --lr 1e-3
+```
+
+预期 `no_text` 在 `wrong_phrase_same_region` 上应接近随机，因为同一个 crop 配正确 phrase 和错误 phrase 时，去掉 text 后特征几乎相同；`no_detector_score` 如果还能保持较高 AUC/AP，说明 verifier 不是只靠 detector score。
+
 建议先用 `--max-images 100` 做 smoke test，确认图片路径和 OpenCLIP 环境正常：
 
 ```bash

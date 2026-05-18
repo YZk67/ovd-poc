@@ -430,11 +430,12 @@ def _load_or_build_cache(
 
 
 class PairFeatureDataset(Dataset):
-    def __init__(self, cache: Mapping[str, Any]) -> None:
+    def __init__(self, cache: Mapping[str, Any], *, feature_mode: str) -> None:
         self.crop_feats = cache["crop_feats"].float()
         self.text_feats = cache["text_feats"].float()
         self.labels = cache["labels"].float()
         self.detector_scores = cache["detector_scores"].float()
+        self.feature_mode = feature_mode
         if self.crop_feats.shape != self.text_feats.shape:
             raise ValueError(
                 f"crop/text feature shape mismatch: {self.crop_feats.shape} vs {self.text_feats.shape}"
@@ -445,14 +446,57 @@ class PairFeatureDataset(Dataset):
 
     @property
     def input_dim(self) -> int:
-        return int(self.crop_feats.shape[1] * 4 + 1)
+        return int(_build_pair_features(
+            self.crop_feats[:1],
+            self.text_feats[:1],
+            self.detector_scores[:1],
+            self.feature_mode,
+        ).shape[1])
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
         crop = self.crop_feats[index]
         text = self.text_feats[index]
-        score = self.detector_scores[index].view(1)
-        features = torch.cat([crop, text, crop * text, torch.abs(crop - text), score], dim=0)
+        score = self.detector_scores[index : index + 1]
+        features = _build_pair_features(
+            crop.view(1, -1),
+            text.view(1, -1),
+            score,
+            self.feature_mode,
+        ).squeeze(0)
         return features, self.labels[index]
+
+
+def _build_pair_features(
+    crop_feats: torch.Tensor,
+    text_feats: torch.Tensor,
+    detector_scores: torch.Tensor,
+    feature_mode: str,
+) -> torch.Tensor:
+    score = detector_scores.to(dtype=crop_feats.dtype).view(-1, 1)
+    if feature_mode == "full":
+        return torch.cat(
+            [
+                crop_feats,
+                text_feats,
+                crop_feats * text_feats,
+                torch.abs(crop_feats - text_feats),
+                score,
+            ],
+            dim=-1,
+        )
+    if feature_mode == "no_text":
+        return torch.cat([crop_feats, score], dim=-1)
+    if feature_mode == "no_detector_score":
+        return torch.cat(
+            [
+                crop_feats,
+                text_feats,
+                crop_feats * text_feats,
+                torch.abs(crop_feats - text_feats),
+            ],
+            dim=-1,
+        )
+    raise ValueError(f"Unsupported feature mode: {feature_mode}")
 
 
 def _validate_cache_labels(name: str, cache: Mapping[str, Any]) -> None:
@@ -490,10 +534,27 @@ def _average_precision(scores: np.ndarray, labels: np.ndarray) -> float:
     if positives == 0:
         return float("nan")
     order = np.argsort(-scores, kind="mergesort")
+    sorted_scores = scores[order]
     sorted_labels = labels[order]
-    tp = np.cumsum(sorted_labels)
-    precision = tp / (np.arange(len(sorted_labels)) + 1)
-    return float((precision * sorted_labels).sum() / positives)
+
+    ap = 0.0
+    tp = 0
+    fp = 0
+    previous_recall = 0.0
+    start = 0
+    while start < len(sorted_labels):
+        end = start + 1
+        while end < len(sorted_labels) and sorted_scores[end] == sorted_scores[start]:
+            end += 1
+        group = sorted_labels[start:end]
+        tp += int(group.sum())
+        fp += int(len(group) - group.sum())
+        recall = tp / positives
+        precision = tp / max(1, tp + fp)
+        ap += (recall - previous_recall) * precision
+        previous_recall = recall
+        start = end
+    return float(ap)
 
 
 def _roc_auc(scores: np.ndarray, labels: np.ndarray) -> float:
@@ -503,8 +564,16 @@ def _roc_auc(scores: np.ndarray, labels: np.ndarray) -> float:
     if n_pos == 0 or n_neg == 0:
         return float("nan")
     order = np.argsort(scores, kind="mergesort")
+    sorted_scores = scores[order]
     ranks = np.empty(len(scores), dtype=np.float64)
-    ranks[order] = np.arange(1, len(scores) + 1, dtype=np.float64)
+    start = 0
+    while start < len(scores):
+        end = start + 1
+        while end < len(scores) and sorted_scores[end] == sorted_scores[start]:
+            end += 1
+        average_rank = (start + 1 + end) / 2.0
+        ranks[order[start:end]] = average_rank
+        start = end
     pos_rank_sum = ranks[labels == 1].sum()
     auc = (pos_rank_sum - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
     return float(auc)
@@ -605,8 +674,8 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
     random.seed(args.seed)
     np.random.seed(args.seed)
 
-    train_dataset = PairFeatureDataset(train_cache)
-    val_dataset = PairFeatureDataset(val_cache)
+    train_dataset = PairFeatureDataset(train_cache, feature_mode=args.feature_mode)
+    val_dataset = PairFeatureDataset(val_cache, feature_mode=args.feature_mode)
     model = CropDescriptionVerifier(
         input_dim=train_dataset.input_dim,
         hidden_dim=args.hidden_dim,
@@ -672,6 +741,7 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
                     "input_dim": train_dataset.input_dim,
                     "hidden_dim": args.hidden_dim,
                     "dropout": args.dropout,
+                    "feature_mode": args.feature_mode,
                     "epoch": epoch,
                     "score": score,
                     "args": _jsonable_args(args),
@@ -742,6 +812,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text-batch-size", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=512)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument(
+        "--feature-mode",
+        choices=("full", "no_text", "no_detector_score"),
+        default="full",
+        help=(
+            "Verifier input features. full uses crop/text/interactions/score; "
+            "no_text removes all phrase features; no_detector_score removes detector score."
+        ),
+    )
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=5.0)

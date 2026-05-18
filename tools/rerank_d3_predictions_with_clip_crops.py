@@ -64,6 +64,18 @@ def _group_predictions(predictions: Sequence[Mapping[str, Any]]) -> Dict[int, Li
     return grouped
 
 
+def _load_image_ids_from_jsonl(path: Path) -> List[int]:
+    image_ids = set()
+    with path.open("r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            image_ids.add(int(row["image_id"]))
+    return sorted(image_ids)
+
+
 def _limit_predictions(predictions: Sequence[Dict[str, Any]], keep_topk: int) -> List[Dict[str, Any]]:
     if keep_topk <= 0:
         return list(predictions)
@@ -184,38 +196,54 @@ def _load_torch_checkpoint(path: Path, device: str) -> Mapping[str, Any]:
         return torch.load(path, map_location=device)
 
 
-def _load_verifier(path: Path, device: str) -> CropDescriptionVerifier:
+def _load_verifier(path: Path, device: str) -> Tuple[CropDescriptionVerifier, str]:
     checkpoint = _load_torch_checkpoint(path, device)
     input_dim = int(checkpoint["input_dim"])
     hidden_dim = int(checkpoint.get("hidden_dim", 512))
     dropout = float(checkpoint.get("dropout", 0.0))
+    feature_mode = str(checkpoint.get("feature_mode", "full"))
     verifier = CropDescriptionVerifier(input_dim=input_dim, hidden_dim=hidden_dim, dropout=dropout)
     verifier.load_state_dict(checkpoint["model_state"])
     verifier.to(device)
     verifier.eval()
     print(
         f"loaded verifier: {path} "
-        f"(epoch={checkpoint.get('epoch')}, score={checkpoint.get('score')})"
+        f"(epoch={checkpoint.get('epoch')}, score={checkpoint.get('score')}, feature_mode={feature_mode})"
     )
-    return verifier
+    return verifier, feature_mode
 
 
 def _build_verifier_features(
     image_features: torch.Tensor,
     text_features: torch.Tensor,
     detector_scores: Sequence[float],
+    feature_mode: str,
 ) -> torch.Tensor:
     score_tensor = torch.tensor(detector_scores, dtype=image_features.dtype).view(-1, 1)
-    return torch.cat(
-        [
-            image_features,
-            text_features,
-            image_features * text_features,
-            torch.abs(image_features - text_features),
-            score_tensor,
-        ],
-        dim=-1,
-    )
+    if feature_mode == "full":
+        return torch.cat(
+            [
+                image_features,
+                text_features,
+                image_features * text_features,
+                torch.abs(image_features - text_features),
+                score_tensor,
+            ],
+            dim=-1,
+        )
+    if feature_mode == "no_text":
+        return torch.cat([image_features, score_tensor], dim=-1)
+    if feature_mode == "no_detector_score":
+        return torch.cat(
+            [
+                image_features,
+                text_features,
+                image_features * text_features,
+                torch.abs(image_features - text_features),
+            ],
+            dim=-1,
+        )
+    raise ValueError(f"Unsupported verifier feature mode: {feature_mode}")
 
 
 def _load_openclip(model_name: str, pretrained: str, device: str):
@@ -307,6 +335,10 @@ def rerank(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
     grouped = _group_predictions(predictions)
     image_ids = sorted(grouped)
+    if args.image_id_jsonl is not None:
+        selected_ids = set(_load_image_ids_from_jsonl(args.image_id_jsonl))
+        image_ids = [image_id for image_id in image_ids if image_id in selected_ids]
+        print(f"using image ids from {args.image_id_jsonl}: {len(image_ids)}")
     if args.max_images is not None:
         image_ids = image_ids[: args.max_images]
 
@@ -324,7 +356,10 @@ def rerank(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
     device = args.device
     model, preprocess, tokenizer = _load_openclip(args.model, args.pretrained, device)
-    verifier = _load_verifier(args.verifier_checkpoint, device) if args.verifier_checkpoint else None
+    verifier = None
+    verifier_feature_mode = "full"
+    if args.verifier_checkpoint:
+        verifier, verifier_feature_mode = _load_verifier(args.verifier_checkpoint, device)
     text_features = _encode_texts(
         model,
         tokenizer,
@@ -389,6 +424,7 @@ def rerank(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     image_features,
                     text_for_crops,
                     crop_detector_scores,
+                    verifier_feature_mode,
                 ).to(device)
                 with torch.no_grad():
                     verifier_logits = verifier(verifier_features).float().cpu().numpy()
@@ -467,6 +503,15 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         required=True,
         help="Output reranked COCO-format result JSON.",
+    )
+    parser.add_argument(
+        "--image-id-jsonl",
+        type=Path,
+        default=None,
+        help=(
+            "Optional JSONL file with image_id fields. If set, rerank/evaluate only those images, "
+            "e.g. verifier_pairs_w075/val.jsonl for held-out verifier-val evaluation."
+        ),
     )
     parser.add_argument(
         "--prompt-template",
@@ -604,7 +649,7 @@ def main() -> None:
     print(f"saved reranked predictions to {args.output}")
     if args.eval:
         eval_image_ids = None
-        if args.eval_output_images_only or args.max_images is not None:
+        if args.eval_output_images_only or args.max_images is not None or args.image_id_jsonl is not None:
             eval_image_ids = sorted({int(result["image_id"]) for result in results})
         _evaluate_coco(args.annotation, results, image_ids=eval_image_ids)
 
