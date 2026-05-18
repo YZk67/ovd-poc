@@ -58,6 +58,54 @@ def _sample_count(base_count: int, ratio: float, available: int) -> int:
     return min(available, int(round(base_count * ratio)))
 
 
+def _sample_total_for_positive_count(
+    positive_count: int,
+    *,
+    same_phrase_neg_per_pos: float,
+    wrong_phrase_neg_per_pos: float,
+    same_available: int,
+    wrong_available: int,
+) -> int:
+    same_count = _sample_count(positive_count, same_phrase_neg_per_pos, same_available)
+    wrong_count = _sample_count(positive_count, wrong_phrase_neg_per_pos, wrong_available)
+    return positive_count + same_count + wrong_count
+
+
+def _fit_positive_count_to_budget(
+    positive_limit: int,
+    *,
+    max_samples: Optional[int],
+    same_phrase_neg_per_pos: float,
+    wrong_phrase_neg_per_pos: float,
+    same_available: int,
+    wrong_available: int,
+) -> int:
+    if max_samples is None or max_samples <= 0:
+        return positive_limit
+    if positive_limit <= 0:
+        return 0
+
+    lo = 0
+    hi = min(positive_limit, max_samples)
+    best = 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        total = _sample_total_for_positive_count(
+            mid,
+            same_phrase_neg_per_pos=same_phrase_neg_per_pos,
+            wrong_phrase_neg_per_pos=wrong_phrase_neg_per_pos,
+            same_available=same_available,
+            wrong_available=wrong_available,
+        )
+        if total <= max_samples:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    return best if best > 0 else min(positive_limit, max_samples)
+
+
 def _sample_rows(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -84,9 +132,19 @@ def _sample_rows(
     rng.shuffle(same_phrase)
     rng.shuffle(wrong_phrase)
 
+    positive_limit = len(positives)
     if max_positives is not None and max_positives > 0:
-        positives = positives[:max_positives]
+        positive_limit = min(positive_limit, max_positives)
+    positive_limit = _fit_positive_count_to_budget(
+        positive_limit,
+        max_samples=max_samples,
+        same_phrase_neg_per_pos=same_phrase_neg_per_pos,
+        wrong_phrase_neg_per_pos=wrong_phrase_neg_per_pos,
+        same_available=len(same_phrase),
+        wrong_available=len(wrong_phrase),
+    )
 
+    positives = positives[:positive_limit]
     same_count = _sample_count(len(positives), same_phrase_neg_per_pos, len(same_phrase))
     wrong_count = _sample_count(len(positives), wrong_phrase_neg_per_pos, len(wrong_phrase))
     selected = positives + same_phrase[:same_count] + wrong_phrase[:wrong_count]
@@ -94,7 +152,7 @@ def _sample_rows(
     if max_samples is not None and max_samples > 0 and len(selected) > max_samples:
         pos = [row for row in selected if int(row.get("label", 0)) == 1]
         neg = [row for row in selected if int(row.get("label", 0)) == 0]
-        if len(pos) >= max_samples:
+        if len(pos) > max_samples:
             selected = rng.sample(pos, max_samples)
         else:
             selected = pos + rng.sample(neg, max_samples - len(pos))
@@ -395,6 +453,17 @@ class PairFeatureDataset(Dataset):
         score = self.detector_scores[index].view(1)
         features = torch.cat([crop, text, crop * text, torch.abs(crop - text), score], dim=0)
         return features, self.labels[index]
+
+
+def _validate_cache_labels(name: str, cache: Mapping[str, Any]) -> None:
+    labels = cache["labels"].float()
+    positives = int(labels.sum().item())
+    negatives = int(labels.numel()) - positives
+    if positives == 0 or negatives == 0:
+        raise ValueError(
+            f"{name} cache has {positives} positives and {negatives} negatives. "
+            "The verifier needs both classes; remove stale caches or rerun with --overwrite-cache."
+        )
 
 
 class CropDescriptionVerifier(nn.Module):
@@ -718,6 +787,8 @@ def main() -> None:
         tokenizer=tokenizer,
     )
 
+    _validate_cache_labels("train", train_cache)
+    _validate_cache_labels("val", val_cache)
     print(f"train encoded rows: {len(train_cache['labels'])}")
     print(f"val encoded rows: {len(val_cache['labels'])}")
     result = train(args, train_cache, val_cache)
