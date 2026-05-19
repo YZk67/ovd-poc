@@ -686,3 +686,47 @@ CUDA_VISIBLE_DEVICES=0 python tools/train_net.py \
 ```
 
 这一步才是 “真正内部 verifier” 的关键检查：如果比 crop-trained internal verifier 高，说明之前主要问题是 feature distribution mismatch；如果还不高，再考虑把 verifier 从 MLP 升级成 query/text cross-attention 或直接训练进 detector。
+
+## 11. D3 ROI verifier 实验记录
+
+以下结果用于后续整理实验表。评测设置：
+
+```text
+benchmark: D3 intra full
+detector: LaMI-DETR ConvNeXt-L
+checkpoint: /root/autodl-tmp/model_final_ovd_lvis_kang.pth
+first-stage classifier: d3_description_anchor_target_w075_bank_convnextl.npy
+score ensemble: enabled, beta=0.1
+verifier text: d3_description_anchor_target_w100_bank_convnextl.npy
+verifier fusion: logit_add
+verifier top-k: 20 flat query-class pairs per image
+```
+
+主结果：
+
+| Method | AP | AP50 | AP75 | APs | APm | APl |
+|:--|--:|--:|--:|--:|--:|--:|
+| w075 target-framed text prototype | 9.1563 | 11.4391 | 9.3068 | 5.9630 | 10.8197 | 10.7859 |
+| crop-trained internal verifier | 9.4168 | 11.6221 | 9.5625 | 6.2668 | 11.3023 | 11.3114 |
+| ROI-trained internal verifier, weight=0.10 | 9.8187 | 12.2622 | 9.9849 | 6.5359 | 11.6386 | 11.5203 |
+| ROI-trained internal verifier, weight=0.25 | **10.3111** | 12.8845 | **10.4725** | 7.0019 | 12.2422 | 12.0509 |
+| ROI-trained internal verifier, weight=0.50 | 10.2652 | **12.8994** | 10.4105 | **7.0393** | **12.7739** | **12.2676** |
+| offline verifier rerank, weight=0.25 | 10.50 | 13.10 | 10.70 | 6.60 | 12.30 | 12.00 |
+
+Verifier validation：
+
+| Feature setting | overall AP | overall AUC | same_phrase AP | same_phrase AUC | wrong_phrase AP | wrong_phrase AUC |
+|:--|--:|--:|--:|--:|--:|--:|
+| crop no-score verifier | 0.8720 | 0.9573 | 0.9344 | 0.9470 | 0.9218 | 0.9624 |
+| ROI no-score verifier | 0.8718 | 0.9565 | 0.9279 | 0.9395 | 0.9272 | 0.9650 |
+| ROI no-text verifier | 0.3188 | 0.6362 | 0.8825 | 0.9087 | 0.3333 | 0.5000 |
+
+关键结论：
+
+```text
+Best internal result: ROI-trained verifier, fusion weight=0.25, AP 10.3111.
+Gain over w075 text prototype baseline: +1.1548 AP.
+Gain over crop-trained internal verifier: +0.8943 AP.
+No-text verifier collapses on wrong_phrase_same_region to AP 0.3333 / AUC 0.5.
+This supports that the gain comes from region-description matching, not detector score or box calibration.
+```
