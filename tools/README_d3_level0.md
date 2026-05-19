@@ -801,7 +801,44 @@ region_verifier_pos_rate
 eval bbox AP
 ```
 
-这个版本仍然是保守训练：ROI feature 默认 detach，所以首先训练 verifier 本身，不把梯度推回 detector 主干。若 2k 稳定且 AP 有收益，再把：
+已跑结果：
+
+| Setting | Init | Train update | AP | AP50 | AP75 | APs | APm | APl | Note |
+|:--|:--|:--|--:|--:|--:|--:|--:|--:|:--|
+| train config, eval-only | ROI no-score verifier | none | 10.3111 | 12.8845 | 10.4725 | 7.0019 | 12.2422 | 12.0509 | reproduces best internal ROI verifier |
+| train config, scratch smoke | random verifier | joint detector+verifier, 200 iters | 7.4178 | 8.8053 | 7.6624 | 3.0858 | 8.6136 | 8.9512 | verifies loss path, but random verifier hurts ranking |
+| train config, warm smoke | ROI no-score verifier | joint detector+verifier, 200 iters | 6.3780 | 7.5990 | 6.6460 | 3.0830 | 7.7310 | 7.7920 | naive joint fine-tuning damages the detector/verifier ranking |
+
+The 200-iter warm smoke shows that the current train-time loss is wired, but
+naive joint fine-tuning is not the right training strategy. The next controlled
+test is verifier-only warm fine-tuning, which keeps the detector fixed through
+an optimizer LR mask:
+
+```text
+lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_train_roi_verifier_only_w075.py
+```
+
+Run:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python tools/train_net.py \
+  --config-file lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_train_roi_verifier_only_w075.py \
+  --num-gpus 1 \
+  train.init_checkpoint=/root/autodl-tmp/model_final_ovd_lvis_kang.pth \
+  model.region_verifier_checkpoint="$TMP_OUT/d3_roi_verifier_w075_no_score/verifier_best.pt" \
+  train.max_iter=200 \
+  train.eval_period=200 \
+  train.checkpointer.period=200 \
+  train.output_dir="$TMP_OUT/d3_train_roi_verifier_only_w075_warm_smoke" \
+  dataloader.evaluator.output_dir="$TMP_OUT/d3_train_roi_verifier_only_w075_warm_smoke"
+```
+
+If verifier-only warm fine-tuning stays near 10.31 or improves, then the
+training loss is useful but the detector must stay frozen initially. If it still
+drops, the verifier loss is overfitting or miscalibrating and should be trained
+with a lower LR / lower fusion weight / held-out validation selection.
+
+这个版本仍然是保守训练：ROI feature 默认 detach，所以首先训练 verifier 本身，不把梯度推回 detector 主干。若 verifier-only 版本稳定且 AP 有收益，再把：
 
 ```text
 model.region_verifier_train_detach_region_features=False
