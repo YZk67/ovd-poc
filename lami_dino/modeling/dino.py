@@ -132,6 +132,15 @@ class DINO(nn.Module):
         region_verifier_fusion: str = "logit_add",
         region_verifier_fusion_weight: float = 0.25,
         region_verifier_topk_per_image: int = 20,
+        region_verifier_train_enabled: bool = False,
+        region_verifier_train_feature_mode: str = "no_detector_score",
+        region_verifier_train_hidden_dim: int = 512,
+        region_verifier_train_dropout: float = 0.1,
+        region_verifier_same_phrase_neg_per_pos: int = 1,
+        region_verifier_wrong_phrase_neg_per_pos: int = 2,
+        region_verifier_neg_iou_thresh: float = 0.3,
+        region_verifier_max_pairs: int = 256,
+        region_verifier_train_detach_region_features: bool = True,
     ):
         super().__init__()
         self.vlm_temperature = vlm_temperature
@@ -147,8 +156,17 @@ class DINO(nn.Module):
         self.region_verifier_fusion = region_verifier_fusion
         self.region_verifier_fusion_weight = region_verifier_fusion_weight
         self.region_verifier_topk_per_image = region_verifier_topk_per_image
+        self.region_verifier_train_enabled = bool(region_verifier_train_enabled)
+        self.region_verifier_train_feature_mode = region_verifier_train_feature_mode
+        self.region_verifier_train_hidden_dim = int(region_verifier_train_hidden_dim)
+        self.region_verifier_train_dropout = float(region_verifier_train_dropout)
+        self.region_verifier_same_phrase_neg_per_pos = int(region_verifier_same_phrase_neg_per_pos)
+        self.region_verifier_wrong_phrase_neg_per_pos = int(region_verifier_wrong_phrase_neg_per_pos)
+        self.region_verifier_neg_iou_thresh = float(region_verifier_neg_iou_thresh)
+        self.region_verifier_max_pairs = int(region_verifier_max_pairs)
+        self.region_verifier_train_detach_region_features = bool(region_verifier_train_detach_region_features)
         self.region_verifier = None
-        self.region_verifier_feature_mode = "no_detector_score"
+        self.region_verifier_feature_mode = str(region_verifier_train_feature_mode)
         self.region_verifier_text_embedding = None
         # define backbone and position embedding module
         self.backbone = backbone
@@ -273,18 +291,31 @@ class DINO(nn.Module):
             self.cluster_label = np.load(cluster_label_path)
 
         self.score_ensemble = score_ensemble
-        if self.score_ensemble or self.region_verifier_enabled:
+        if self.score_ensemble or self.region_verifier_enabled or self.region_verifier_train_enabled:
             clip_head = torch.load(clip_head_path)
             self.identical, self.thead = clip_head[0]
             self.head = clip_head[1]
 
-        if self.region_verifier_enabled:
-            if not self.region_verifier_checkpoint:
+        if self.region_verifier_enabled or self.region_verifier_train_enabled:
+            if self.region_verifier_checkpoint:
+                self.region_verifier, self.region_verifier_feature_mode = self._load_region_verifier(
+                    self.region_verifier_checkpoint,
+                    device=self.device,
+                    freeze=not self.region_verifier_train_enabled,
+                )
+            elif self.region_verifier_train_enabled:
+                if self.region_verifier_feature_mode not in {"no_detector_score", "full", "no_text"}:
+                    raise ValueError(
+                        f"Unsupported region verifier train feature mode: {self.region_verifier_feature_mode!r}."
+                    )
+                input_dim = self._region_verifier_input_dim(self.region_verifier_feature_mode, feat_dim)
+                self.region_verifier = RegionDescriptionVerifier(
+                    input_dim=input_dim,
+                    hidden_dim=self.region_verifier_train_hidden_dim,
+                    dropout=self.region_verifier_train_dropout,
+                ).to(self.device)
+            else:
                 raise ValueError("region_verifier_enabled=True requires region_verifier_checkpoint.")
-            self.region_verifier, self.region_verifier_feature_mode = self._load_region_verifier(
-                self.region_verifier_checkpoint,
-                device=self.device,
-            )
             if self.region_verifier_feature_mode not in {"no_detector_score", "full", "no_text"}:
                 raise ValueError(
                     f"Unsupported region verifier feature_mode={self.region_verifier_feature_mode!r}."
@@ -314,7 +345,7 @@ class DINO(nn.Module):
         if self.save_dir:
             os.makedirs(self.save_dir, exist_ok=True)
 
-        if self.region_verifier_enabled:
+        if self.region_verifier_enabled or self.region_verifier_train_enabled:
             verifier_text_path = self.region_verifier_text_path or eval_query_path
             verifier_text = self._load_region_verifier_text_embedding(
                 verifier_text_path,
@@ -387,7 +418,23 @@ class DINO(nn.Module):
         except TypeError:
             return torch.load(path, map_location=device)
 
-    def _load_region_verifier(self, path: str, device: str) -> Tuple[RegionDescriptionVerifier, str]:
+    @staticmethod
+    def _region_verifier_input_dim(feature_mode: str, feature_dim: int) -> int:
+        if feature_mode == "full":
+            return feature_dim * 4 + 1
+        if feature_mode == "no_text":
+            return feature_dim + 1
+        if feature_mode == "no_detector_score":
+            return feature_dim * 4
+        raise ValueError(f"Unsupported region verifier feature mode: {feature_mode}")
+
+    def _load_region_verifier(
+        self,
+        path: str,
+        device: str,
+        *,
+        freeze: bool = True,
+    ) -> Tuple[RegionDescriptionVerifier, str]:
         checkpoint = self._torch_load_checkpoint(path, device)
         input_dim = int(checkpoint["input_dim"])
         hidden_dim = int(checkpoint.get("hidden_dim", 512))
@@ -397,8 +444,11 @@ class DINO(nn.Module):
         verifier.load_state_dict(checkpoint["model_state"])
         verifier.to(device)
         verifier.eval()
-        for param in verifier.parameters():
-            param.requires_grad_(False)
+        if freeze:
+            for param in verifier.parameters():
+                param.requires_grad_(False)
+        else:
+            verifier.train()
         logger_rpsa.info(
             "[RegionVerifier] loaded %s (epoch=%s, score=%s, feature_mode=%s)",
             path,
@@ -465,6 +515,220 @@ class DINO(nn.Module):
                 dim=-1,
             )
         raise ValueError(f"Unsupported region verifier feature mode: {self.region_verifier_feature_mode}")
+
+    @staticmethod
+    def _pairwise_iou_cxcywh(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+        if boxes1.numel() == 0 or boxes2.numel() == 0:
+            return boxes1.new_zeros((boxes1.shape[0], boxes2.shape[0]))
+        boxes1_xyxy = box_cxcywh_to_xyxy(boxes1)
+        boxes2_xyxy = box_cxcywh_to_xyxy(boxes2)
+
+        lt = torch.maximum(boxes1_xyxy[:, None, :2], boxes2_xyxy[None, :, :2])
+        rb = torch.minimum(boxes1_xyxy[:, None, 2:], boxes2_xyxy[None, :, 2:])
+        wh = (rb - lt).clamp(min=0)
+        inter = wh[:, :, 0] * wh[:, :, 1]
+
+        area1 = (boxes1_xyxy[:, 2] - boxes1_xyxy[:, 0]).clamp(min=0) * (
+            boxes1_xyxy[:, 3] - boxes1_xyxy[:, 1]
+        ).clamp(min=0)
+        area2 = (boxes2_xyxy[:, 2] - boxes2_xyxy[:, 0]).clamp(min=0) * (
+            boxes2_xyxy[:, 3] - boxes2_xyxy[:, 1]
+        ).clamp(min=0)
+        union = area1[:, None] + area2[None, :] - inter
+        return torch.where(union > 0, inter / union.clamp(min=1e-6), torch.zeros_like(inter))
+
+    def _sample_wrong_phrase_labels(
+        self,
+        *,
+        correct_label: torch.Tensor,
+        present_labels: torch.Tensor,
+        num_classes: int,
+        count: int,
+    ) -> List[torch.Tensor]:
+        if count <= 0 or num_classes <= 1:
+            return []
+
+        wrong_labels: List[torch.Tensor] = []
+        alternatives = present_labels[present_labels != correct_label]
+        for idx in range(count):
+            if alternatives.numel() > 0:
+                wrong_labels.append(alternatives[idx % alternatives.numel()])
+            else:
+                sampled = torch.randint(
+                    low=0,
+                    high=num_classes - 1,
+                    size=(),
+                    device=correct_label.device,
+                    dtype=correct_label.dtype,
+                )
+                wrong_labels.append(sampled + (sampled >= correct_label).to(dtype=sampled.dtype))
+        return wrong_labels
+
+    def _append_region_verifier_pair(
+        self,
+        *,
+        region_feats: List[torch.Tensor],
+        text_feats: List[torch.Tensor],
+        detector_scores: List[torch.Tensor],
+        labels: List[torch.Tensor],
+        region_feat: torch.Tensor,
+        text_feat: torch.Tensor,
+        detector_score: torch.Tensor,
+        label: float,
+    ) -> None:
+        region_feats.append(region_feat)
+        text_feats.append(text_feat)
+        detector_scores.append(detector_score.reshape(()))
+        labels.append(region_feat.new_tensor(label))
+
+    def compute_region_verifier_training_loss(
+        self,
+        output,
+        targets,
+        features_wonorm,
+        content_inds=None,
+    ) -> torch.Tensor:
+        if not self.region_verifier_train_enabled:
+            return output["pred_logits"].sum() * 0.0
+        if self.region_verifier is None or self.region_verifier_text_embedding is None:
+            raise RuntimeError("Region verifier training is enabled but verifier/text embedding is not initialized.")
+
+        pred_logits = output["pred_logits"]
+        pred_boxes = output["pred_boxes"]
+        device = pred_logits.device
+        num_classes = pred_logits.shape[-1]
+
+        text_embedding = self.region_verifier_text_embedding
+        if content_inds is not None:
+            text_embedding = text_embedding[content_inds]
+        text_embedding = text_embedding.to(device=device, dtype=pred_logits.dtype)
+
+        with torch.no_grad():
+            match_output = {"pred_logits": pred_logits.detach(), "pred_boxes": pred_boxes.detach()}
+            indices = self.criterion.matcher(match_output, targets)
+
+        roi_features = self.extract_region_feature(features_wonorm, pred_boxes, "p3")
+        if self.region_verifier_train_detach_region_features:
+            roi_features = roi_features.detach()
+
+        region_feats: List[torch.Tensor] = []
+        text_feats: List[torch.Tensor] = []
+        detector_scores: List[torch.Tensor] = []
+        labels: List[torch.Tensor] = []
+
+        detached_boxes = pred_boxes.detach()
+        detached_scores = pred_logits.detach().sigmoid()
+        same_neg_per_pos = max(0, self.region_verifier_same_phrase_neg_per_pos)
+        wrong_neg_per_pos = max(0, self.region_verifier_wrong_phrase_neg_per_pos)
+
+        for batch_idx, (src_idx, tgt_idx) in enumerate(indices):
+            src_idx = src_idx.to(device=device)
+            tgt_idx = tgt_idx.to(device=device)
+            if src_idx.numel() == 0:
+                continue
+
+            target = targets[batch_idx]
+            target_labels = target["labels"].to(device=device, dtype=torch.long)
+            target_boxes = target["boxes"].to(device=device, dtype=detached_boxes.dtype)
+            present_labels = torch.unique(target_labels)
+            matched_query_mask = torch.zeros(pred_logits.shape[1], dtype=torch.bool, device=device)
+            matched_query_mask[src_idx] = True
+
+            for query_idx, target_idx in zip(src_idx.tolist(), tgt_idx.tolist()):
+                label = target_labels[target_idx]
+                label_int = int(label.item())
+                if label_int < 0 or label_int >= num_classes:
+                    continue
+
+                region_feat = roi_features[batch_idx, query_idx]
+                text_feat = text_embedding[label_int]
+                detector_score = detached_scores[batch_idx, query_idx, label_int]
+                self._append_region_verifier_pair(
+                    region_feats=region_feats,
+                    text_feats=text_feats,
+                    detector_scores=detector_scores,
+                    labels=labels,
+                    region_feat=region_feat,
+                    text_feat=text_feat,
+                    detector_score=detector_score,
+                    label=1.0,
+                )
+
+                for wrong_label in self._sample_wrong_phrase_labels(
+                    correct_label=label,
+                    present_labels=present_labels,
+                    num_classes=num_classes,
+                    count=wrong_neg_per_pos,
+                ):
+                    wrong_label = wrong_label.to(device=device, dtype=torch.long)
+                    wrong_label_int = int(wrong_label.item())
+                    self._append_region_verifier_pair(
+                        region_feats=region_feats,
+                        text_feats=text_feats,
+                        detector_scores=detector_scores,
+                        labels=labels,
+                        region_feat=region_feat,
+                        text_feat=text_embedding[wrong_label_int],
+                        detector_score=detached_scores[batch_idx, query_idx, wrong_label_int],
+                        label=0.0,
+                    )
+
+                if same_neg_per_pos <= 0:
+                    continue
+
+                ious = self._pairwise_iou_cxcywh(
+                    detached_boxes[batch_idx],
+                    target_boxes[target_idx : target_idx + 1],
+                ).squeeze(1)
+                valid = ious <= self.region_verifier_neg_iou_thresh
+                valid &= ~matched_query_mask
+                if not valid.any():
+                    continue
+
+                same_scores = detached_scores[batch_idx, :, label_int].clone()
+                same_scores[~valid] = -1.0
+                neg_count = min(same_neg_per_pos, int(valid.sum().item()))
+                neg_queries = torch.topk(same_scores, k=neg_count).indices
+                for neg_query_idx in neg_queries.tolist():
+                    self._append_region_verifier_pair(
+                        region_feats=region_feats,
+                        text_feats=text_feats,
+                        detector_scores=detector_scores,
+                        labels=labels,
+                        region_feat=roi_features[batch_idx, neg_query_idx],
+                        text_feat=text_feat,
+                        detector_score=detached_scores[batch_idx, neg_query_idx, label_int],
+                        label=0.0,
+                    )
+
+        if not labels:
+            return pred_logits.sum() * 0.0
+
+        region_tensor = torch.stack(region_feats, dim=0)
+        text_tensor = torch.stack(text_feats, dim=0).to(dtype=region_tensor.dtype)
+        score_tensor = torch.stack(detector_scores, dim=0).to(dtype=region_tensor.dtype)
+        label_tensor = torch.stack(labels, dim=0).to(dtype=region_tensor.dtype)
+
+        max_pairs = self.region_verifier_max_pairs
+        if max_pairs > 0 and label_tensor.numel() > max_pairs:
+            keep = torch.randperm(label_tensor.numel(), device=device)[:max_pairs]
+            region_tensor = region_tensor[keep]
+            text_tensor = text_tensor[keep]
+            score_tensor = score_tensor[keep]
+            label_tensor = label_tensor[keep]
+
+        pair_features = self._build_region_verifier_features(region_tensor, text_tensor, score_tensor)
+        logits = self.region_verifier(pair_features)
+        loss = F.binary_cross_entropy_with_logits(logits, label_tensor)
+
+        try:
+            storage = get_event_storage()
+            storage.put_scalar("region_verifier_num_pairs", float(label_tensor.numel()), smoothing_hint=False)
+            storage.put_scalar("region_verifier_pos_rate", float(label_tensor.mean().detach()), smoothing_hint=False)
+        except AssertionError:
+            pass
+
+        return loss
 
     def _fuse_region_verifier_scores(
         self,
@@ -661,7 +925,7 @@ class DINO(nn.Module):
             img_masks = images.tensor.new_zeros(batch_size, H, W)
 
         # original features
-        needs_wonorm_features = self.score_ensemble or self.region_verifier_enabled
+        needs_wonorm_features = self.score_ensemble or self.region_verifier_enabled or self.region_verifier_train_enabled
         backbone_outputs = self.backbone(images.tensor)
         if needs_wonorm_features:
             if not (isinstance(backbone_outputs, tuple) and len(backbone_outputs) == 2):
@@ -801,6 +1065,13 @@ class DINO(nn.Module):
 
         if self.training:
             loss_dict = self.criterion(output, targets, dn_meta)
+            if self.region_verifier_train_enabled:
+                loss_dict["loss_region_verifier"] = self.compute_region_verifier_training_loss(
+                    output,
+                    targets,
+                    features_wonorm,
+                    content_inds=content_inds,
+                )
             # === 1️⃣ 添加 APR 损失（保持原逻辑） ===
             if apr_loss is not None:
                 loss_dict["loss_apr"] = apr_loss

@@ -114,6 +114,7 @@ model = L(DINO)(
             "loss_giou_dn": 2.0,
             "loss_apr": 1.0,  # APR loss weight
             "loss_rpsa": 0.2,  # RPSA loss weight
+            "loss_region_verifier": 0.0,
         },
         loss_class_type="focal_loss",
         alpha=0.25,
@@ -151,6 +152,15 @@ model = L(DINO)(
     novel_scale=1.0,
     save_roi_features_only=False,
     save_roi_features_fp16=False,
+    region_verifier_train_enabled=False,
+    region_verifier_train_feature_mode="no_detector_score",
+    region_verifier_train_hidden_dim=512,
+    region_verifier_train_dropout=0.1,
+    region_verifier_same_phrase_neg_per_pos=1,
+    region_verifier_wrong_phrase_neg_per_pos=2,
+    region_verifier_neg_iou_thresh=0.3,
+    region_verifier_max_pairs=256,
+    region_verifier_train_detach_region_features=True,
     dn_number=100,
     label_noise_ratio=0.5,
     box_noise_scale=1.0,

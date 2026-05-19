@@ -730,3 +730,81 @@ Gain over crop-trained internal verifier: +0.8943 AP.
 No-text verifier collapses on wrong_phrase_same_region to AP 0.3333 / AUC 0.5.
 This supports that the gain comes from region-description matching, not detector score or box calibration.
 ```
+
+## 12. 训练时内部 ROI verifier loss
+
+前面的 ROI verifier 是离线训练再接回推理。下一步把 verifier loss 放进 `DINO.forward()` 训练分支：
+
+```text
+matched query ROI feature + correct phrase -> label 1
+matched query ROI feature + wrong phrase   -> label 0
+bad query ROI feature + same phrase        -> label 0
+loss_region_verifier = BCE(verifier(region_feature, phrase_feature), label)
+```
+
+对应 config：
+
+```text
+lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_train_roi_verifier_w075.py
+```
+
+默认设置：
+
+```text
+region_verifier_train_enabled=True
+region_verifier_enabled=True
+region_verifier_train_feature_mode=no_detector_score
+same_phrase_neg_per_pos=1
+wrong_phrase_neg_per_pos=2
+max_pairs=256
+loss_region_verifier weight=0.1
+region features detached=True
+fusion weight=0.25
+```
+
+先跑一个短 smoke，确认 `loss_region_verifier` 正常下降且不会 OOM：
+
+```bash
+TMP_OUT=/root/autodl-tmp/LaMI-DETR-output
+
+CUDA_VISIBLE_DEVICES=0 python tools/train_net.py \
+  --config-file lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_train_roi_verifier_w075.py \
+  --num-gpus 1 \
+  train.init_checkpoint=/root/autodl-tmp/model_final_ovd_lvis_kang.pth \
+  train.max_iter=200 \
+  train.eval_period=200 \
+  train.checkpointer.period=200 \
+  train.output_dir="$TMP_OUT/d3_train_roi_verifier_w075_smoke" \
+  dataloader.evaluator.output_dir="$TMP_OUT/d3_train_roi_verifier_w075_smoke"
+```
+
+如果 smoke 正常，再跑稍长版本：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python tools/train_net.py \
+  --config-file lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_train_roi_verifier_w075.py \
+  --num-gpus 1 \
+  train.init_checkpoint=/root/autodl-tmp/model_final_ovd_lvis_kang.pth \
+  train.max_iter=2000 \
+  train.eval_period=1000 \
+  train.checkpointer.period=1000 \
+  train.output_dir="$TMP_OUT/d3_train_roi_verifier_w075_2k" \
+  dataloader.evaluator.output_dir="$TMP_OUT/d3_train_roi_verifier_w075_2k"
+```
+
+主要看：
+
+```text
+loss_region_verifier
+region_verifier_num_pairs
+region_verifier_pos_rate
+eval bbox AP
+```
+
+这个版本仍然是保守训练：ROI feature 默认 detach，所以首先训练 verifier 本身，不把梯度推回 detector 主干。若 2k 稳定且 AP 有收益，再把：
+
+```text
+model.region_verifier_train_detach_region_features=False
+```
+
+作为真正端到端版本的下一轮 ablation。
