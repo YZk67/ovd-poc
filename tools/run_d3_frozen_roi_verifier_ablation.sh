@@ -25,6 +25,8 @@ CONFIG="${CONFIG:-lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zerosho
 DETECTOR_CKPT="${DETECTOR_CKPT:-/root/autodl-tmp/model_final_ovd_lvis_kang.pth}"
 VERIFIER_CKPT="${VERIFIER_CKPT:-$TMP_OUT/d3_roi_verifier_w075_no_score/verifier_best.pt}"
 OUT_ROOT="${OUT_ROOT:-$TMP_OUT/d3_frozen_roi_verifier_ablation}"
+SPLIT_VERIFIER_WEIGHT="${SPLIT_VERIFIER_WEIGHT:-0.25}"
+SPLIT_VERIFIER_TOPK="${SPLIT_VERIFIER_TOPK:-20}"
 
 SPLITS=(
   d3_intra_full
@@ -145,9 +147,12 @@ run_ablation() {
 }
 
 run_splits() {
+  local wtag="${SPLIT_VERIFIER_WEIGHT/./}"
+  local tag="verifier_w${wtag}_top${SPLIT_VERIFIER_TOPK}"
+
   for split in "${SPLITS[@]}"; do
     run_eval "$split" detector_only False
-    run_eval "$split" verifier_w025_top20 True 0.25 20
+    run_eval "$split" "$tag" True "$SPLIT_VERIFIER_WEIGHT" "$SPLIT_VERIFIER_TOPK"
   done
 }
 

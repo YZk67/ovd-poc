@@ -803,6 +803,15 @@ D3_INTRA_ABS_JSON=d3/annotations/d3_abs_fullcats.json \
 bash tools/run_d3_frozen_roi_verifier_ablation.sh splits
 ```
 
+To rerun the same splits with the best full-split top-k setting:
+
+```bash
+SPLIT_VERIFIER_TOPK=50 \
+D3_INTRA_PRES_JSON=d3/annotations/d3_pres_fullcats.json \
+D3_INTRA_ABS_JSON=d3/annotations/d3_abs_fullcats.json \
+bash tools/run_d3_frozen_roi_verifier_ablation.sh splits
+```
+
 The split runner evaluates:
 
 ```text
