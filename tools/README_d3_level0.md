@@ -1056,6 +1056,12 @@ Observed ranking results:
 |:--|:--|:--|--:|--:|--:|--:|--:|--:|:--|
 | global batch ranking, 200 iters | ROI no-score verifier | verifier only | 10.2640 | 12.8432 | 10.4180 | 6.8387 | 12.5437 | 11.9869 | below frozen top50 |
 | grouped ranking, 200 iters | ROI no-score verifier | verifier only | 10.3549 | 12.9660 | 10.5099 | 6.8872 | 12.8028 | 12.0462 | better than global ranking, still below frozen top50 |
+| grouped ranking, 200 iters, loss weight=0.01 | ROI no-score verifier | verifier only | 10.3730 | 12.9891 | 10.5252 | 6.9942 | 12.8280 | 12.0089 | slight improvement, still below frozen top50 |
+
+Conclusion: train-time verifier losses (BCE and current ranking variants) do not
+improve over the frozen ROI verifier. Keep this branch as negative/diagnostic
+evidence and use the frozen `w=0.25, topk=50` ROI verifier as the main method
+module.
 
 这个版本仍然是保守训练：ROI feature 默认 detach，所以首先训练 verifier 本身，不把梯度推回 detector 主干。若 verifier-only 版本稳定且 AP 有收益，再把：
 
