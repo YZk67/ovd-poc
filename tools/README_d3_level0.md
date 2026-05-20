@@ -997,6 +997,52 @@ over time. Treat this as a negative finding for naive BCE and revisit training
 with a pairwise/ranking objective only after the frozen verifier results are
 fully evaluated.
 
+## 13. Pairwise ranking loss for ROI verifier training
+
+After frozen verifier evaluation, the training-side upgrade is to replace BCE
+with pairwise ranking while keeping the detector frozen. The ranking objective
+uses the same sampled positive/negative verifier pairs, but optimizes:
+
+```text
+softplus(margin - (positive_logit - negative_logit))
+```
+
+This directly matches the test-time use of the verifier as a ranking/fusion
+score and avoids forcing verifier logits to be calibrated binary probabilities.
+
+Config:
+
+```text
+lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_train_roi_verifier_ranking_only_w075.py
+```
+
+Smoke run:
+
+```bash
+export TMP_OUT=/root/autodl-tmp/LaMI-DETR-output
+
+CUDA_VISIBLE_DEVICES=0 python tools/train_net.py \
+  --config-file lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_train_roi_verifier_ranking_only_w075.py \
+  --num-gpus 1 \
+  train.init_checkpoint=/root/autodl-tmp/model_final_ovd_lvis_kang.pth \
+  model.region_verifier_checkpoint="$TMP_OUT/d3_roi_verifier_w075_no_score/verifier_best.pt" \
+  train.max_iter=200 \
+  train.eval_period=200 \
+  train.checkpointer.period=200 \
+  train.output_dir="$TMP_OUT/d3_train_roi_verifier_ranking_only_w075_warm_200" \
+  dataloader.evaluator.output_dir="$TMP_OUT/d3_train_roi_verifier_ranking_only_w075_warm_200"
+```
+
+Watch:
+
+```text
+loss_region_verifier
+region_verifier_num_pairs
+region_verifier_pos_rate
+region_verifier_num_rank_pairs
+eval bbox AP
+```
+
 这个版本仍然是保守训练：ROI feature 默认 detach，所以首先训练 verifier 本身，不把梯度推回 detector 主干。若 verifier-only 版本稳定且 AP 有收益，再把：
 
 ```text

@@ -141,6 +141,8 @@ class DINO(nn.Module):
         region_verifier_neg_iou_thresh: float = 0.3,
         region_verifier_max_pairs: int = 256,
         region_verifier_train_detach_region_features: bool = True,
+        region_verifier_train_loss_type: str = "bce",
+        region_verifier_ranking_margin: float = 0.0,
     ):
         super().__init__()
         self.vlm_temperature = vlm_temperature
@@ -165,6 +167,8 @@ class DINO(nn.Module):
         self.region_verifier_neg_iou_thresh = float(region_verifier_neg_iou_thresh)
         self.region_verifier_max_pairs = int(region_verifier_max_pairs)
         self.region_verifier_train_detach_region_features = bool(region_verifier_train_detach_region_features)
+        self.region_verifier_train_loss_type = str(region_verifier_train_loss_type)
+        self.region_verifier_ranking_margin = float(region_verifier_ranking_margin)
         self.region_verifier = None
         self.region_verifier_feature_mode = str(region_verifier_train_feature_mode)
         self.region_verifier_text_embedding = None
@@ -719,12 +723,34 @@ class DINO(nn.Module):
 
         pair_features = self._build_region_verifier_features(region_tensor, text_tensor, score_tensor)
         logits = self.region_verifier(pair_features)
-        loss = F.binary_cross_entropy_with_logits(logits, label_tensor)
+
+        loss_type = self.region_verifier_train_loss_type
+        if loss_type == "bce":
+            loss = F.binary_cross_entropy_with_logits(logits, label_tensor)
+        elif loss_type in {"pairwise_rank", "ranking"}:
+            pos_logits = logits[label_tensor > 0.5]
+            neg_logits = logits[label_tensor <= 0.5]
+            if pos_logits.numel() == 0 or neg_logits.numel() == 0:
+                loss = logits.sum() * 0.0
+            else:
+                logit_margin = pos_logits[:, None] - neg_logits[None, :]
+                loss = F.softplus(self.region_verifier_ranking_margin - logit_margin).mean()
+        else:
+            raise ValueError(
+                f"Unsupported region_verifier_train_loss_type={loss_type!r}; "
+                "expected 'bce' or 'pairwise_rank'."
+            )
 
         try:
             storage = get_event_storage()
             storage.put_scalar("region_verifier_num_pairs", float(label_tensor.numel()), smoothing_hint=False)
             storage.put_scalar("region_verifier_pos_rate", float(label_tensor.mean().detach()), smoothing_hint=False)
+            if loss_type in {"pairwise_rank", "ranking"}:
+                num_pos = int((label_tensor > 0.5).sum().item())
+                num_neg = int((label_tensor <= 0.5).sum().item())
+                storage.put_scalar("region_verifier_num_pos", float(num_pos), smoothing_hint=False)
+                storage.put_scalar("region_verifier_num_neg", float(num_neg), smoothing_hint=False)
+                storage.put_scalar("region_verifier_num_rank_pairs", float(num_pos * num_neg), smoothing_hint=False)
         except AssertionError:
             pass
 
