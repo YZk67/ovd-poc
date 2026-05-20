@@ -808,6 +808,28 @@ eval bbox AP
 | train config, eval-only | ROI no-score verifier | none | 10.3111 | 12.8845 | 10.4725 | 7.0019 | 12.2422 | 12.0509 | reproduces best internal ROI verifier |
 | train config, scratch smoke | random verifier | joint detector+verifier, 200 iters | 7.4178 | 8.8053 | 7.6624 | 3.0858 | 8.6136 | 8.9512 | verifies loss path, but random verifier hurts ranking |
 | train config, warm smoke | ROI no-score verifier | joint detector+verifier, 200 iters | 6.3780 | 7.5990 | 6.6460 | 3.0830 | 7.7310 | 7.7920 | naive joint fine-tuning damages the detector/verifier ranking |
+| verifier-only warm smoke | ROI no-score verifier | verifier only, 200 iters, lr=1e-4 | 9.9547 | 12.4480 | 10.1159 | 6.7904 | 11.7018 | 11.7026 | freezing detector avoids collapse, but still drifts |
+| verifier-only warm smoke | ROI no-score verifier | verifier only, 200 iters, lr=1e-5 | 10.2456 | 12.8119 | 10.4107 | 6.9175 | 12.1713 | 11.9813 | lower LR mostly preserves calibration |
+| verifier-only warm 1k | ROI no-score verifier | verifier only, 1000 iters, lr=1e-5 | 10.1137 | 12.6402 | 10.2737 | 6.8667 | 11.9464 | 11.8489 | longer BCE fine-tuning keeps drifting down |
+
+Current conclusion: keep the train-time BCE branch as an ablation behind flags,
+but stop using it as the main method. The main result is still the frozen
+ROI-trained internal verifier at AP 10.3111. To disable train-time BCE while
+keeping test-time verifier fusion:
+
+```text
+model.region_verifier_enabled=True
+model.region_verifier_train_enabled=False
+model.criterion.weight_dict.loss_region_verifier=0.0
+```
+
+To fully disable the verifier:
+
+```text
+model.region_verifier_enabled=False
+model.region_verifier_train_enabled=False
+model.criterion.weight_dict.loss_region_verifier=0.0
+```
 
 The 200-iter warm smoke shows that the current train-time loss is wired, but
 naive joint fine-tuning is not the right training strategy. The next controlled
@@ -833,10 +855,11 @@ CUDA_VISIBLE_DEVICES=0 python tools/train_net.py \
   dataloader.evaluator.output_dir="$TMP_OUT/d3_train_roi_verifier_only_w075_warm_smoke"
 ```
 
-If verifier-only warm fine-tuning stays near 10.31 or improves, then the
-training loss is useful but the detector must stay frozen initially. If it still
-drops, the verifier loss is overfitting or miscalibrating and should be trained
-with a lower LR / lower fusion weight / held-out validation selection.
+Verifier-only warm fine-tuning confirms that freezing the detector avoids the
+large collapse, but the BCE objective still degrades the frozen ROI verifier
+over time. Treat this as a negative finding for naive BCE and revisit training
+with a pairwise/ranking objective only after the frozen verifier results are
+fully evaluated.
 
 这个版本仍然是保守训练：ROI feature 默认 detach，所以首先训练 verifier 本身，不把梯度推回 detector 主干。若 verifier-only 版本稳定且 AP 有收益，再把：
 
