@@ -731,6 +731,68 @@ No-text verifier collapses on wrong_phrase_same_region to AP 0.3333 / AUC 0.5.
 This supports that the gain comes from region-description matching, not detector score or box calibration.
 ```
 
+### Frozen verifier follow-up runs
+
+After the train-time BCE ablation, keep the ROI verifier frozen and evaluate it
+as the main plug-in method. The runner below uses:
+
+```text
+config: dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_internal_roi_verifier_w075.py
+detector checkpoint: /root/autodl-tmp/model_final_ovd_lvis_kang.pth
+verifier checkpoint: $TMP_OUT/d3_roi_verifier_w075_no_score/verifier_best.pt
+train-time BCE: disabled
+```
+
+First run the main split fusion/top-k ablation:
+
+```bash
+export TMP_OUT=/root/autodl-tmp/LaMI-DETR-output
+bash tools/run_d3_frozen_roi_verifier_ablation.sh ablation
+```
+
+This runs:
+
+```text
+d3_intra_full detector_only
+d3_intra_full verifier weight=0.10 topk=20
+d3_intra_full verifier weight=0.25 topk=20
+d3_intra_full verifier weight=0.50 topk=20
+d3_intra_full verifier weight=0.25 topk=10
+d3_intra_full verifier weight=0.25 topk=50
+```
+
+Then run the six D3 splits with detector-only and the current best verifier
+setting:
+
+```bash
+bash tools/run_d3_frozen_roi_verifier_ablation.sh splits
+```
+
+The split runner evaluates:
+
+```text
+d3_intra_full, d3_intra_pres, d3_intra_abs
+d3_inter_full, d3_inter_pres, d3_inter_abs
+```
+
+Outputs are written under:
+
+```text
+$TMP_OUT/d3_frozen_roi_verifier_ablation/{split}/{setting}
+```
+
+Summarize all finished logs:
+
+```bash
+python tools/summarize_d3_ablation_results.py \
+  --root "$TMP_OUT/d3_frozen_roi_verifier_ablation" \
+  --output "$TMP_OUT/d3_frozen_roi_verifier_ablation/summary.csv"
+```
+
+The runner skips existing `coco_instances_results.json` by default. Set
+`SKIP_EXISTING=0` to force reruns, or `DRY_RUN=1` to print commands without
+running them.
+
 ## 12. 训练时内部 ROI verifier loss
 
 前面的 ROI verifier 是离线训练再接回推理。下一步把 verifier loss 放进 `DINO.forward()` 训练分支：
