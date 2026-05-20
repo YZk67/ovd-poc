@@ -1050,6 +1050,13 @@ That is below the frozen `w=0.25, topk=50` verifier AP 10.4748, so the ranking
 loss was changed to group-aware ranking: each matched positive is only compared
 with its own wrong-phrase and same-phrase negative samples.
 
+Observed ranking results:
+
+| Setting | Init | Train update | AP | AP50 | AP75 | APs | APm | APl | Note |
+|:--|:--|:--|--:|--:|--:|--:|--:|--:|:--|
+| global batch ranking, 200 iters | ROI no-score verifier | verifier only | 10.2640 | 12.8432 | 10.4180 | 6.8387 | 12.5437 | 11.9869 | below frozen top50 |
+| grouped ranking, 200 iters | ROI no-score verifier | verifier only | 10.3549 | 12.9660 | 10.5099 | 6.8872 | 12.8028 | 12.0462 | better than global ranking, still below frozen top50 |
+
 这个版本仍然是保守训练：ROI feature 默认 detach，所以首先训练 verifier 本身，不把梯度推回 detector 主干。若 verifier-only 版本稳定且 AP 有收益，再把：
 
 ```text
