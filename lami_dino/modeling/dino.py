@@ -575,15 +575,18 @@ class DINO(nn.Module):
         text_feats: List[torch.Tensor],
         detector_scores: List[torch.Tensor],
         labels: List[torch.Tensor],
+        group_ids: List[int],
         region_feat: torch.Tensor,
         text_feat: torch.Tensor,
         detector_score: torch.Tensor,
         label: float,
+        group_id: int,
     ) -> None:
         region_feats.append(region_feat)
         text_feats.append(text_feat)
         detector_scores.append(detector_score.reshape(()))
         labels.append(region_feat.new_tensor(label))
+        group_ids.append(group_id)
 
     def compute_region_verifier_training_loss(
         self,
@@ -619,6 +622,8 @@ class DINO(nn.Module):
         text_feats: List[torch.Tensor] = []
         detector_scores: List[torch.Tensor] = []
         labels: List[torch.Tensor] = []
+        group_ids: List[int] = []
+        next_group_id = 0
 
         detached_boxes = pred_boxes.detach()
         detached_scores = pred_logits.detach().sigmoid()
@@ -644,6 +649,8 @@ class DINO(nn.Module):
                 if label_int < 0 or label_int >= num_classes:
                     continue
 
+                group_id = next_group_id
+                next_group_id += 1
                 region_feat = roi_features[batch_idx, query_idx]
                 text_feat = text_embedding[label_int]
                 detector_score = detached_scores[batch_idx, query_idx, label_int]
@@ -652,10 +659,12 @@ class DINO(nn.Module):
                     text_feats=text_feats,
                     detector_scores=detector_scores,
                     labels=labels,
+                    group_ids=group_ids,
                     region_feat=region_feat,
                     text_feat=text_feat,
                     detector_score=detector_score,
                     label=1.0,
+                    group_id=group_id,
                 )
 
                 for wrong_label in self._sample_wrong_phrase_labels(
@@ -671,10 +680,12 @@ class DINO(nn.Module):
                         text_feats=text_feats,
                         detector_scores=detector_scores,
                         labels=labels,
+                        group_ids=group_ids,
                         region_feat=region_feat,
                         text_feat=text_embedding[wrong_label_int],
                         detector_score=detached_scores[batch_idx, query_idx, wrong_label_int],
                         label=0.0,
+                        group_id=group_id,
                     )
 
                 if same_neg_per_pos <= 0:
@@ -699,10 +710,12 @@ class DINO(nn.Module):
                         text_feats=text_feats,
                         detector_scores=detector_scores,
                         labels=labels,
+                        group_ids=group_ids,
                         region_feat=roi_features[batch_idx, neg_query_idx],
                         text_feat=text_feat,
                         detector_score=detached_scores[batch_idx, neg_query_idx, label_int],
                         label=0.0,
+                        group_id=group_id,
                     )
 
         if not labels:
@@ -712,6 +725,7 @@ class DINO(nn.Module):
         text_tensor = torch.stack(text_feats, dim=0).to(dtype=region_tensor.dtype)
         score_tensor = torch.stack(detector_scores, dim=0).to(dtype=region_tensor.dtype)
         label_tensor = torch.stack(labels, dim=0).to(dtype=region_tensor.dtype)
+        group_tensor = torch.as_tensor(group_ids, device=device, dtype=torch.long)
 
         max_pairs = self.region_verifier_max_pairs
         if max_pairs > 0 and label_tensor.numel() > max_pairs:
@@ -720,6 +734,7 @@ class DINO(nn.Module):
             text_tensor = text_tensor[keep]
             score_tensor = score_tensor[keep]
             label_tensor = label_tensor[keep]
+            group_tensor = group_tensor[keep]
 
         pair_features = self._build_region_verifier_features(region_tensor, text_tensor, score_tensor)
         logits = self.region_verifier(pair_features)
@@ -728,13 +743,21 @@ class DINO(nn.Module):
         if loss_type == "bce":
             loss = F.binary_cross_entropy_with_logits(logits, label_tensor)
         elif loss_type in {"pairwise_rank", "ranking"}:
-            pos_logits = logits[label_tensor > 0.5]
-            neg_logits = logits[label_tensor <= 0.5]
-            if pos_logits.numel() == 0 or neg_logits.numel() == 0:
+            rank_losses = []
+            rank_pair_count = 0
+            for group_id in torch.unique(group_tensor).tolist():
+                in_group = group_tensor == int(group_id)
+                pos_logits = logits[in_group & (label_tensor > 0.5)]
+                neg_logits = logits[in_group & (label_tensor <= 0.5)]
+                if pos_logits.numel() == 0 or neg_logits.numel() == 0:
+                    continue
+                logit_margin = pos_logits[:, None] - neg_logits[None, :]
+                rank_losses.append(F.softplus(self.region_verifier_ranking_margin - logit_margin).mean())
+                rank_pair_count += int(pos_logits.numel() * neg_logits.numel())
+            if not rank_losses:
                 loss = logits.sum() * 0.0
             else:
-                logit_margin = pos_logits[:, None] - neg_logits[None, :]
-                loss = F.softplus(self.region_verifier_ranking_margin - logit_margin).mean()
+                loss = torch.stack(rank_losses).mean()
         else:
             raise ValueError(
                 f"Unsupported region_verifier_train_loss_type={loss_type!r}; "
@@ -750,7 +773,7 @@ class DINO(nn.Module):
                 num_neg = int((label_tensor <= 0.5).sum().item())
                 storage.put_scalar("region_verifier_num_pos", float(num_pos), smoothing_hint=False)
                 storage.put_scalar("region_verifier_num_neg", float(num_neg), smoothing_hint=False)
-                storage.put_scalar("region_verifier_num_rank_pairs", float(num_pos * num_neg), smoothing_hint=False)
+                storage.put_scalar("region_verifier_num_rank_pairs", float(rank_pair_count), smoothing_hint=False)
         except AssertionError:
             pass
 

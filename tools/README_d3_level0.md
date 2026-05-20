@@ -1001,7 +1001,8 @@ fully evaluated.
 
 After frozen verifier evaluation, the training-side upgrade is to replace BCE
 with pairwise ranking while keeping the detector frozen. The ranking objective
-uses the same sampled positive/negative verifier pairs, but optimizes:
+uses the same sampled positive/negative verifier pairs, but optimizes each
+matched region against its own sampled negatives:
 
 ```text
 softplus(margin - (positive_logit - negative_logit))
@@ -1029,8 +1030,8 @@ CUDA_VISIBLE_DEVICES=0 python tools/train_net.py \
   train.max_iter=200 \
   train.eval_period=200 \
   train.checkpointer.period=200 \
-  train.output_dir="$TMP_OUT/d3_train_roi_verifier_ranking_only_w075_warm_200" \
-  dataloader.evaluator.output_dir="$TMP_OUT/d3_train_roi_verifier_ranking_only_w075_warm_200"
+  train.output_dir="$TMP_OUT/d3_train_roi_verifier_ranking_grouped_only_w075_warm_200" \
+  dataloader.evaluator.output_dir="$TMP_OUT/d3_train_roi_verifier_ranking_grouped_only_w075_warm_200"
 ```
 
 Watch:
@@ -1042,6 +1043,12 @@ region_verifier_pos_rate
 region_verifier_num_rank_pairs
 eval bbox AP
 ```
+
+Initial global batch ranking, where every positive was compared against every
+negative in the batch, reached AP 10.2640 after 200 verifier-only warm iters.
+That is below the frozen `w=0.25, topk=50` verifier AP 10.4748, so the ranking
+loss was changed to group-aware ranking: each matched positive is only compared
+with its own wrong-phrase and same-phrase negative samples.
 
 这个版本仍然是保守训练：ROI feature 默认 detach，所以首先训练 verifier 本身，不把梯度推回 detector 主干。若 verifier-only 版本稳定且 AP 有收益，再把：
 
