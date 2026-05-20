@@ -826,6 +826,25 @@ python tools/summarize_d3_ablation_results.py \
   --output "$TMP_OUT/d3_frozen_roi_verifier_ablation/summary.csv"
 ```
 
+Frozen verifier summary:
+
+| Split | Setting | AP | AP50 | AP75 | APs | APm | APl | Gain |
+|:--|:--|--:|--:|--:|--:|--:|--:|--:|
+| d3_intra_full | detector_only | 9.1563 | 11.4391 | 9.3068 | 5.9630 | 10.8197 | 10.7859 | - |
+| d3_intra_full | verifier w=0.25 topk=20 | 10.3111 | 12.8845 | 10.4725 | 7.0019 | 12.2422 | 12.0509 | +1.1548 |
+| d3_intra_full | verifier w=0.25 topk=50 | **10.4748** | **13.1072** | **10.6299** | **7.0552** | **12.9048** | 12.1969 | **+1.3185** |
+| d3_intra_pres | detector_only | 9.7479 | 12.2098 | 9.8280 | 5.5991 | 11.5583 | 11.6346 | - |
+| d3_intra_pres | verifier w=0.25 topk=20 | 11.0696 | 13.8643 | 11.1748 | 6.6718 | 13.0225 | 13.1646 | +1.3217 |
+| d3_intra_abs | detector_only | 7.4037 | 9.1556 | 7.7627 | 6.9056 | 8.7863 | 8.2977 | - |
+| d3_intra_abs | verifier w=0.25 topk=20 | 8.0640 | 9.9817 | 8.3918 | 7.8568 | 10.0944 | 8.7853 | +0.6603 |
+| d3_inter_full | detector_only | 9.1563 | 11.4391 | 9.3068 | 5.9630 | 10.8197 | 10.7859 | - |
+| d3_inter_full | verifier w=0.25 topk=20 | 10.3111 | 12.8845 | 10.4725 | 7.0019 | 12.2422 | 12.0509 | +1.1548 |
+
+`d3_inter_full` currently matches `d3_intra_full` exactly. Before treating it as
+an independent split result, verify that `dataset/d3/annotations/d3_inter_full.json`
+and `dataset/d3/annotations/d3_intra_full.json` are not identical or aliased by
+the environment.
+
 The runner skips existing `coco_instances_results.json` by default. Set
 `SKIP_EXISTING=0` to force reruns, or `DRY_RUN=1` to print commands without
 running them. It also skips missing D3 split annotation files by default; set
