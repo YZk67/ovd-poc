@@ -761,18 +761,37 @@ d3_intra_full verifier weight=0.25 topk=10
 d3_intra_full verifier weight=0.25 topk=50
 ```
 
-Then run the six D3 splits with detector-only and the current best verifier
-setting:
+Official D3 `pres/abs` JSONs contain only category subsets (316 present
+categories and 106 absent categories). Since this detector predicts the full 422
+D3 phrase bank, first create full-category compatible versions:
 
 ```bash
+python tools/prepare_d3_subset_full_categories.py
+```
+
+This creates:
+
+```text
+dataset/d3/annotations/d3_pres_fullcats.json
+dataset/d3/annotations/d3_abs_fullcats.json
+```
+
+Then run the available official D3 splits with detector-only and the current
+best verifier setting:
+
+```bash
+D3_INTRA_PRES_JSON=d3/annotations/d3_pres_fullcats.json \
+D3_INTRA_ABS_JSON=d3/annotations/d3_abs_fullcats.json \
 bash tools/run_d3_frozen_roi_verifier_ablation.sh splits
 ```
 
 The split runner evaluates:
 
 ```text
-d3_intra_full, d3_intra_pres, d3_intra_abs
-d3_inter_full, d3_inter_pres, d3_inter_abs
+d3_intra_full
+d3_intra_pres, using d3_pres_fullcats.json
+d3_intra_abs, using d3_abs_fullcats.json
+d3_inter_full
 ```
 
 Outputs are written under:
@@ -791,7 +810,8 @@ python tools/summarize_d3_ablation_results.py \
 
 The runner skips existing `coco_instances_results.json` by default. Set
 `SKIP_EXISTING=0` to force reruns, or `DRY_RUN=1` to print commands without
-running them.
+running them. It also skips missing D3 split annotation files by default; set
+`SKIP_MISSING_SPLITS=0` if missing split files should be treated as a hard error.
 
 ## 12. 训练时内部 ROI verifier loss
 

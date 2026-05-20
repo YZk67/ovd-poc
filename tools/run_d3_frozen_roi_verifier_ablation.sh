@@ -18,6 +18,7 @@ TMP_OUT="${TMP_OUT:-/root/autodl-tmp/LaMI-DETR-output}"
 PYTHON="${PYTHON:-python}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
+SKIP_MISSING_SPLITS="${SKIP_MISSING_SPLITS:-1}"
 DRY_RUN="${DRY_RUN:-0}"
 
 CONFIG="${CONFIG:-lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_internal_roi_verifier_w075.py}"
@@ -30,9 +31,47 @@ SPLITS=(
   d3_intra_pres
   d3_intra_abs
   d3_inter_full
-  d3_inter_pres
-  d3_inter_abs
 )
+
+d3_annotation_path() {
+  local split="$1"
+  local data_root="${DETECTRON2_DATASETS:-dataset}"
+  local rel_path
+
+  case "$split" in
+    d3_inter_full) rel_path="${D3_INTER_FULL_JSON:-d3/annotations/d3_inter_full.json}" ;;
+    d3_inter_pres) rel_path="${D3_INTER_PRES_JSON:-d3/annotations/d3_inter_pres.json}" ;;
+    d3_inter_abs) rel_path="${D3_INTER_ABS_JSON:-d3/annotations/d3_inter_abs.json}" ;;
+    d3_intra_full) rel_path="${D3_INTRA_FULL_JSON:-d3/annotations/d3_intra_full.json}" ;;
+    d3_intra_pres) rel_path="${D3_INTRA_PRES_JSON:-d3/annotations/d3_intra_pres.json}" ;;
+    d3_intra_abs) rel_path="${D3_INTRA_ABS_JSON:-d3/annotations/d3_intra_abs.json}" ;;
+    *) return 1 ;;
+  esac
+
+  if [[ "$rel_path" == *"://"* || "$rel_path" = /* ]]; then
+    printf '%s\n' "$rel_path"
+  else
+    printf '%s\n' "$data_root/$rel_path"
+  fi
+}
+
+split_available() {
+  local split="$1"
+  local ann_path
+
+  ann_path="$(d3_annotation_path "$split")" || return 0
+  if [[ "$ann_path" == *"://"* || -f "$ann_path" ]]; then
+    return 0
+  fi
+
+  if [[ "$SKIP_MISSING_SPLITS" == "1" ]]; then
+    echo "[skip] $split annotation not found: $ann_path" >&2
+    return 1
+  fi
+
+  echo "[error] $split annotation not found: $ann_path" >&2
+  exit 1
+}
 
 run_eval() {
   local split="$1"
@@ -41,6 +80,10 @@ run_eval() {
   local fusion_weight="${4:-0.25}"
   local topk="${5:-20}"
   local output_dir="$OUT_ROOT/$split/$tag"
+
+  if ! split_available "$split"; then
+    return
+  fi
 
   if [[ "$SKIP_EXISTING" == "1" && -f "$output_dir/coco_instances_results.json" ]]; then
     echo "[skip] $split $tag already has coco_instances_results.json"
