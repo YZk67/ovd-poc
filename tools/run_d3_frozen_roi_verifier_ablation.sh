@@ -10,7 +10,7 @@ set -euo pipefail
 # Modes:
 #   quick     d3_intra_full detector-only + best verifier
 #   ablation  d3_intra_full detector-only + fusion/top-k sweep
-#   splits    all D3 splits detector-only + best verifier
+#   splits    main non-redundant D3 bbox splits detector-only + best verifier
 #   all       ablation + splits
 
 MODE="${1:-quick}"
@@ -27,13 +27,9 @@ VERIFIER_CKPT="${VERIFIER_CKPT:-$TMP_OUT/d3_roi_verifier_w075_no_score/verifier_
 OUT_ROOT="${OUT_ROOT:-$TMP_OUT/d3_frozen_roi_verifier_ablation}"
 SPLIT_VERIFIER_WEIGHT="${SPLIT_VERIFIER_WEIGHT:-0.25}"
 SPLIT_VERIFIER_TOPK="${SPLIT_VERIFIER_TOPK:-20}"
+D3_SPLITS="${D3_SPLITS:-d3_intra_full d3_intra_pres d3_intra_abs}"
 
-SPLITS=(
-  d3_intra_full
-  d3_intra_pres
-  d3_intra_abs
-  d3_inter_full
-)
+read -r -a SPLITS <<< "$D3_SPLITS"
 
 d3_annotation_path() {
   local split="$1"

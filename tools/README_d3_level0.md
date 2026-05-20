@@ -812,14 +812,18 @@ D3_INTRA_ABS_JSON=d3/annotations/d3_abs_fullcats.json \
 bash tools/run_d3_frozen_roi_verifier_ablation.sh splits
 ```
 
-The split runner evaluates:
+The split runner evaluates the non-redundant main bbox splits by default:
 
 ```text
 d3_intra_full
 d3_intra_pres, using d3_pres_fullcats.json
 d3_intra_abs, using d3_abs_fullcats.json
-d3_inter_full
 ```
+
+`d3_inter_full` can still be run explicitly with `D3_SPLITS=d3_inter_full`,
+but the released `d3_inter_full.json` has the same effective
+`(image_id, category_id, bbox)` set as `d3_intra_full.json` for bbox AP in this
+setup. Treat it as a duplicate sanity check, not an independent main split.
 
 Outputs are written under:
 
@@ -846,13 +850,11 @@ Frozen verifier summary:
 | d3_intra_pres | verifier w=0.25 topk=20 | 11.0696 | 13.8643 | 11.1748 | 6.6718 | 13.0225 | 13.1646 | +1.3217 |
 | d3_intra_abs | detector_only | 7.4037 | 9.1556 | 7.7627 | 6.9056 | 8.7863 | 8.2977 | - |
 | d3_intra_abs | verifier w=0.25 topk=20 | 8.0640 | 9.9817 | 8.3918 | 7.8568 | 10.0944 | 8.7853 | +0.6603 |
-| d3_inter_full | detector_only | 9.1563 | 11.4391 | 9.3068 | 5.9630 | 10.8197 | 10.7859 | - |
-| d3_inter_full | verifier w=0.25 topk=20 | 10.3111 | 12.8845 | 10.4725 | 7.0019 | 12.2422 | 12.0509 | +1.1548 |
-
-`d3_inter_full` currently matches `d3_intra_full` exactly. Before treating it as
-an independent split result, verify that `dataset/d3/annotations/d3_inter_full.json`
-and `dataset/d3/annotations/d3_intra_full.json` are not identical or aliased by
-the environment.
+`d3_inter_full` loads a different JSON file from `d3_intra_full`, but direct
+COCOeval checks against the same predictions give identical bbox AP because the
+effective `(image_id, category_id, bbox)` annotation set is the same:
+`intra only=0`, `inter only=0`, `shared=20278`, with all annotations
+`iscrowd=0`. Do not count it as an independent main result.
 
 The runner skips existing `coco_instances_results.json` by default. Set
 `SKIP_EXISTING=0` to force reruns, or `DRY_RUN=1` to print commands without
