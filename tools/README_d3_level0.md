@@ -1070,3 +1070,69 @@ model.region_verifier_train_detach_region_features=False
 ```
 
 作为真正端到端版本的下一轮 ablation。
+
+## 14. Multi-description alias bank + frozen ROI verifier
+
+The next description-conditioned step is to put the stable frozen ROI verifier
+behind a multi-description first-stage classifier. This tests whether the method
+is more than a D3 reranker: the detector first scores each phrase through
+multiple alias prompts, then the ROI verifier checks region-description
+consistency.
+
+If the D3 alias bank is missing, create it:
+
+```bash
+python tools/prepare_d3_description_prompts.py \
+  --phrases-json dataset/metadata/d3_phrases.json \
+  --preset anchored \
+  --prompt-count 3 \
+  --output dataset/metadata/d3_description_anchor_prompts.json
+
+python tools/generate_text_embeddings.py \
+  --prompt-json dataset/metadata/d3_description_anchor_prompts.json \
+  --clip-model pretrained_models/clip_convnext_large_head.pth \
+  --output dataset/metadata/d3_description_anchor_bank_convnextl.npy \
+  --aggregate none \
+  --normalize
+```
+
+Run the alias classifier with and without the frozen verifier:
+
+```bash
+export TMP_OUT=/root/autodl-tmp/LaMI-DETR-output
+
+CONFIG=lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_desc_anchor_logsumexp_roi_verifier_w075.py \
+OUT_ROOT="$TMP_OUT/d3_alias_roi_verifier_ablation" \
+SPLIT_VERIFIER_TOPK=50 \
+D3_INTRA_PRES_JSON=d3/annotations/d3_pres_fullcats.json \
+D3_INTRA_ABS_JSON=d3/annotations/d3_abs_fullcats.json \
+bash tools/run_d3_frozen_roi_verifier_ablation.sh splits
+```
+
+Summarize:
+
+```bash
+python tools/summarize_d3_ablation_results.py \
+  --root "$TMP_OUT/d3_alias_roi_verifier_ablation" \
+  --output "$TMP_OUT/d3_alias_roi_verifier_ablation/summary.csv"
+```
+
+For class-level OVD datasets such as LVIS/COCO, generate a uniform alias prompt
+bank with:
+
+```bash
+python tools/prepare_class_alias_prompts.py \
+  --classes-json dataset/lvis/lvis_v1_all_classes.json \
+  --output dataset/metadata/lvis_alias_prompts.json \
+  --prompt-count 5
+
+python tools/generate_text_embeddings.py \
+  --prompt-json dataset/metadata/lvis_alias_prompts.json \
+  --clip-model pretrained_models/clip_convnext_large_head.pth \
+  --output dataset/metadata/lvis_alias_prompts_convnextl.npy \
+  --aggregate none \
+  --normalize
+```
+
+This produces a `[num_classes, num_aliases, dim]` bank accepted directly by the
+static multi-prototype classifier (`logsumexp`, `max`, or `mean` aggregation).
