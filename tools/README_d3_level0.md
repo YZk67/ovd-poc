@@ -848,8 +848,14 @@ Frozen verifier summary:
 | d3_intra_full | verifier w=0.25 topk=50 | **10.4748** | **13.1072** | **10.6299** | **7.0552** | **12.9048** | 12.1969 | **+1.3185** |
 | d3_intra_pres | detector_only | 9.7479 | 12.2098 | 9.8280 | 5.5991 | 11.5583 | 11.6346 | - |
 | d3_intra_pres | verifier w=0.25 topk=20 | 11.0696 | 13.8643 | 11.1748 | 6.6718 | 13.0225 | 13.1646 | +1.3217 |
+| d3_intra_pres | verifier w=0.25 topk=50 | **11.2590** | **14.1168** | **11.3535** | **6.6955** | **13.7282** | **13.3405** | **+1.5111** |
 | d3_intra_abs | detector_only | 7.4037 | 9.1556 | 7.7627 | 6.9056 | 8.7863 | 8.2977 | - |
 | d3_intra_abs | verifier w=0.25 topk=20 | 8.0640 | 9.9817 | 8.3918 | 7.8568 | 10.0944 | 8.7853 | +0.6603 |
+| d3_intra_abs | verifier w=0.25 topk=50 | **8.1516** | **10.1163** | **8.4861** | **7.9867** | **10.6383** | **8.8441** | **+0.7479** |
+
+Top-k conclusion: `topk=50` beats `topk=20` on all three non-redundant D3 bbox
+splits, so the current main frozen-verifier setting is `w=0.25, topk=50`.
+
 `d3_inter_full` loads a different JSON file from `d3_intra_full`, but direct
 COCOeval checks against the same predictions give identical bbox AP because the
 effective `(image_id, category_id, bbox)` annotation set is the same:
