@@ -9,16 +9,15 @@
 - `d3_images.zip` 解压后的图片目录
 - `d3_json.zip` 的 COCO-style annotation，或 `d3_pkl.zip` 的 `sentences.pkl / annotations.pkl / images.pkl / groups.pkl`
 
-默认注册路径是：
+当前默认实验至少使用这些文件：
 
 ```text
 dataset/d3/images
 dataset/d3/annotations/d3_inter_full.json
-dataset/d3/annotations/d3_inter_pres.json
-dataset/d3/annotations/d3_inter_abs.json
 dataset/d3/annotations/d3_intra_full.json
-dataset/d3/annotations/d3_intra_pres.json
-dataset/d3/annotations/d3_intra_abs.json
+dataset/d3/d3_json/d3_full_annotations.json
+dataset/d3/d3_json/d3_pres_annotations.json
+dataset/d3/d3_json/d3_abs_annotations.json
 ```
 
 如果你的文件不放在这些位置，可以用环境变量覆盖：
@@ -56,6 +55,25 @@ python tools/prepare_d3_metadata.py \
 ```bash
 python tools/prepare_d3_metadata.py --pkl-root /path/to/d3_pkl --split pres --setting intra --coco-output dataset/d3/annotations/d3_intra_pres.json
 python tools/prepare_d3_metadata.py --pkl-root /path/to/d3_pkl --split abs --setting intra --coco-output dataset/d3/annotations/d3_intra_abs.json
+```
+
+`inter_pres` / `inter_abs` 不是当前默认主结果需要的 split。只有在明确要做
+inter-setting 的 PRES / ABS 压力测试时，才从 `d3_pkl` 额外派生：
+
+```bash
+python tools/prepare_d3_metadata.py --pkl-root /path/to/d3_pkl --split pres --setting inter --coco-output dataset/d3/annotations/d3_inter_pres.json
+python tools/prepare_d3_metadata.py --pkl-root /path/to/d3_pkl --split abs --setting inter --coco-output dataset/d3/annotations/d3_inter_abs.json
+```
+
+如果继续用 422 类 fixed-bank detector 评估这些派生 split，也要把
+`categories` 补回 full 422 类，例如：
+
+```bash
+python tools/prepare_d3_subset_full_categories.py \
+  --pres-json dataset/d3/annotations/d3_inter_pres.json \
+  --abs-json dataset/d3/annotations/d3_inter_abs.json \
+  --pres-output dataset/d3/annotations/d3_inter_pres_fullcats.json \
+  --abs-output dataset/d3/annotations/d3_inter_abs_fullcats.json
 ```
 
 ## 3. 生成 D3 text embedding bank
