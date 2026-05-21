@@ -20,6 +20,7 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 SKIP_MISSING_SPLITS="${SKIP_MISSING_SPLITS:-1}"
 DRY_RUN="${DRY_RUN:-0}"
+EXTRA_OPTS="${EXTRA_OPTS:-}"
 
 CONFIG="${CONFIG:-lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_internal_roi_verifier_w075.py}"
 DETECTOR_CKPT="${DETECTOR_CKPT:-/root/autodl-tmp/model_final_ovd_lvis_kang.pth}"
@@ -30,6 +31,7 @@ SPLIT_VERIFIER_TOPK="${SPLIT_VERIFIER_TOPK:-20}"
 D3_SPLITS="${D3_SPLITS:-d3_intra_full d3_intra_pres d3_intra_abs}"
 
 read -r -a SPLITS <<< "$D3_SPLITS"
+read -r -a EXTRA_OPTS_ARRAY <<< "$EXTRA_OPTS"
 
 d3_annotation_path() {
   local split="$1"
@@ -111,6 +113,9 @@ run_eval() {
       "model.region_verifier_fusion_weight=$fusion_weight"
       "model.region_verifier_topk_per_image=$topk"
     )
+  fi
+  if [[ ${#EXTRA_OPTS_ARRAY[@]} -gt 0 ]]; then
+    cmd+=("${EXTRA_OPTS_ARRAY[@]}")
   fi
 
   echo

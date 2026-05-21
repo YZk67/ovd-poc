@@ -1134,6 +1134,26 @@ target-framed single-prototype baseline. Treat this as evidence that naive
 alias aggregation is not enough; next check whether `mean` or `max` aggregation
 is better calibrated than `logsumexp`.
 
+Run alternate alias aggregation with `EXTRA_OPTS`:
+
+```bash
+CONFIG=lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_desc_anchor_logsumexp_roi_verifier_w075.py \
+OUT_ROOT="$TMP_OUT/d3_alias_mean_roi_verifier_ablation" \
+SPLIT_VERIFIER_TOPK=50 \
+EXTRA_OPTS="model.classifier.static_multi_prototype_agg=mean" \
+D3_INTRA_PRES_JSON=d3/annotations/d3_pres_fullcats.json \
+D3_INTRA_ABS_JSON=d3/annotations/d3_abs_fullcats.json \
+bash tools/run_d3_frozen_roi_verifier_ablation.sh splits
+
+CONFIG=lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_desc_anchor_logsumexp_roi_verifier_w075.py \
+OUT_ROOT="$TMP_OUT/d3_alias_max_roi_verifier_ablation" \
+SPLIT_VERIFIER_TOPK=50 \
+EXTRA_OPTS="model.classifier.static_multi_prototype_agg=max" \
+D3_INTRA_PRES_JSON=d3/annotations/d3_pres_fullcats.json \
+D3_INTRA_ABS_JSON=d3/annotations/d3_abs_fullcats.json \
+bash tools/run_d3_frozen_roi_verifier_ablation.sh splits
+```
+
 For class-level OVD datasets such as LVIS/COCO, generate a uniform alias prompt
 bank with:
 
