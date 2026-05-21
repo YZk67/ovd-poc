@@ -1117,6 +1117,23 @@ python tools/summarize_d3_ablation_results.py \
   --output "$TMP_OUT/d3_alias_roi_verifier_ablation/summary.csv"
 ```
 
+Observed anchored-alias logsumexp results:
+
+| Split | Setting | AP | AP50 | AP75 | APs | APm | APl | Gain |
+|:--|:--|--:|--:|--:|--:|--:|--:|--:|
+| d3_intra_full | alias detector_only | 6.4199 | 8.1473 | 6.5249 | 5.0477 | 7.9867 | 8.3688 | - |
+| d3_intra_full | alias + ROI verifier | 7.4853 | 9.6155 | 7.5357 | 6.1920 | 9.1368 | 9.3734 | +1.0654 |
+| d3_intra_pres | alias detector_only | 6.8921 | 8.7335 | 6.9446 | 4.9297 | 8.9207 | 8.7666 | - |
+| d3_intra_pres | alias + ROI verifier | 8.0565 | 10.3420 | 8.0414 | 5.8446 | 10.0249 | 9.9914 | +1.1644 |
+| d3_intra_abs | alias detector_only | 5.0204 | 6.4099 | 5.2807 | 5.3534 | 5.4156 | 7.1980 | - |
+| d3_intra_abs | alias + ROI verifier | 5.7895 | 7.4588 | 6.0337 | 7.0920 | 6.6921 | 7.5474 | +0.7691 |
+
+The verifier still gives consistent gains on top of an alias classifier, but
+the anchored alias logsumexp first stage is much weaker than the weighted
+target-framed single-prototype baseline. Treat this as evidence that naive
+alias aggregation is not enough; next check whether `mean` or `max` aggregation
+is better calibrated than `logsumexp`.
+
 For class-level OVD datasets such as LVIS/COCO, generate a uniform alias prompt
 bank with:
 
