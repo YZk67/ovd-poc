@@ -1216,3 +1216,54 @@ This config keeps classifier inference on alias-mean aggregation, but DN label
 queries use `dn_label_embed_source="classifier"` and
 `dn_multi_prototype_sampling="random"`, so repeated denoising copies of the same
 class see different alias embeddings during training.
+
+## 16. Proposal recall and phrase-oracle diagnosis
+
+Before adding more train-time losses, diagnose whether D3 is bottlenecked by
+missing boxes or by phrase/category ranking. The diagnostic reads an existing
+COCO-format result file and reports:
+
+- `any_recall*`: class-agnostic proposal coverage. High values mean the right
+  boxes are present somewhere in top-k.
+- `same_cat_recall*`: coverage requiring the predicted D3 phrase/category to
+  match the GT phrase.
+- `oracle_ap*`: greedy oracle AP after assigning top-k proposals to GT phrase
+  categories. This approximates the upper bound of a perfect phrase reranker
+  using the same boxes.
+
+Run this first on the frozen detector-only predictions:
+
+```bash
+export TMP_OUT=/root/autodl-tmp/LaMI-DETR-output
+
+python tools/analyze_d3_oracle_recall.py \
+  --annotation dataset/d3/annotations/d3_intra_full.json \
+  --predictions "$TMP_OUT/d3_frozen_roi_verifier_ablation/d3_intra_full/detector_only/coco_instances_results.json" \
+  --topk 20,50,100,300 \
+  --output "$TMP_OUT/d3_frozen_roi_verifier_ablation/d3_intra_full/detector_only/oracle_recall.csv" \
+  --json-output "$TMP_OUT/d3_frozen_roi_verifier_ablation/d3_intra_full/detector_only/oracle_recall.json"
+
+cat "$TMP_OUT/d3_frozen_roi_verifier_ablation/d3_intra_full/detector_only/oracle_recall.csv"
+```
+
+Then repeat on the verifier-fused predictions to see whether fusion improves
+top-k ranking or only AP calibration:
+
+```bash
+python tools/analyze_d3_oracle_recall.py \
+  --annotation dataset/d3/annotations/d3_intra_full.json \
+  --predictions "$TMP_OUT/d3_frozen_roi_verifier_ablation/d3_intra_full/verifier_w025_top50/coco_instances_results.json" \
+  --topk 20,50,100,300 \
+  --output "$TMP_OUT/d3_frozen_roi_verifier_ablation/d3_intra_full/verifier_w025_top50/oracle_recall.csv" \
+  --json-output "$TMP_OUT/d3_frozen_roi_verifier_ablation/d3_intra_full/verifier_w025_top50/oracle_recall.json"
+
+cat "$TMP_OUT/d3_frozen_roi_verifier_ablation/d3_intra_full/verifier_w025_top50/oracle_recall.csv"
+```
+
+Interpretation:
+
+- High `any_recall50/75` but low `same_cat_recall50/75` means the proposal
+  source is usable and the main method should become a stronger
+  description-aware reranker.
+- Low `any_recall50/75` means reranking cannot solve the main gap; use a
+  stronger proposal source or detector backbone before improving the verifier.
