@@ -105,6 +105,8 @@ class DINO(nn.Module):
         dn_number: int = 100,
         label_noise_ratio: float = 0.2,
         box_noise_scale: float = 1.0,
+        dn_label_embed_source: str = "query",
+        dn_multi_prototype_sampling: str = "mean",
         use_fed_loss: bool = False,
         cluster_fed_loss: bool = False,
         cluster_label_path=None,
@@ -172,6 +174,18 @@ class DINO(nn.Module):
         self.region_verifier = None
         self.region_verifier_feature_mode = str(region_verifier_train_feature_mode)
         self.region_verifier_text_embedding = None
+        if dn_label_embed_source not in {"query", "classifier"}:
+            raise ValueError(
+                "dn_label_embed_source must be 'query' or 'classifier', "
+                f"got {dn_label_embed_source!r}."
+            )
+        if dn_multi_prototype_sampling not in {"mean", "random"}:
+            raise ValueError(
+                "dn_multi_prototype_sampling must be 'mean' or 'random', "
+                f"got {dn_multi_prototype_sampling!r}."
+            )
+        self.dn_label_embed_source = str(dn_label_embed_source)
+        self.dn_multi_prototype_sampling = str(dn_multi_prototype_sampling)
         # define backbone and position embedding module
         self.backbone = backbone
         self.position_embedding = position_embedding
@@ -414,6 +428,67 @@ class DINO(nn.Module):
         
         else:
             raise ValueError(f"Unknown aggregation method: {method}")
+
+    @staticmethod
+    def _select_dn_label_embeddings(
+        content_query_embeds: torch.Tensor,
+        labels: torch.Tensor,
+        sampling: str = "mean",
+    ) -> torch.Tensor:
+        if content_query_embeds.ndim == 2:
+            return content_query_embeds[labels]
+        if content_query_embeds.ndim != 3:
+            raise ValueError(
+                "DN label embeddings must be 2D [C, D] or 3D [C, K, D], "
+                f"got shape {tuple(content_query_embeds.shape)}."
+            )
+        if sampling == "mean":
+            return content_query_embeds.mean(dim=1)[labels]
+        if sampling == "random":
+            candidates = content_query_embeds[labels]
+            alias_idx = torch.randint(
+                candidates.shape[1],
+                (labels.numel(),),
+                device=labels.device,
+            )
+            row_idx = torch.arange(labels.numel(), device=labels.device)
+            return candidates[row_idx, alias_idx]
+        raise ValueError(f"Unsupported dn_multi_prototype_sampling={sampling!r}.")
+
+    def _build_dn_label_query_embeds(self, raw_content_query_embeds, content_inds=None):
+        if self.dn_label_embed_source == "query":
+            return raw_content_query_embeds
+
+        classifier = self.transformer.decoder.class_embed[0]
+        if not getattr(classifier, "static_multi_prototype", False):
+            raise ValueError(
+                "dn_label_embed_source='classifier' requires a static multi-prototype "
+                "classifier weight bank."
+            )
+
+        embeddings = classifier.zs_weight
+        if content_inds is not None:
+            embeddings = embeddings[content_inds]
+        embeddings = embeddings.to(
+            device=self.content_layer.weight.device,
+            dtype=self.content_layer.weight.dtype,
+        )
+        if embeddings.ndim != 3:
+            raise ValueError(
+                "Classifier DN label embeddings must be 3D [C, K, D], "
+                f"got shape {tuple(embeddings.shape)}."
+            )
+        if embeddings.shape[-1] != self.content_layer.in_features:
+            raise ValueError(
+                "Classifier DN label embedding dim must match content_layer input dim, "
+                f"got {embeddings.shape[-1]} vs {self.content_layer.in_features}."
+            )
+        projected = self.content_layer(embeddings.reshape(-1, embeddings.shape[-1])).reshape(
+            embeddings.shape[0],
+            embeddings.shape[1],
+            -1,
+        )
+        return F.normalize(projected, p=2, dim=-1)
 
     @staticmethod
     def _torch_load_checkpoint(path: str, device: str):
@@ -1031,6 +1106,24 @@ class DINO(nn.Module):
             gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
             targets = self.prepare_targets(gt_instances)
             cdn_num_classes = self.fed_loss_num_cat if self.use_fed_loss else self.num_classes
+            dn_label_query_embeds = self._build_dn_label_query_embeds(
+                raw_content_query_embeds,
+                content_inds=content_inds,
+            )
+            if dn_label_query_embeds.ndim == 3 and (
+                self.dn_label_embed_source != "query" or dn_label_query_embeds.shape[1] > 1
+            ):
+                storage = get_event_storage()
+                storage.put_scalar(
+                    "dn_num_aliases",
+                    float(dn_label_query_embeds.shape[1]),
+                    smoothing_hint=False,
+                )
+                storage.put_scalar(
+                    "dn_alias_random_sampling",
+                    float(self.dn_multi_prototype_sampling == "random"),
+                    smoothing_hint=False,
+                )
             input_query_label, input_query_bbox, attn_mask, dn_meta = self.prepare_for_cdn(
                 targets,
                 dn_number=self.dn_number,
@@ -1040,7 +1133,8 @@ class DINO(nn.Module):
                 num_classes=cdn_num_classes,
                 hidden_dim=self.embed_dim,
                 # label_enc=self.label_enc,
-                content_query_embeds=raw_content_query_embeds,
+                content_query_embeds=dn_label_query_embeds,
+                multi_prototype_sampling=self.dn_multi_prototype_sampling,
             )
         else:
             input_query_label, input_query_bbox, attn_mask, dn_meta = None, None, None, None
@@ -1292,6 +1386,7 @@ class DINO(nn.Module):
         hidden_dim,
         label_enc=None,
         content_query_embeds=None,
+        multi_prototype_sampling="mean",
         convert_map=None,
     ):
         """
@@ -1379,14 +1474,11 @@ class DINO(nn.Module):
         # input_label_embed = label_enc(m)
         
         if content_query_embeds is not None:
-            if content_query_embeds.ndim == 3:
-                # Multi-prototype mode: [C, K, embed_dim]
-                # For CDN, we need to aggregate prototypes first
-                content_query_embeds_agg = content_query_embeds.mean(dim=1)  # [C, embed_dim]
-                input_label_content = content_query_embeds_agg[m]
-            else:
-                # Single-prototype mode: [C, embed_dim]
-                input_label_content = content_query_embeds[m]
+            input_label_content = self._select_dn_label_embeddings(
+                content_query_embeds,
+                m,
+                sampling=multi_prototype_sampling,
+            )
             input_label_embed = input_label_content
 
         input_bbox_embed = inverse_sigmoid(known_bbox_expand)

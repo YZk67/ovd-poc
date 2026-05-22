@@ -1173,3 +1173,46 @@ python tools/generate_text_embeddings.py \
 
 This produces a `[num_classes, num_aliases, dim]` bank accepted directly by the
 static multi-prototype classifier (`logsumexp`, `max`, or `mean` aggregation).
+
+Observed aggregation follow-up:
+
+| Split | Setting | AP | AP50 | AP75 | APs | APm | APl | Gain |
+|:--|:--|--:|--:|--:|--:|--:|--:|--:|
+| d3_intra_full | alias mean detector_only | 9.1699 | 11.4882 | 9.3706 | 6.6015 | 11.0003 | 11.0427 | - |
+| d3_intra_full | alias mean + ROI verifier | 10.4285 | 13.0981 | 10.6260 | 7.5407 | 12.3230 | 12.2672 | +1.2586 |
+| d3_intra_pres | alias mean detector_only | 9.7040 | 12.1579 | 9.8469 | 6.1798 | 11.9703 | 11.8291 | - |
+| d3_intra_pres | alias mean + ROI verifier | 11.1390 | 13.9929 | 11.2765 | 7.0656 | 13.4141 | 13.2543 | +1.4350 |
+| d3_intra_abs | alias mean detector_only | 7.5872 | 9.5035 | 7.9593 | 7.6939 | 8.3302 | 8.7362 | - |
+| d3_intra_abs | alias mean + ROI verifier | 8.3231 | 10.4466 | 8.6981 | 8.7713 | 9.3196 | 9.3714 | +0.7359 |
+| d3_intra_full | alias max + ROI verifier | 7.9133 | 10.2426 | 7.9610 | 6.8465 | 10.2846 | 9.5436 | - |
+| d3_intra_pres | alias max + ROI verifier | 8.4130 | 10.9327 | 8.3649 | 6.2849 | 11.2396 | 10.1254 | - |
+| d3_intra_abs | alias max + ROI verifier | 6.4285 | 8.1931 | 6.7594 | 8.3010 | 7.6559 | 7.8250 | - |
+
+Mean aggregation is the only viable naive alias aggregation. Max and logsumexp
+hurt score calibration badly, while the ROI verifier remains consistently
+positive on top of the alias-mean classifier.
+
+## 15. Alias-aware DN sampling
+
+The next training-side step is to stop treating multi-description aliases as an
+eval-only classifier detail. Enable random alias sampling for DN label queries:
+
+```bash
+export TMP_OUT=/root/autodl-tmp/LaMI-DETR-output
+
+CUDA_VISIBLE_DEVICES=0 python tools/train_net.py \
+  --config-file lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_train_alias_dn_mean_roi_verifier_w075.py \
+  --num-gpus 1 \
+  train.init_checkpoint=/root/autodl-tmp/model_final_ovd_lvis_kang.pth \
+  model.region_verifier_checkpoint="$TMP_OUT/d3_roi_verifier_w075_no_score/verifier_best.pt" \
+  train.max_iter=200 \
+  train.eval_period=200 \
+  train.checkpointer.period=200 \
+  train.output_dir="$TMP_OUT/d3_train_alias_dn_mean_roi_verifier_w075_warm_200" \
+  dataloader.evaluator.output_dir="$TMP_OUT/d3_train_alias_dn_mean_roi_verifier_w075_warm_200"
+```
+
+This config keeps classifier inference on alias-mean aggregation, but DN label
+queries use `dn_label_embed_source="classifier"` and
+`dn_multi_prototype_sampling="random"`, so repeated denoising copies of the same
+class see different alias embeddings during training.
