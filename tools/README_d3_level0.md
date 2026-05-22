@@ -1267,3 +1267,66 @@ Interpretation:
   description-aware reranker.
 - Low `any_recall50/75` means reranking cannot solve the main gap; use a
   stronger proposal source or detector backbone before improving the verifier.
+
+## 17. Top300 box-phrase ROI verifier reranker
+
+The previous frozen verifier only rescored the detector's global top-k
+`(box, phrase)` pairs. The proposal oracle shows that top300 boxes contain a
+much higher class-agnostic upper bound, so the next inference test reranks more
+box-phrase pairs:
+
+```text
+top300 boxes by max detector score
+  x top50 detector phrase candidates per box
+  -> ROI verifier fusion
+  -> final ranking uses only these verified candidates
+```
+
+Run the first full-split test:
+
+```bash
+export TMP_OUT=/root/autodl-tmp/LaMI-DETR-output
+
+CUDA_VISIBLE_DEVICES=0 python tools/train_net.py \
+  --config-file lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_internal_roi_verifier_w075_top300_rerank.py \
+  --num-gpus 1 \
+  --eval-only \
+  train.init_checkpoint=/root/autodl-tmp/model_final_ovd_lvis_kang.pth \
+  model.region_verifier_checkpoint="$TMP_OUT/d3_roi_verifier_w075_no_score/verifier_best.pt" \
+  dataloader.test.dataset.names=d3_intra_full \
+  train.output_dir="$TMP_OUT/d3_top300_roi_verifier_rerank/d3_intra_full/top300_box_phrase50" \
+  dataloader.evaluator.output_dir="$TMP_OUT/d3_top300_roi_verifier_rerank/d3_intra_full/top300_box_phrase50"
+```
+
+This scores up to `300 * 50 = 15000` verifier pairs per image, so it is much
+slower than the old global top50 fusion. If it is too slow for a first smoke
+test, reduce only the phrase fanout:
+
+```bash
+model.region_verifier_num_phrases_per_box=20
+```
+
+If candidate-only ranking is too aggressive, keep old detector scores outside
+the verified candidate set with:
+
+```bash
+model.region_verifier_candidate_only=False
+```
+
+If the full split improves meaningfully, run the same config over the three main
+splits:
+
+```bash
+CONFIG=lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_internal_roi_verifier_w075_top300_rerank.py \
+OUT_ROOT="$TMP_OUT/d3_top300_roi_verifier_rerank" \
+SPLIT_VERIFIER_TOPK=50 \
+D3_INTRA_PRES_JSON=d3/annotations/d3_pres_fullcats.json \
+D3_INTRA_ABS_JSON=d3/annotations/d3_abs_fullcats.json \
+bash tools/run_d3_frozen_roi_verifier_ablation.sh splits
+
+python tools/summarize_d3_ablation_results.py \
+  --root "$TMP_OUT/d3_top300_roi_verifier_rerank" \
+  --output "$TMP_OUT/d3_top300_roi_verifier_rerank/summary.csv"
+
+cat "$TMP_OUT/d3_top300_roi_verifier_rerank/summary.csv"
+```

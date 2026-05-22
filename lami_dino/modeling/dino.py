@@ -134,6 +134,11 @@ class DINO(nn.Module):
         region_verifier_fusion: str = "logit_add",
         region_verifier_fusion_weight: float = 0.25,
         region_verifier_topk_per_image: int = 20,
+        region_verifier_candidate_mode: str = "flat",
+        region_verifier_num_boxes_per_image: int = 300,
+        region_verifier_num_phrases_per_box: int = 50,
+        region_verifier_eval_chunk_size: int = 4096,
+        region_verifier_candidate_only: bool = False,
         region_verifier_train_enabled: bool = False,
         region_verifier_train_feature_mode: str = "no_detector_score",
         region_verifier_train_hidden_dim: int = 512,
@@ -160,6 +165,16 @@ class DINO(nn.Module):
         self.region_verifier_fusion = region_verifier_fusion
         self.region_verifier_fusion_weight = region_verifier_fusion_weight
         self.region_verifier_topk_per_image = region_verifier_topk_per_image
+        if region_verifier_candidate_mode not in {"flat", "box_phrase"}:
+            raise ValueError(
+                "region_verifier_candidate_mode must be 'flat' or 'box_phrase', "
+                f"got {region_verifier_candidate_mode!r}."
+            )
+        self.region_verifier_candidate_mode = str(region_verifier_candidate_mode)
+        self.region_verifier_num_boxes_per_image = int(region_verifier_num_boxes_per_image)
+        self.region_verifier_num_phrases_per_box = int(region_verifier_num_phrases_per_box)
+        self.region_verifier_eval_chunk_size = int(region_verifier_eval_chunk_size)
+        self.region_verifier_candidate_only = bool(region_verifier_candidate_only)
         self.region_verifier_train_enabled = bool(region_verifier_train_enabled)
         self.region_verifier_train_feature_mode = region_verifier_train_feature_mode
         self.region_verifier_train_hidden_dim = int(region_verifier_train_hidden_dim)
@@ -875,18 +890,56 @@ class DINO(nn.Module):
         raise ValueError(f"Unsupported region verifier fusion: {self.region_verifier_fusion}")
 
     @torch.no_grad()
+    def _apply_region_verifier_pairs(
+        self,
+        fused: torch.Tensor,
+        cls_score: torch.Tensor,
+        roi_features: torch.Tensor,
+        text_embedding: torch.Tensor,
+        batch_idx: int,
+        query_indexes: torch.Tensor,
+        class_indexes: torch.Tensor,
+    ) -> None:
+        if query_indexes.numel() == 0:
+            return
+
+        detector_scores = cls_score[batch_idx, query_indexes, class_indexes]
+        chunk_size = int(self.region_verifier_eval_chunk_size)
+        if chunk_size <= 0:
+            chunk_size = int(query_indexes.numel())
+
+        fused_chunks = []
+        for start in range(0, int(query_indexes.numel()), chunk_size):
+            end = min(start + chunk_size, int(query_indexes.numel()))
+            chunk_query_indexes = query_indexes[start:end]
+            chunk_class_indexes = class_indexes[start:end]
+            region_feats = roi_features[batch_idx, chunk_query_indexes]
+            text_feats = text_embedding[chunk_class_indexes]
+            chunk_detector_scores = detector_scores[start:end]
+            verifier_inputs = self._build_region_verifier_features(
+                region_feats,
+                text_feats,
+                chunk_detector_scores,
+            ).to(device=cls_score.device)
+            verifier_logits = self.region_verifier(verifier_inputs).to(dtype=cls_score.dtype)
+            fused_chunks.append(
+                self._fuse_region_verifier_scores(chunk_detector_scores, verifier_logits)
+            )
+
+        fused_scores = torch.cat(fused_chunks, dim=0)
+        fused[batch_idx, query_indexes, class_indexes] = fused_scores
+
+    @torch.no_grad()
     def apply_region_verifier(self, cls_score: torch.Tensor, roi_features: torch.Tensor) -> torch.Tensor:
         if not self.region_verifier_enabled or self.region_verifier is None:
             return cls_score
         if self.region_verifier_text_embedding is None:
             raise RuntimeError("region_verifier_text_embedding is not initialized.")
 
-        topk = int(self.region_verifier_topk_per_image)
-        if topk <= 0:
-            topk = cls_score.shape[1] * cls_score.shape[2]
-        topk = min(topk, cls_score.shape[1] * cls_score.shape[2])
-
-        fused = cls_score.clone()
+        if self.region_verifier_candidate_only:
+            fused = cls_score.new_zeros(cls_score.shape)
+        else:
+            fused = cls_score.clone()
         num_classes = cls_score.shape[-1]
         text_embedding = self.region_verifier_text_embedding.to(
             device=cls_score.device,
@@ -894,25 +947,60 @@ class DINO(nn.Module):
         )
         text_embedding = F.normalize(text_embedding, p=2, dim=-1)
 
-        flat_scores = cls_score.view(cls_score.shape[0], -1)
-        _, topk_indexes = torch.topk(flat_scores, topk, dim=1)
-        for batch_idx in range(cls_score.shape[0]):
-            pair_indexes = topk_indexes[batch_idx]
-            query_indexes = torch.div(pair_indexes, num_classes, rounding_mode="floor")
-            class_indexes = pair_indexes % num_classes
+        if self.region_verifier_candidate_mode == "flat":
+            topk = int(self.region_verifier_topk_per_image)
+            if topk <= 0:
+                topk = cls_score.shape[1] * cls_score.shape[2]
+            topk = min(topk, cls_score.shape[1] * cls_score.shape[2])
 
-            region_feats = roi_features[batch_idx, query_indexes]
-            text_feats = text_embedding[class_indexes]
-            detector_scores = cls_score[batch_idx, query_indexes, class_indexes]
-            verifier_inputs = self._build_region_verifier_features(
-                region_feats,
-                text_feats,
-                detector_scores,
-            ).to(device=cls_score.device)
-            verifier_logits = self.region_verifier(verifier_inputs).to(dtype=cls_score.dtype)
-            fused_scores = self._fuse_region_verifier_scores(detector_scores, verifier_logits)
-            fused[batch_idx, query_indexes, class_indexes] = fused_scores
-        return fused
+            flat_scores = cls_score.view(cls_score.shape[0], -1)
+            _, topk_indexes = torch.topk(flat_scores, topk, dim=1)
+            for batch_idx in range(cls_score.shape[0]):
+                pair_indexes = topk_indexes[batch_idx]
+                query_indexes = torch.div(pair_indexes, num_classes, rounding_mode="floor")
+                class_indexes = pair_indexes % num_classes
+                self._apply_region_verifier_pairs(
+                    fused,
+                    cls_score,
+                    roi_features,
+                    text_embedding,
+                    batch_idx,
+                    query_indexes,
+                    class_indexes,
+                )
+            return fused
+
+        if self.region_verifier_candidate_mode == "box_phrase":
+            num_boxes = int(self.region_verifier_num_boxes_per_image)
+            if num_boxes <= 0:
+                num_boxes = cls_score.shape[1]
+            num_boxes = min(num_boxes, cls_score.shape[1])
+
+            num_phrases = int(self.region_verifier_num_phrases_per_box)
+            if num_phrases <= 0:
+                num_phrases = num_classes
+            num_phrases = min(num_phrases, num_classes)
+
+            box_scores = cls_score.max(dim=-1).values
+            _, top_box_indexes = torch.topk(box_scores, num_boxes, dim=1)
+            for batch_idx in range(cls_score.shape[0]):
+                query_indexes = top_box_indexes[batch_idx]
+                phrase_scores = cls_score[batch_idx, query_indexes]
+                _, class_indexes_2d = torch.topk(phrase_scores, num_phrases, dim=1)
+                query_indexes = query_indexes[:, None].expand(-1, num_phrases).reshape(-1)
+                class_indexes = class_indexes_2d.reshape(-1)
+                self._apply_region_verifier_pairs(
+                    fused,
+                    cls_score,
+                    roi_features,
+                    text_embedding,
+                    batch_idx,
+                    query_indexes,
+                    class_indexes,
+                )
+            return fused
+
+        raise ValueError(f"Unsupported region_verifier_candidate_mode: {self.region_verifier_candidate_mode}")
 
     def filter_content_info(self, batched_inputs):
         """
