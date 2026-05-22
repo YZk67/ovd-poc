@@ -1330,3 +1330,77 @@ python tools/summarize_d3_ablation_results.py \
 
 cat "$TMP_OUT/d3_top300_roi_verifier_rerank/summary.csv"
 ```
+
+## 18. Export top300 candidate pairs for trained reranker
+
+The top300 inference reranker improves AP, but it still uses a verifier trained
+on a weaker pair distribution. The next step is to export the actual inference
+candidate distribution:
+
+```text
+top300 boxes by detector max score
+  x top50 phrases per box
+  -> IoU/phrase labels for reranker training
+```
+
+First save detector dumps with both logits and ROI features. The old ROI-feature
+export config saved only ROI features, so override `save_roi_features_only`:
+
+```bash
+export TMP_OUT=/root/autodl-tmp/LaMI-DETR-output
+
+CUDA_VISIBLE_DEVICES=0 python tools/train_net.py \
+  --config-file lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_desc_anchor_target_w075_save_roi_features.py \
+  --num-gpus 1 \
+  --eval-only \
+  train.init_checkpoint=/root/autodl-tmp/model_final_ovd_lvis_kang.pth \
+  model.save_roi_features_only=False \
+  model.save_dir="$TMP_OUT/d3_topk_candidate_dumps_w075/pth" \
+  train.output_dir="$TMP_OUT/d3_topk_candidate_dumps_w075" \
+  dataloader.evaluator.output_dir="$TMP_OUT/d3_topk_candidate_dumps_w075"
+```
+
+This dump can be large because it stores `pred_logits` for every image. Start
+with a smoke export over 100 images:
+
+```bash
+python tools/export_d3_topk_candidate_pairs.py \
+  --annotation dataset/d3/annotations/d3_intra_full.json \
+  --phrases-json dataset/metadata/d3_phrases.json \
+  --saved-output-dir "$TMP_OUT/d3_topk_candidate_dumps_w075/pth" \
+  --output-dir "$TMP_OUT/d3_topk_candidate_pairs_w075_top300x50_smoke" \
+  --box-topk 300 \
+  --phrase-topk 50 \
+  --max-images 100
+
+cat "$TMP_OUT/d3_topk_candidate_pairs_w075_top300x50_smoke/summary.json"
+```
+
+If `candidate_stats` shows enough `positive` and
+`wrong_phrase_good_box` rows, run the full export:
+
+```bash
+python tools/export_d3_topk_candidate_pairs.py \
+  --annotation dataset/d3/annotations/d3_intra_full.json \
+  --phrases-json dataset/metadata/d3_phrases.json \
+  --saved-output-dir "$TMP_OUT/d3_topk_candidate_dumps_w075/pth" \
+  --output-dir "$TMP_OUT/d3_topk_candidate_pairs_w075_top300x50" \
+  --box-topk 300 \
+  --phrase-topk 50
+```
+
+The output files are:
+
+```text
+all.jsonl
+train.jsonl
+val.jsonl
+summary.json
+```
+
+Each row stores `query_index`, `phrase_rank`, `target_iou`,
+`best_any_iou`, `box_iou_label`, and `phrase_match_label`. For the next trainer,
+`label=1` means the predicted box overlaps a GT instance of the target phrase
+with IoU >= 0.5. The most important hard negatives are
+`wrong_phrase_good_box`: the box is good for some GT phrase, but not the target
+phrase.
