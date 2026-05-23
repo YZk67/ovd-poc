@@ -59,6 +59,18 @@ def _load_categories(annotation: Mapping[str, Any], phrases_json: Optional[Path]
     ]
 
 
+def _load_image_ids_from_jsonl(path: Path) -> List[int]:
+    image_ids = set()
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            image_ids.add(int(row["image_id"]))
+    return sorted(image_ids)
+
+
 def _saved_prediction_path(saved_output_dir: Path, file_name: str) -> Path:
     path = Path(file_name)
     return saved_output_dir / path.with_suffix(".pth").name
@@ -354,6 +366,10 @@ def rerank(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Dict[str, An
         vlm_query_embedding = _load_vlm_query_embedding(args.vlm_query_embedding)
 
     image_ids = sorted(image_infos)
+    if args.image_id_jsonl is not None:
+        selected_ids = set(_load_image_ids_from_jsonl(args.image_id_jsonl))
+        image_ids = [image_id for image_id in image_ids if image_id in selected_ids]
+        print(f"using image ids from {args.image_id_jsonl}: {len(image_ids)}")
     if args.max_images is not None:
         image_ids = image_ids[: args.max_images]
 
@@ -506,6 +522,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--saved-output-dir", type=Path, required=True)
     parser.add_argument("--verifier-checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--image-id-jsonl",
+        type=Path,
+        default=None,
+        help="Optional JSONL file with image_id fields for held-out subset evaluation.",
+    )
     parser.add_argument("--box-topk", type=int, default=300)
     parser.add_argument("--phrase-topk", type=int, default=50)
     parser.add_argument("--keep-topk-per-image", type=int, default=100)
@@ -544,7 +566,7 @@ def main() -> None:
     print(f"saved summary to {summary_output}")
     if args.eval:
         eval_image_ids = None
-        if args.eval_output_images_only or args.max_images is not None:
+        if args.eval_output_images_only or args.max_images is not None or args.image_id_jsonl is not None:
             eval_image_ids = sorted({int(result["image_id"]) for result in results})
         _evaluate_coco(args.annotation, results, image_ids=eval_image_ids)
 
