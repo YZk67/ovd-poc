@@ -303,13 +303,17 @@ class CandidatePairDataset(Dataset):
         *,
         text_bank: torch.Tensor,
         feature_mode: str,
+        rank_group: str,
     ) -> None:
         self.region_feats = cache["region_feats"]
         self.labels = cache["labels"].float()
         self.detector_scores = cache["detector_scores"].float()
         self.target_category_ids = cache["target_category_ids"].long()
+        self.image_ids = cache["image_ids"].long()
+        self.negative_types = list(cache["negative_types"])
         self.text_bank = text_bank.float()
         self.feature_mode = feature_mode
+        self.rank_group = rank_group
 
         if int(self.target_category_ids.min().item()) <= 0:
             raise ValueError("target_category_ids must be 1-based positive ids.")
@@ -320,10 +324,21 @@ class CandidatePairDataset(Dataset):
             )
         if self.region_feats.shape[0] != self.labels.numel():
             raise ValueError("region_feats/labels row count mismatch.")
+        if self.image_ids.numel() != self.labels.numel():
+            raise ValueError("image_ids/labels row count mismatch.")
+        if len(self.negative_types) != self.labels.numel():
+            raise ValueError("negative_types/labels row count mismatch.")
         if self.region_feats.shape[-1] != self.text_bank.shape[-1]:
             raise ValueError(
                 f"ROI/text feature dim mismatch: {self.region_feats.shape[-1]} vs {self.text_bank.shape[-1]}."
             )
+        if rank_group not in {"image", "image_category"}:
+            raise ValueError(f"Unsupported rank_group={rank_group!r}.")
+        if rank_group == "image":
+            self.group_ids = self.image_ids
+        else:
+            stride = int(self.target_category_ids.max().item()) + 1
+            self.group_ids = self.image_ids * stride + self.target_category_ids
 
     def __len__(self) -> int:
         return int(self.labels.numel())
@@ -339,7 +354,7 @@ class CandidatePairDataset(Dataset):
             ).shape[1]
         )
 
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]:
         region = self.region_feats[index].float()
         text = self.text_bank[int(self.target_category_ids[index].item()) - 1]
         score = self.detector_scores[index : index + 1]
@@ -349,7 +364,7 @@ class CandidatePairDataset(Dataset):
             score,
             self.feature_mode,
         ).squeeze(0)
-        return features, self.labels[index]
+        return features, self.labels[index], self.group_ids[index], self.negative_types[index]
 
 
 class CandidateReranker(nn.Module):
@@ -476,6 +491,94 @@ def _detector_baseline_metrics(cache: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _parse_rank_neg_types(value: str) -> Optional[set]:
+    value = value.strip()
+    if value.lower() == "all":
+        return None
+    return {item.strip() for item in value.split(",") if item.strip()}
+
+
+def _pairwise_rank_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    group_ids: torch.Tensor,
+    negative_types: Sequence[str],
+    *,
+    margin: float,
+    rank_neg_types: Optional[set],
+    max_pairs_per_group: int,
+) -> Tuple[torch.Tensor, int, int]:
+    if rank_neg_types is None:
+        neg_type_mask = torch.ones_like(labels, dtype=torch.bool)
+    else:
+        neg_type_mask = torch.tensor(
+            [str(kind) in rank_neg_types for kind in negative_types],
+            dtype=torch.bool,
+            device=logits.device,
+        )
+
+    losses = []
+    rank_pair_count = 0
+    rank_group_count = 0
+    for group_id in torch.unique(group_ids):
+        in_group = group_ids == group_id
+        pos_logits = logits[in_group & (labels > 0.5)]
+        neg_logits = logits[in_group & (labels <= 0.5) & neg_type_mask]
+        if pos_logits.numel() == 0 or neg_logits.numel() == 0:
+            continue
+
+        pair_losses = F.softplus(margin - (pos_logits[:, None] - neg_logits[None, :])).reshape(-1)
+        if max_pairs_per_group > 0 and pair_losses.numel() > max_pairs_per_group:
+            keep = torch.randperm(pair_losses.numel(), device=pair_losses.device)[:max_pairs_per_group]
+            pair_losses = pair_losses[keep]
+
+        losses.append(pair_losses.mean())
+        rank_pair_count += int(pair_losses.numel())
+        rank_group_count += 1
+
+    if not losses:
+        return logits.sum() * 0.0, 0, 0
+    return torch.stack(losses).mean(), rank_pair_count, rank_group_count
+
+
+def _compute_train_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    group_ids: torch.Tensor,
+    negative_types: Sequence[str],
+    *,
+    args: argparse.Namespace,
+    pos_weight: torch.Tensor,
+    rank_neg_types: Optional[set],
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    bce_loss = F.binary_cross_entropy_with_logits(logits, labels, pos_weight=pos_weight)
+    rank_loss, rank_pair_count, rank_group_count = _pairwise_rank_loss(
+        logits,
+        labels,
+        group_ids,
+        negative_types,
+        margin=args.ranking_margin,
+        rank_neg_types=rank_neg_types,
+        max_pairs_per_group=args.rank_max_pairs_per_group,
+    )
+
+    if args.loss_type == "bce":
+        loss = bce_loss
+    elif args.loss_type == "pairwise_rank":
+        loss = rank_loss
+    elif args.loss_type == "bce_pairwise":
+        loss = bce_loss + args.rank_loss_weight * rank_loss
+    else:
+        raise ValueError(f"Unsupported loss_type={args.loss_type!r}.")
+
+    return loss, {
+        "bce_loss": float(bce_loss.detach().item()),
+        "rank_loss": float(rank_loss.detach().item()),
+        "rank_pair_count": float(rank_pair_count),
+        "rank_group_count": float(rank_group_count),
+    }
+
+
 @torch.no_grad()
 def evaluate(
     model: nn.Module,
@@ -494,7 +597,7 @@ def evaluate(
     total_loss = 0.0
     total_count = 0
 
-    for features, labels in loader:
+    for features, labels, _, _ in loader:
         features = features.to(device)
         labels = labels.to(device)
         logits = model(features)
@@ -563,11 +666,13 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
         train_cache,
         text_bank=text_bank,
         feature_mode=args.feature_mode,
+        rank_group=args.rank_group,
     )
     val_dataset = CandidatePairDataset(
         val_cache,
         text_bank=text_bank,
         feature_mode=args.feature_mode,
+        rank_group=args.rank_group,
     )
 
     model = CandidateReranker(
@@ -590,6 +695,7 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
     else:
         pos_weight_value = float(args.pos_weight)
     pos_weight = torch.tensor(pos_weight_value, dtype=torch.float32, device=args.device)
+    rank_neg_types = _parse_rank_neg_types(args.rank_neg_types)
 
     history: List[Dict[str, Any]] = []
     best_score = -float("inf")
@@ -603,12 +709,25 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
     for epoch in range(1, args.epochs + 1):
         model.train()
         train_loss = 0.0
+        train_bce_loss = 0.0
+        train_rank_loss = 0.0
         train_count = 0
-        for features, labels in tqdm(loader, desc=f"epoch {epoch}/{args.epochs}"):
+        train_rank_pairs = 0.0
+        train_rank_groups = 0.0
+        for features, labels, group_ids, negative_types in tqdm(loader, desc=f"epoch {epoch}/{args.epochs}"):
             features = features.to(args.device)
             labels = labels.to(args.device)
+            group_ids = group_ids.to(args.device)
             logits = model(features)
-            loss = F.binary_cross_entropy_with_logits(logits, labels, pos_weight=pos_weight)
+            loss, loss_parts = _compute_train_loss(
+                logits,
+                labels,
+                group_ids,
+                negative_types,
+                args=args,
+                pos_weight=pos_weight,
+                rank_neg_types=rank_neg_types,
+            )
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -617,6 +736,10 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
             optimizer.step()
 
             train_loss += float(loss.item()) * int(labels.numel())
+            train_bce_loss += loss_parts["bce_loss"] * int(labels.numel())
+            train_rank_loss += loss_parts["rank_loss"] * int(labels.numel())
+            train_rank_pairs += loss_parts["rank_pair_count"]
+            train_rank_groups += loss_parts["rank_group_count"]
             train_count += int(labels.numel())
 
         val_metrics = evaluate(
@@ -631,6 +754,10 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
         epoch_record = {
             "epoch": epoch,
             "train_loss": train_loss / max(1, train_count),
+            "train_bce_loss": train_bce_loss / max(1, train_count),
+            "train_rank_loss": train_rank_loss / max(1, train_count),
+            "train_rank_pairs": train_rank_pairs,
+            "train_rank_groups": train_rank_groups,
             "val": val_metrics,
         }
         history.append(epoch_record)
@@ -662,6 +789,10 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
                 {
                     "epoch": epoch,
                     "train_loss": epoch_record["train_loss"],
+                    "train_bce_loss": epoch_record["train_bce_loss"],
+                    "train_rank_loss": epoch_record["train_rank_loss"],
+                    "train_rank_pairs": train_rank_pairs,
+                    "train_rank_groups": train_rank_groups,
                     "overall_ap": val_metrics["overall"]["ap"],
                     "overall_auc": val_metrics["overall"]["auc"],
                     "wrong_phrase_ap": val_metrics["wrong_phrase_good_box"]["ap"],
@@ -742,6 +873,36 @@ def parse_args() -> argparse.Namespace:
         "--pos-weight",
         default="auto",
         help="Positive BCE weight. Use 'auto' for neg/pos, or a numeric value.",
+    )
+    parser.add_argument(
+        "--loss-type",
+        choices=("bce", "pairwise_rank", "bce_pairwise"),
+        default="bce",
+        help="Training objective. pairwise_rank optimizes positive > hard negative within a group.",
+    )
+    parser.add_argument(
+        "--rank-group",
+        choices=("image", "image_category"),
+        default="image",
+        help="Group used by pairwise_rank loss.",
+    )
+    parser.add_argument(
+        "--rank-neg-types",
+        default="wrong_phrase_good_box,same_phrase_bad_box",
+        help="Comma-separated negative_type list for ranking, or 'all'.",
+    )
+    parser.add_argument("--ranking-margin", type=float, default=0.0)
+    parser.add_argument(
+        "--rank-loss-weight",
+        type=float,
+        default=1.0,
+        help="Pairwise rank loss weight when --loss-type=bce_pairwise.",
+    )
+    parser.add_argument(
+        "--rank-max-pairs-per-group",
+        type=int,
+        default=4096,
+        help="Subsample rank pairs per group. Use 0 to keep all.",
     )
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)

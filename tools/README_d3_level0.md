@@ -1461,3 +1461,67 @@ If the full-split AP beats the frozen top300 reranker (`11.0259`), repeat on
 `d3_intra_pres` and `d3_intra_abs`. If it does not, run the same trainer with
 `--feature-mode full` to test whether the learned verifier needs detector score
 calibration in addition to ROI/text matching.
+
+## 20. Candidate reranker with pairwise ranking loss
+
+If BCE improves validation AP/AUC but hurts final COCO AP, optimize the local
+ranking objective directly. This keeps the detector frozen and compares positive
+candidate scores against hard negatives from the same image.
+
+Smoke:
+
+```bash
+export TMP_OUT=/root/autodl-tmp/LaMI-DETR-output
+
+python tools/train_d3_candidate_reranker.py \
+  --train-jsonl "$TMP_OUT/d3_topk_candidate_pairs_w075_top300x50_smoke/train.jsonl" \
+  --val-jsonl "$TMP_OUT/d3_topk_candidate_pairs_w075_top300x50_smoke/val.jsonl" \
+  --saved-output-dir "$TMP_OUT/d3_topk_candidate_dumps_w075/pth" \
+  --cache-dir "$TMP_OUT/d3_candidate_reranker_w075_top300x50_smoke/cache" \
+  --output-dir "$TMP_OUT/d3_candidate_reranker_rank_w075_top300x50_smoke" \
+  --cache-fp16 \
+  --loss-type pairwise_rank \
+  --rank-group image \
+  --rank-neg-types wrong_phrase_good_box,same_phrase_bad_box \
+  --epochs 1 \
+  --batch-size 2048
+```
+
+Full training:
+
+```bash
+python tools/train_d3_candidate_reranker.py \
+  --train-jsonl "$TMP_OUT/d3_topk_candidate_pairs_w075_top300x50/train.jsonl" \
+  --val-jsonl "$TMP_OUT/d3_topk_candidate_pairs_w075_top300x50/val.jsonl" \
+  --saved-output-dir "$TMP_OUT/d3_topk_candidate_dumps_w075/pth" \
+  --cache-dir "$TMP_OUT/d3_candidate_reranker_w075_top300x50/cache" \
+  --output-dir "$TMP_OUT/d3_candidate_reranker_rank_w075_top300x50" \
+  --cache-fp16 \
+  --loss-type pairwise_rank \
+  --rank-group image \
+  --rank-neg-types wrong_phrase_good_box,same_phrase_bad_box \
+  --epochs 5 \
+  --batch-size 4096 \
+  --lr 1e-3
+```
+
+Check that each epoch reports non-zero `train_rank_pairs` and
+`train_rank_groups`. Then evaluate the best checkpoint:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python tools/train_net.py \
+  --config-file lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_internal_roi_verifier_w075_top300_rerank.py \
+  --num-gpus 1 \
+  --eval-only \
+  train.init_checkpoint=/root/autodl-tmp/model_final_ovd_lvis_kang.pth \
+  model.region_verifier_checkpoint="$TMP_OUT/d3_candidate_reranker_rank_w075_top300x50/verifier_best.pt" \
+  dataloader.test.dataset.names=d3_intra_full \
+  train.output_dir="$TMP_OUT/d3_candidate_reranker_rank_eval/d3_intra_full/top300_box_phrase50" \
+  dataloader.evaluator.output_dir="$TMP_OUT/d3_candidate_reranker_rank_eval/d3_intra_full/top300_box_phrase50"
+```
+
+If pure ranking improves ordering but hurts calibration, try the combined loss:
+
+```bash
+--loss-type bce_pairwise --rank-loss-weight 1.0
+```
