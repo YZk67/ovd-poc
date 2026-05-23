@@ -1640,7 +1640,7 @@ python tools/train_d3_token_cross_verifier.py \
   --train-jsonl "$TMP_OUT/d3_topk_candidate_pairs_w075_top300x50_smoke/train.jsonl" \
   --val-jsonl "$TMP_OUT/d3_topk_candidate_pairs_w075_top300x50_smoke/val.jsonl" \
   --image-root dataset/d3/images \
-  --output-dir "$TMP_OUT/d3_token_cross_verifier_smoke" \
+  --output-dir "$TMP_OUT/d3_token_cross_verifier_rank_smoke" \
   --clip-backend open_clip \
   --clip-model ViT-L-14 \
   --clip-pretrained laion2b_s32b_b82k \
@@ -1648,7 +1648,11 @@ python tools/train_d3_token_cross_verifier.py \
   --max-val-samples 3000 \
   --epochs 1 \
   --batch-size 8 \
-  --eval-batch-size 16
+  --eval-batch-size 16 \
+  --loss-type bce_pairwise \
+  --rank-group image \
+  --rank-neg-types wrong_phrase_good_box,same_phrase_bad_box \
+  --rank-loss-weight 1.0
 ```
 
 Then evaluate the smoke checkpoint as a top-k reranker:
@@ -1659,26 +1663,26 @@ python tools/rerank_d3_topk_candidates_with_token_verifier.py \
   --image-root dataset/d3/images \
   --phrases-json dataset/metadata/d3_phrases.json \
   --saved-output-dir "$TMP_OUT/d3_topk_candidate_dumps_w075/pth" \
-  --verifier-checkpoint "$TMP_OUT/d3_token_cross_verifier_smoke/verifier_best.pt" \
-  --output "$TMP_OUT/d3_token_cross_verifier_smoke_eval/d3_intra_full/top100x20_results.json" \
+  --verifier-checkpoint "$TMP_OUT/d3_token_cross_verifier_rank_smoke/verifier_best.pt" \
+  --output "$TMP_OUT/d3_token_cross_verifier_rank_smoke_eval/d3_intra_full/top100x20_w0.5_results.json" \
   --box-topk 100 \
   --phrase-topk 20 \
   --keep-topk-per-image 100 \
   --max-images 100 \
   --fusion logit_add \
-  --fusion-weight 1.0 \
+  --fusion-weight 0.5 \
   --eval
 ```
 
-If this beats the crop-cosine smoke result (`15.7` AP on the same 100 images),
-scale the training sample before running large eval:
+The BCE smoke checkpoint reached `18.4` AP on the same 100 images. The ranking
+smoke should beat that before running a larger training sample.
 
 ```bash
 python tools/train_d3_token_cross_verifier.py \
   --train-jsonl "$TMP_OUT/d3_topk_candidate_pairs_w075_top300x50/train.jsonl" \
   --val-jsonl "$TMP_OUT/d3_topk_candidate_pairs_w075_top300x50/val.jsonl" \
   --image-root dataset/d3/images \
-  --output-dir "$TMP_OUT/d3_token_cross_verifier_80k" \
+  --output-dir "$TMP_OUT/d3_token_cross_verifier_rank_80k" \
   --clip-backend open_clip \
   --clip-model ViT-L-14 \
   --clip-pretrained laion2b_s32b_b82k \
@@ -1686,9 +1690,13 @@ python tools/train_d3_token_cross_verifier.py \
   --max-val-samples 20000 \
   --epochs 1 \
   --batch-size 8 \
-  --eval-batch-size 16
+  --eval-batch-size 16 \
+  --loss-type bce_pairwise \
+  --rank-group image \
+  --rank-neg-types wrong_phrase_good_box,same_phrase_bad_box \
+  --rank-loss-weight 1.0
 ```
 
-If the smoke checkpoint does not beat crop cosine, do not run the 80k/full
-version; inspect failure cases or switch to a stronger pretrained grounding
-encoder.
+The trainer uses grouped batches automatically for ranking objectives. Watch
+`train_rank_pairs` in `metrics.json`; if it is near zero, the batch construction
+is wrong and the result should not be trusted.

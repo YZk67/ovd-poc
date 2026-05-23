@@ -17,9 +17,9 @@ import argparse
 import json
 import math
 import random
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -178,10 +178,25 @@ class D3CandidateCropDataset(Dataset):
         *,
         image_root: Path,
         prompt_template: str,
+        rank_group: str,
     ) -> None:
         self.rows = [dict(row) for row in rows]
         self.image_root = image_root
         self.prompt_template = prompt_template
+        if rank_group not in {"image", "image_category"}:
+            raise ValueError(f"Unsupported rank_group={rank_group!r}.")
+        self.rank_group = rank_group
+        self.image_ids = [int(row.get("image_id", -1)) for row in self.rows]
+        self.target_category_ids = [int(row.get("target_category_id", row.get("category_id", -1))) for row in self.rows]
+        stride = max(self.target_category_ids + [0]) + 1
+        if rank_group == "image":
+            self.group_ids = list(self.image_ids)
+        else:
+            self.group_ids = [
+                int(image_id) * int(stride) + max(0, int(category_id))
+                for image_id, category_id in zip(self.image_ids, self.target_category_ids)
+            ]
+        self.labels = [float(row.get("label", 0.0)) for row in self.rows]
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -195,9 +210,84 @@ class D3CandidateCropDataset(Dataset):
             "phrase": str(row["phrase"]),
             "text": self.prompt_template.format(phrase=str(row["phrase"])),
             "label": float(row.get("label", 0)),
+            "target_category_id": self.target_category_ids[index],
+            "group_id": self.group_ids[index],
             "detector_score": float(row.get("detector_score", row.get("score", 0.0))),
             "negative_type": _negative_kind(row),
         }
+
+
+class GroupedCandidateBatchSampler:
+    """Yield batches that keep same-image candidates together for ranking loss."""
+
+    def __init__(
+        self,
+        dataset: D3CandidateCropDataset,
+        *,
+        batch_size: int,
+        seed: int,
+        shuffle: bool = True,
+    ) -> None:
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.seed = int(seed)
+        self.shuffle = bool(shuffle)
+        self.epoch = 0
+        groups: Dict[int, List[int]] = defaultdict(list)
+        for index, group_id in enumerate(dataset.group_ids):
+            groups[int(group_id)].append(index)
+        self.groups = dict(groups)
+        self.group_ids = list(groups.keys())
+        self._length = self._estimate_length()
+
+    def _estimate_length(self) -> int:
+        length = 0
+        for indices in self.groups.values():
+            positives = [index for index in indices if self.dataset.labels[index] > 0.5]
+            negatives = [index for index in indices if self.dataset.labels[index] <= 0.5]
+            if positives and negatives:
+                neg_slots = max(1, self.batch_size - min(len(positives), max(1, self.batch_size // 4)))
+                length += max(1, math.ceil(len(negatives) / neg_slots))
+            else:
+                length += max(1, math.ceil(len(indices) / max(1, self.batch_size)))
+        return length
+
+    def __len__(self) -> int:
+        return self._length
+
+    def __iter__(self) -> Iterator[List[int]]:
+        rng = random.Random(self.seed + self.epoch)
+        self.epoch += 1
+        group_ids = list(self.group_ids)
+        if self.shuffle:
+            rng.shuffle(group_ids)
+
+        for group_id in group_ids:
+            indices = list(self.groups[group_id])
+            positives = [index for index in indices if self.dataset.labels[index] > 0.5]
+            negatives = [index for index in indices if self.dataset.labels[index] <= 0.5]
+            if self.shuffle:
+                rng.shuffle(positives)
+                rng.shuffle(negatives)
+                rng.shuffle(indices)
+
+            if not positives or not negatives:
+                for start in range(0, len(indices), self.batch_size):
+                    yield indices[start : start + self.batch_size]
+                continue
+
+            pos_per_batch = min(len(positives), max(1, self.batch_size // 4))
+            neg_slots = max(1, self.batch_size - pos_per_batch)
+            for start in range(0, len(negatives), neg_slots):
+                neg_chunk = negatives[start : start + neg_slots]
+                if len(positives) <= pos_per_batch:
+                    pos_chunk = list(positives)
+                else:
+                    pos_chunk = rng.sample(positives, pos_per_batch)
+                batch = pos_chunk + neg_chunk
+                if self.shuffle:
+                    rng.shuffle(batch)
+                yield batch
 
 
 class ClipTokenEncoder(nn.Module):
@@ -479,6 +569,8 @@ def _collate_rows(
     texts = []
     labels = []
     detector_scores = []
+    group_ids = []
+    target_category_ids = []
     negative_types = []
     kept_rows = []
     invalid_crops = 0
@@ -498,6 +590,8 @@ def _collate_rows(
         texts.append(str(row["text"]))
         labels.append(float(row["label"]))
         detector_scores.append(float(row["detector_score"]))
+        group_ids.append(int(row["group_id"]))
+        target_category_ids.append(int(row["target_category_id"]))
         negative_types.append(str(row["negative_type"]))
         kept_rows.append(row)
 
@@ -506,17 +600,23 @@ def _collate_rows(
         text_tokens = tokenizer(texts)
         label_tensor = torch.tensor(labels, dtype=torch.float32)
         score_tensor = torch.tensor(detector_scores, dtype=torch.float32)
+        group_tensor = torch.tensor(group_ids, dtype=torch.long)
+        target_category_tensor = torch.tensor(target_category_ids, dtype=torch.long)
     else:
         image_tensor = torch.empty(0)
         text_tokens = torch.empty(0, dtype=torch.long)
         label_tensor = torch.empty(0, dtype=torch.float32)
         score_tensor = torch.empty(0, dtype=torch.float32)
+        group_tensor = torch.empty(0, dtype=torch.long)
+        target_category_tensor = torch.empty(0, dtype=torch.long)
 
     return {
         "images": image_tensor,
         "text_tokens": text_tokens,
         "labels": label_tensor,
         "detector_scores": score_tensor,
+        "group_ids": group_tensor,
+        "target_category_ids": target_category_tensor,
         "negative_types": negative_types,
         "rows": kept_rows,
         "invalid_crops": invalid_crops,
@@ -543,6 +643,94 @@ def _run_model_batch(
         batch["detector_scores"].to(device),
     )
     return logits
+
+
+def _parse_rank_neg_types(value: str) -> Optional[set]:
+    value = str(value).strip()
+    if not value or value.lower() == "all":
+        return None
+    return {part.strip() for part in value.split(",") if part.strip()}
+
+
+def _pairwise_rank_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    group_ids: torch.Tensor,
+    negative_types: Sequence[str],
+    *,
+    margin: float,
+    rank_neg_types: Optional[set],
+    max_pairs_per_group: int,
+) -> Tuple[torch.Tensor, int, int]:
+    if rank_neg_types is None:
+        neg_type_mask = torch.ones_like(labels, dtype=torch.bool)
+    else:
+        neg_type_mask = torch.tensor(
+            [str(kind) in rank_neg_types for kind in negative_types],
+            dtype=torch.bool,
+            device=logits.device,
+        )
+
+    losses = []
+    rank_pair_count = 0
+    rank_group_count = 0
+    for group_id in torch.unique(group_ids):
+        in_group = group_ids == group_id
+        pos_logits = logits[in_group & (labels > 0.5)]
+        neg_logits = logits[in_group & (labels <= 0.5) & neg_type_mask]
+        if pos_logits.numel() == 0 or neg_logits.numel() == 0:
+            continue
+
+        pair_losses = F.softplus(margin - (pos_logits[:, None] - neg_logits[None, :])).reshape(-1)
+        if max_pairs_per_group > 0 and pair_losses.numel() > max_pairs_per_group:
+            keep = torch.randperm(pair_losses.numel(), device=pair_losses.device)[:max_pairs_per_group]
+            pair_losses = pair_losses[keep]
+
+        losses.append(pair_losses.mean())
+        rank_pair_count += int(pair_losses.numel())
+        rank_group_count += 1
+
+    if not losses:
+        return logits.sum() * 0.0, 0, 0
+    return torch.stack(losses).mean(), rank_pair_count, rank_group_count
+
+
+def _compute_train_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    group_ids: torch.Tensor,
+    negative_types: Sequence[str],
+    *,
+    args: argparse.Namespace,
+    pos_weight: torch.Tensor,
+    rank_neg_types: Optional[set],
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    bce_loss = F.binary_cross_entropy_with_logits(logits, labels, pos_weight=pos_weight)
+    rank_loss, rank_pair_count, rank_group_count = _pairwise_rank_loss(
+        logits,
+        labels,
+        group_ids,
+        negative_types,
+        margin=args.ranking_margin,
+        rank_neg_types=rank_neg_types,
+        max_pairs_per_group=args.rank_max_pairs_per_group,
+    )
+
+    if args.loss_type == "bce":
+        loss = bce_loss
+    elif args.loss_type == "pairwise_rank":
+        loss = rank_loss
+    elif args.loss_type == "bce_pairwise":
+        loss = bce_loss + args.rank_loss_weight * rank_loss
+    else:
+        raise ValueError(f"Unsupported loss_type={args.loss_type!r}.")
+
+    return loss, {
+        "bce_loss": float(bce_loss.detach().item()),
+        "rank_loss": float(rank_loss.detach().item()),
+        "rank_pair_count": float(rank_pair_count),
+        "rank_group_count": float(rank_group_count),
+    }
 
 
 def evaluate(
@@ -671,8 +859,18 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         use_detector_score=not args.no_detector_score,
     ).to(device)
 
-    train_dataset = D3CandidateCropDataset(train_rows, image_root=args.image_root, prompt_template=args.prompt_template)
-    val_dataset = D3CandidateCropDataset(val_rows, image_root=args.image_root, prompt_template=args.prompt_template)
+    train_dataset = D3CandidateCropDataset(
+        train_rows,
+        image_root=args.image_root,
+        prompt_template=args.prompt_template,
+        rank_group=args.rank_group,
+    )
+    val_dataset = D3CandidateCropDataset(
+        val_rows,
+        image_root=args.image_root,
+        prompt_template=args.prompt_template,
+        rank_group=args.rank_group,
+    )
 
     collate = lambda batch: _collate_rows(  # noqa: E731
         batch,
@@ -681,14 +879,31 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         tokenizer=clip_encoder.tokenizer,
         crop_margin=args.crop_margin,
     )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=collate,
-        pin_memory=True,
-    )
+    batch_sampler_mode = args.batch_sampler
+    if batch_sampler_mode == "auto":
+        batch_sampler_mode = "grouped" if args.loss_type != "bce" else "random"
+    if batch_sampler_mode == "grouped":
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=GroupedCandidateBatchSampler(
+                train_dataset,
+                batch_size=args.batch_size,
+                seed=args.seed,
+                shuffle=True,
+            ),
+            num_workers=args.num_workers,
+            collate_fn=collate,
+            pin_memory=True,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            collate_fn=collate,
+            pin_memory=True,
+        )
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.eval_batch_size,
@@ -701,6 +916,7 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
     pos_count = max(1, train_summary["positive"])
     neg_count = max(1, train_summary["negative"])
     pos_weight = torch.tensor([min(args.max_pos_weight, neg_count / pos_count)], dtype=torch.float32, device=device)
+    rank_neg_types = _parse_rank_neg_types(args.rank_neg_types)
     optimizer = torch.optim.AdamW(verifier.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -711,6 +927,10 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
     for epoch in range(1, args.epochs + 1):
         verifier.train()
         losses = []
+        bce_losses = []
+        rank_losses = []
+        rank_pairs = 0.0
+        rank_groups = 0.0
         invalid_crops = 0
         missing_images = 0
         for batch in tqdm(train_loader, desc=f"epoch {epoch}/{args.epochs}"):
@@ -726,18 +946,35 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
             if logits is None:
                 continue
             labels = batch["labels"].to(device)
-            loss = F.binary_cross_entropy_with_logits(logits, labels, pos_weight=pos_weight)
+            group_ids = batch["group_ids"].to(device)
+            loss, loss_parts = _compute_train_loss(
+                logits,
+                labels,
+                group_ids,
+                batch["negative_types"],
+                args=args,
+                pos_weight=pos_weight,
+                rank_neg_types=rank_neg_types,
+            )
             loss.backward()
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(verifier.parameters(), args.grad_clip)
             optimizer.step()
             losses.append(float(loss.detach().cpu()))
+            bce_losses.append(loss_parts["bce_loss"])
+            rank_losses.append(loss_parts["rank_loss"])
+            rank_pairs += loss_parts["rank_pair_count"]
+            rank_groups += loss_parts["rank_group_count"]
 
         val_metrics = evaluate(verifier=verifier, clip_encoder=clip_encoder, loader=val_loader, device=device)
         score = float(val_metrics["token_verifier"]["ap"])
         record = {
             "epoch": epoch,
             "train_loss": float(np.mean(losses)) if losses else float("nan"),
+            "train_bce_loss": float(np.mean(bce_losses)) if bce_losses else float("nan"),
+            "train_rank_loss": float(np.mean(rank_losses)) if rank_losses else float("nan"),
+            "train_rank_pairs": rank_pairs,
+            "train_rank_groups": rank_groups,
             "train_invalid_crops": invalid_crops,
             "train_missing_images": missing_images,
             "val": val_metrics,
@@ -804,6 +1041,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--eval-batch-size", type=int, default=32)
+    parser.add_argument(
+        "--loss-type",
+        choices=("bce", "pairwise_rank", "bce_pairwise"),
+        default="bce",
+        help="Training objective. pairwise_rank optimizes positive > hard negative within a rank group.",
+    )
+    parser.add_argument(
+        "--rank-group",
+        choices=("image", "image_category"),
+        default="image",
+        help="Group used by pairwise_rank loss.",
+    )
+    parser.add_argument(
+        "--rank-neg-types",
+        default="wrong_phrase_good_box,same_phrase_bad_box",
+        help="Comma-separated negative_type list for ranking, or 'all'.",
+    )
+    parser.add_argument("--ranking-margin", type=float, default=0.0)
+    parser.add_argument(
+        "--rank-loss-weight",
+        type=float,
+        default=1.0,
+        help="Pairwise rank loss weight when --loss-type=bce_pairwise.",
+    )
+    parser.add_argument(
+        "--rank-max-pairs-per-group",
+        type=int,
+        default=4096,
+        help="Subsample rank pairs per group. Use 0 to keep all.",
+    )
+    parser.add_argument(
+        "--batch-sampler",
+        choices=("auto", "random", "grouped"),
+        default="auto",
+        help="Use grouped batches for ranking losses so same-image pairs share a batch.",
+    )
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
