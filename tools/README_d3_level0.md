@@ -1700,3 +1700,61 @@ python tools/train_d3_token_cross_verifier.py \
 The trainer uses grouped batches automatically for ranking objectives. Watch
 `train_rank_pairs` in `metrics.json`; if it is near zero, the batch construction
 is wrong and the result should not be trusted.
+
+## 23. Stronger proposal-source diagnosis with OWLv2
+
+The crop/token verifier gives a consistent held-out gain, but not enough to
+reach a `30+` AP target. The next diagnostic is to replace the proposal source
+before adding more verifier losses. Start with OWLv2 because it can run as a
+standalone HuggingFace model and writes the same COCO-format D3 predictions.
+
+Use the `lami` environment for this step:
+
+```bash
+conda activate lami
+export TMP_OUT=/root/autodl-tmp/LaMI-DETR-output
+export HF_ENDPOINT=https://hf-mirror.com
+```
+
+Run a small held-out smoke first. The per-image cache lets long runs resume:
+
+```bash
+python tools/run_d3_owlv2_proposals.py \
+  --annotation dataset/d3/annotations/d3_intra_full.json \
+  --image-root dataset/d3/images \
+  --phrases-json dataset/metadata/d3_phrases.json \
+  --image-id-jsonl "$TMP_OUT/d3_topk_candidate_pairs_w075_top300x50/val.jsonl" \
+  --output "$TMP_OUT/d3_owlv2_large_val200/d3_intra_full/results.json" \
+  --per-image-output-dir "$TMP_OUT/d3_owlv2_large_val200/d3_intra_full/per_image" \
+  --reuse-per-image \
+  --model-name google/owlv2-large-patch14-ensemble \
+  --prompt-template "a photo of {phrase}" \
+  --text-chunk-size 64 \
+  --threshold 0.01 \
+  --keep-topk-per-image 300 \
+  --max-images 200 \
+  --eval
+```
+
+Then run oracle recall on the same predictions:
+
+```bash
+python tools/analyze_d3_oracle_recall.py \
+  --annotation dataset/d3/annotations/d3_intra_full.json \
+  --predictions "$TMP_OUT/d3_owlv2_large_val200/d3_intra_full/results.json" \
+  --topk 20,50,100,300 \
+  --output "$TMP_OUT/d3_owlv2_large_val200/d3_intra_full/oracle_recall.csv" \
+  --json-output "$TMP_OUT/d3_owlv2_large_val200/d3_intra_full/oracle_recall.json"
+
+cat "$TMP_OUT/d3_owlv2_large_val200/d3_intra_full/oracle_recall.csv"
+```
+
+Interpretation:
+
+- If OWLv2 direct AP is already much higher than LaMI-DETR and top300 oracle is
+  strong, use it as the new proposal source and connect a verifier.
+- If direct AP is not better but top300 oracle is much higher, the next method
+  should focus on phrase reranking over OWLv2 proposals.
+- If both direct AP and oracle are weak, the bottleneck is still proposal
+  quality and the next source should be GroundingDINO/GLIP or a stronger OVD
+  detector, not another crop verifier.
