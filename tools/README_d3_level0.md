@@ -1525,3 +1525,71 @@ If pure ranking improves ordering but hurts calibration, try the combined loss:
 ```bash
 --loss-type bce_pairwise --rank-loss-weight 1.0
 ```
+
+## 21. Crop-level top-k candidate reranker
+
+The pooled-ROI MLP reranker is a failed ablation path: keep the code for
+records, but do not use its checkpoints as the main verifier. The next stronger
+test keeps the detector frozen and scores the actual top-k candidate set with
+OpenCLIP crop-text matching:
+
+```text
+top K boxes by detector max phrase score
+  x top M detector phrase candidates per box
+  -> crop each selected box
+  -> OpenCLIP crop-text score
+  -> detector/crop score fusion
+  -> final COCO predictions
+```
+
+Run a small smoke first. This does not train a model and does not touch the
+detector:
+
+```bash
+export TMP_OUT=/root/autodl-tmp/LaMI-DETR-output
+
+python tools/rerank_d3_topk_candidates_with_clip_crops.py \
+  --annotation dataset/d3/annotations/d3_intra_full.json \
+  --image-root dataset/d3/images \
+  --phrases-json dataset/metadata/d3_phrases.json \
+  --saved-output-dir "$TMP_OUT/d3_topk_candidate_dumps_w075/pth" \
+  --output "$TMP_OUT/d3_clip_crop_topk_smoke/d3_intra_full/results.json" \
+  --box-topk 100 \
+  --phrase-topk 20 \
+  --keep-topk-per-image 100 \
+  --max-images 100 \
+  --eval
+```
+
+If the smoke runs cleanly, run the comparable top300 x top50 full-split test:
+
+```bash
+python tools/rerank_d3_topk_candidates_with_clip_crops.py \
+  --annotation dataset/d3/annotations/d3_intra_full.json \
+  --image-root dataset/d3/images \
+  --phrases-json dataset/metadata/d3_phrases.json \
+  --saved-output-dir "$TMP_OUT/d3_topk_candidate_dumps_w075/pth" \
+  --output "$TMP_OUT/d3_clip_crop_top300x50/d3_intra_full/results.json" \
+  --box-topk 300 \
+  --phrase-topk 50 \
+  --keep-topk-per-image 100 \
+  --eval
+```
+
+The default fusion is conservative:
+
+```text
+score = sigmoid(logit(detector_score) + 0.25 * 10.0 * (clip_cosine - 0.25))
+```
+
+If it improves over the frozen top300 ROI verifier (`11.0259` on
+`d3_intra_full`), sweep only these three values first:
+
+```bash
+--fusion-weight 0.1
+--fusion-weight 0.25
+--fusion-weight 0.5
+```
+
+If crop-level OpenCLIP does not improve, move to token-level/cross-attention
+verification rather than tuning the pooled-ROI MLP further.
