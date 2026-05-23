@@ -79,6 +79,18 @@ def _group_predictions(predictions: Sequence[Mapping[str, Any]]) -> Dict[int, Li
     return grouped
 
 
+def _load_image_ids_from_jsonl(path: Path) -> List[int]:
+    image_ids = set()
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            image_ids.add(int(row["image_id"]))
+    return sorted(image_ids)
+
+
 def _recall_from_best_ious(best_ious: Sequence[float], threshold: float) -> float:
     if not best_ious:
         return 0.0
@@ -139,6 +151,7 @@ def _evaluate_coco_stats(
     annotation_path: Path,
     predictions: Sequence[Mapping[str, Any]],
     *,
+    image_ids: Optional[Sequence[int]] = None,
     quiet: bool = True,
 ) -> Optional[Dict[str, Optional[float]]]:
     if not predictions:
@@ -159,6 +172,8 @@ def _evaluate_coco_stats(
         coco_dt = coco_gt.loadRes(list(predictions))
         evaluator = COCOeval(coco_gt, coco_dt, "bbox")
         evaluator.params.maxDets = [1, 10, 100]
+        if image_ids is not None:
+            evaluator.params.imgIds = sorted(set(int(image_id) for image_id in image_ids))
         evaluator.evaluate()
         evaluator.accumulate()
         evaluator.summarize()
@@ -187,7 +202,12 @@ def analyze(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
     gt_by_image = _group_annotations(annotation)
     pred_by_image = _group_predictions(predictions)
-    image_ids = sorted(set(gt_by_image) | set(pred_by_image))
+    if args.image_id_jsonl is not None:
+        image_ids = _load_image_ids_from_jsonl(args.image_id_jsonl)
+    elif args.all_annotation_images:
+        image_ids = sorted(set(gt_by_image) | set(pred_by_image))
+    else:
+        image_ids = sorted(pred_by_image)
 
     rows: List[Dict[str, Any]] = []
     for topk in args.topk:
@@ -241,7 +261,12 @@ def analyze(args: argparse.Namespace) -> List[Dict[str, Any]]:
         }
 
         if not args.skip_oracle_ap:
-            oracle_stats = _evaluate_coco_stats(args.annotation, oracle_predictions, quiet=not args.verbose_coco)
+            oracle_stats = _evaluate_coco_stats(
+                args.annotation,
+                oracle_predictions,
+                image_ids=image_ids,
+                quiet=not args.verbose_coco,
+            )
             if oracle_stats is not None:
                 row.update(oracle_stats)
             if args.oracle_output_dir:
@@ -295,6 +320,17 @@ def main() -> None:
     parser.add_argument("--topk", type=_parse_topk, default=_parse_topk("20,50,100,300"))
     parser.add_argument("--output", type=Path, default=None, help="Optional CSV output path.")
     parser.add_argument("--json-output", type=Path, default=None, help="Optional JSON output path.")
+    parser.add_argument(
+        "--image-id-jsonl",
+        type=Path,
+        default=None,
+        help="Optional JSONL whose image_id values define the evaluation subset.",
+    )
+    parser.add_argument(
+        "--all-annotation-images",
+        action="store_true",
+        help="Use every annotated image instead of defaulting to prediction image ids.",
+    )
     parser.add_argument("--oracle-output-dir", type=Path, default=None)
     parser.add_argument("--skip-oracle-ap", action="store_true", help="Only compute recall metrics.")
     parser.add_argument("--verbose-coco", action="store_true", help="Show pycocotools evaluation logs.")

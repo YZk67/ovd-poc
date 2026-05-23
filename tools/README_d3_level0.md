@@ -1749,6 +1749,10 @@ python tools/analyze_d3_oracle_recall.py \
 cat "$TMP_OUT/d3_owlv2_large_val200/d3_intra_full/oracle_recall.csv"
 ```
 
+For subset prediction files, the oracle script defaults to the image ids present
+in the prediction JSON. Do not pass the full val JSONL here unless it exactly
+matches the processed subset.
+
 Interpretation:
 
 - If OWLv2 direct AP is already much higher than LaMI-DETR and top300 oracle is
