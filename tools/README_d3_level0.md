@@ -1762,3 +1762,81 @@ Interpretation:
 - If both direct AP and oracle are weak, the bottleneck is still proposal
   quality and the next source should be GroundingDINO/GLIP or a stronger OVD
   detector, not another crop verifier.
+
+## 24. OWLv2 proposal-aware phrase reranking
+
+If OWLv2 direct AP is modest but top-k oracle is strong, the missing piece is
+phrase scoring over good class-agnostic boxes. Do not only rerank OWLv2's
+already-emitted category rows: that can only use same-category recall. Instead,
+build proposal-aware training pairs where a high-IoU OWLv2 box is paired with
+the best-overlapping GT phrase, even when OWLv2 predicted a different phrase.
+
+Build a diagnostic pair set from the OWLv2 predictions:
+
+```bash
+python tools/build_d3_verifier_pairs.py \
+  --annotation dataset/d3/annotations/d3_intra_full.json \
+  --phrases-json dataset/metadata/d3_phrases.json \
+  --predictions "$TMP_OUT/d3_owlv2_large_allval/d3_intra_full/results.json" \
+  --output-dir "$TMP_OUT/d3_owlv2_large_allval/proposal_iou_pairs" \
+  --pred-topk-per-image 300 \
+  --positive-source proposal_iou \
+  --max-pos-per-image 50 \
+  --max-same-phrase-neg-per-image 50 \
+  --max-neg-per-image 200
+```
+
+This all-val split is only a diagnostic. For a clean result, run OWLv2 on the
+train image split too and build/train pairs from train predictions only.
+
+Train a crop verifier on those pairs:
+
+```bash
+python tools/train_d3_crop_verifier.py \
+  --train-jsonl "$TMP_OUT/d3_owlv2_large_allval/proposal_iou_pairs/train.jsonl" \
+  --val-jsonl "$TMP_OUT/d3_owlv2_large_allval/proposal_iou_pairs/val.jsonl" \
+  --image-root dataset/d3/images \
+  --cache-dir "$TMP_OUT/d3_owlv2_large_allval/proposal_iou_crop_verifier/cache" \
+  --output-dir "$TMP_OUT/d3_owlv2_large_allval/proposal_iou_crop_verifier" \
+  --max-train-samples 80000 \
+  --max-val-samples 20000 \
+  --epochs 1 \
+  --batch-size 512
+```
+
+First test all-phrase expansion without a trained verifier:
+
+```bash
+python tools/rerank_d3_predictions_with_clip_crops.py \
+  --annotation dataset/d3/annotations/d3_intra_full.json \
+  --image-root dataset/d3/images \
+  --phrases-json dataset/metadata/d3_phrases.json \
+  --predictions "$TMP_OUT/d3_owlv2_large_allval/d3_intra_full/results.json" \
+  --output "$TMP_OUT/d3_owlv2_large_allval/expand_clip_val200/results.json" \
+  --expand-all-phrases \
+  --proposal-topk-per-image 100 \
+  --proposal-nms-thresh 0.9 \
+  --keep-topk-per-image 100 \
+  --max-images 200 \
+  --eval
+```
+
+Then test the trained verifier over the same expanded box-phrase grid:
+
+```bash
+python tools/rerank_d3_predictions_with_clip_crops.py \
+  --annotation dataset/d3/annotations/d3_intra_full.json \
+  --image-root dataset/d3/images \
+  --phrases-json dataset/metadata/d3_phrases.json \
+  --predictions "$TMP_OUT/d3_owlv2_large_allval/d3_intra_full/results.json" \
+  --output "$TMP_OUT/d3_owlv2_large_allval/expand_verifier_val200/results.json" \
+  --expand-all-phrases \
+  --proposal-topk-per-image 100 \
+  --proposal-nms-thresh 0.9 \
+  --keep-topk-per-image 100 \
+  --verifier-checkpoint "$TMP_OUT/d3_owlv2_large_allval/proposal_iou_crop_verifier/verifier_best.pt" \
+  --verifier-fusion logit_add \
+  --verifier-fusion-weight 1.0 \
+  --max-images 200 \
+  --eval
+```

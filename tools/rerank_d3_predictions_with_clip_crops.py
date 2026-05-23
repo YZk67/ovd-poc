@@ -82,6 +82,45 @@ def _limit_predictions(predictions: Sequence[Dict[str, Any]], keep_topk: int) ->
     return list(predictions[:keep_topk])
 
 
+def _xywh_iou(box_a: Sequence[float], box_b: Sequence[float]) -> float:
+    ax, ay, aw, ah = [float(v) for v in box_a]
+    bx, by, bw, bh = [float(v) for v in box_b]
+    ax1, ay1 = ax + aw, ay + ah
+    bx1, by1 = bx + bw, by + bh
+    inter_w = max(0.0, min(ax1, bx1) - max(ax, bx))
+    inter_h = max(0.0, min(ay1, by1) - max(ay, by))
+    inter = inter_w * inter_h
+    area_a = max(0.0, aw) * max(0.0, ah)
+    area_b = max(0.0, bw) * max(0.0, bh)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _select_class_agnostic_proposals(
+    predictions: Sequence[Mapping[str, Any]],
+    *,
+    topk: int,
+    nms_thresh: float,
+) -> List[Dict[str, Any]]:
+    selected: List[Dict[str, Any]] = []
+    for pred in predictions:
+        bbox = [float(v) for v in pred["bbox"]]
+        if bbox[2] <= 1 or bbox[3] <= 1:
+            continue
+        if any(_xywh_iou(bbox, item["bbox"]) >= nms_thresh for item in selected):
+            continue
+        selected.append(
+            {
+                "bbox": bbox,
+                "score": float(pred.get("score", 0.0)),
+                "source_category_id": int(pred.get("category_id", -1)),
+            }
+        )
+        if topk > 0 and len(selected) >= topk:
+            break
+    return selected
+
+
 def _resolve_image_path(image_root: Path, file_name: str) -> Path:
     file_path = Path(file_name)
     if file_path.is_absolute() and file_path.exists():
@@ -246,6 +285,70 @@ def _build_verifier_features(
     raise ValueError(f"Unsupported verifier feature mode: {feature_mode}")
 
 
+@torch.no_grad()
+def _score_expanded_pairs(
+    *,
+    image_features: torch.Tensor,
+    text_features: torch.Tensor,
+    proposal_scores: Sequence[float],
+    verifier: Optional[nn.Module],
+    verifier_feature_mode: str,
+    args: argparse.Namespace,
+) -> np.ndarray:
+    proposal_scores_np = np.asarray(proposal_scores, dtype=np.float32)
+    if verifier is None:
+        clip_scores = (image_features @ text_features.T).numpy()
+        clip_logits = args.clip_scale * (clip_scores - args.clip_center)
+        clip_probs = 1.0 / (1.0 + np.exp(-clip_logits))
+        proposal_probs = proposal_scores_np[:, None]
+        if args.fusion == "logit_add":
+            clipped = np.clip(proposal_probs, 1e-6, 1.0 - 1e-6)
+            proposal_logits = np.log(clipped / (1.0 - clipped))
+            logits = proposal_logits + args.fusion_weight * clip_logits
+            return (1.0 / (1.0 + np.exp(-logits))).astype(np.float32)
+        if args.fusion == "linear":
+            return ((1.0 - args.fusion_weight) * proposal_probs + args.fusion_weight * clip_probs).astype(np.float32)
+        if args.fusion == "replace":
+            return clip_probs.astype(np.float32)
+        raise ValueError(f"Unsupported fusion mode: {args.fusion}")
+
+    num_proposals = int(image_features.shape[0])
+    num_categories = int(text_features.shape[0])
+    flat_scores = np.empty((num_proposals * num_categories,), dtype=np.float32)
+    all_indices = torch.arange(num_proposals * num_categories, dtype=torch.long)
+    for start in range(0, int(all_indices.numel()), args.verifier_pair_batch_size):
+        flat_idx = all_indices[start : start + args.verifier_pair_batch_size]
+        proposal_idx = torch.div(flat_idx, num_categories, rounding_mode="floor")
+        category_idx = flat_idx.remainder(num_categories)
+        proposal_batch_scores = proposal_scores_np[proposal_idx.numpy()]
+        features = _build_verifier_features(
+            image_features[proposal_idx],
+            text_features[category_idx],
+            proposal_batch_scores.tolist(),
+            verifier_feature_mode,
+        ).to(args.device)
+        logits = verifier(features).float().cpu().numpy()
+        for offset, logit in enumerate(logits):
+            flat_scores[start + offset] = _fuse_logit_score(
+                float(proposal_batch_scores[offset]),
+                float(logit),
+                mode=args.verifier_fusion,
+                fusion_weight=args.verifier_fusion_weight,
+            )
+    return flat_scores.reshape(num_proposals, num_categories)
+
+
+def _top_matrix_indices(scores: np.ndarray, topk: int) -> List[Tuple[int, int]]:
+    flat = scores.reshape(-1)
+    if topk > 0 and flat.size > topk:
+        candidate = np.argpartition(-flat, topk - 1)[:topk]
+        candidate = candidate[np.argsort(-flat[candidate], kind="mergesort")]
+    else:
+        candidate = np.argsort(-flat, kind="mergesort")
+    num_categories = scores.shape[1]
+    return [(int(idx // num_categories), int(idx % num_categories)) for idx in candidate]
+
+
 def _load_openclip(model_name: str, pretrained: str, device: str):
     try:
         import open_clip
@@ -389,6 +492,56 @@ def rerank(args: argparse.Namespace) -> List[Dict[str, Any]]:
         image = Image.open(image_path).convert("RGB")
         width, height = image.size
 
+        if args.expand_all_phrases:
+            proposals = _select_class_agnostic_proposals(
+                preds,
+                topk=args.proposal_topk_per_image,
+                nms_thresh=args.proposal_nms_thresh,
+            )
+            crop_tensors = []
+            valid_proposals: List[Dict[str, Any]] = []
+            for proposal in proposals:
+                xyxy = _expanded_xyxy(proposal["bbox"], width=width, height=height, margin=args.crop_margin)
+                if xyxy is None:
+                    invalid_crops += 1
+                    continue
+                crop_tensors.append(preprocess(image.crop(xyxy)))
+                valid_proposals.append(proposal)
+
+            if crop_tensors:
+                image_features = _encode_crops(
+                    model,
+                    crop_tensors,
+                    batch_size=args.image_batch_size,
+                    device=device,
+                )
+                proposal_scores = [float(proposal["score"]) for proposal in valid_proposals]
+                pair_scores = _score_expanded_pairs(
+                    image_features=image_features,
+                    text_features=text_features,
+                    proposal_scores=proposal_scores,
+                    verifier=verifier,
+                    verifier_feature_mode=verifier_feature_mode,
+                    args=args,
+                )
+                processed_crops += len(crop_tensors)
+
+                for proposal_idx, category_idx in _top_matrix_indices(pair_scores, args.keep_topk_per_image):
+                    proposal = valid_proposals[proposal_idx]
+                    cat_id = category_ids[category_idx]
+                    pred = {
+                        "image_id": int(image_id),
+                        "category_id": int(cat_id),
+                        "bbox": [float(v) for v in proposal["bbox"]],
+                        "score": float(pair_scores[proposal_idx, category_idx]),
+                    }
+                    if args.include_debug_fields:
+                        pred["proposal_score"] = float(proposal["score"])
+                        pred["source_category_id"] = int(proposal["source_category_id"])
+                    reranked_results.append(pred)
+            image.close()
+            continue
+
         output_preds = [dict(pred) for pred in preds]
         crop_tensors: List[torch.Tensor] = []
         crop_positions: List[int] = []
@@ -463,6 +616,7 @@ def rerank(args: argparse.Namespace) -> List[Dict[str, Any]]:
         output_preds.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
         output_preds = _limit_predictions(output_preds, args.keep_topk_per_image)
         reranked_results.extend(output_preds)
+        image.close()
 
     print(f"input predictions: {len(predictions)}")
     print(f"output predictions: {len(reranked_results)}")
@@ -546,6 +700,27 @@ def parse_args() -> argparse.Namespace:
         help="Drop predictions outside --rerank-topk-per-image instead of keeping original scores.",
     )
     parser.add_argument(
+        "--expand-all-phrases",
+        action="store_true",
+        help=(
+            "Use predictions as class-agnostic proposal boxes and score every selected proposal "
+            "against every D3 phrase. This can exploit proposal oracle headroom from sources "
+            "such as OWLv2, instead of only reranking already-emitted category rows."
+        ),
+    )
+    parser.add_argument(
+        "--proposal-topk-per-image",
+        type=int,
+        default=100,
+        help="Number of class-agnostic proposal boxes to keep before all-phrase expansion.",
+    )
+    parser.add_argument(
+        "--proposal-nms-thresh",
+        type=float,
+        default=0.9,
+        help="Class-agnostic IoU threshold used to deduplicate proposal boxes before expansion.",
+    )
+    parser.add_argument(
         "--skip-rerank",
         action="store_true",
         help="Only select/limit detector predictions. Useful for subset baseline evaluation.",
@@ -597,6 +772,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.5,
         help="Weight of verifier logit/probability in verifier fusion.",
+    )
+    parser.add_argument(
+        "--verifier-pair-batch-size",
+        type=int,
+        default=8192,
+        help="Batch size for verifier scoring in --expand-all-phrases mode.",
     )
     parser.add_argument(
         "--image-batch-size",

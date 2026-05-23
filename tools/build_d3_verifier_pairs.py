@@ -6,7 +6,11 @@ This is the first training-side step after fixed text-prototype calibration:
 turn detector predictions into binary region/phrase pairs.
 
 Positive pair:
-  predicted box + target phrase c, where IoU(pred, GT of c) >= pos threshold.
+  By default, predicted box + predicted phrase c, where IoU(pred, GT of c)
+  >= pos threshold. With --positive-source proposal_iou, the target phrase is
+  taken from the best-overlapping GT box regardless of the detector's predicted
+  phrase/category. This is useful for class-agnostic proposal sources such as
+  OWLv2 where the box is good but the phrase score is misranked.
 
 Negative pairs:
   1. same_phrase_bad_box: predicted class c but IoU(pred, GT of c) <= neg threshold.
@@ -152,6 +156,7 @@ def _base_row(
     best_any_category_id: Optional[int],
     best_any_gt_id: Optional[int],
     negative_type: Optional[str],
+    positive_source: Optional[str] = None,
 ) -> Dict[str, Any]:
     return {
         "split": split,
@@ -171,6 +176,7 @@ def _base_row(
         "best_any_category_id": best_any_category_id,
         "best_any_gt_id": best_any_gt_id,
         "negative_type": negative_type,
+        "positive_source": positive_source,
     }
 
 
@@ -270,21 +276,32 @@ def build_pairs(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Dict[st
             target_iou, matched_gt_id = _best_iou_for_category(pred["bbox"], gt_by_cat, pred_cat)
             best_any_iou, best_any_cat, best_any_gt_id = _best_iou_any(pred["bbox"], gt_anns)
 
-            if target_iou >= args.pos_iou_thresh:
+            positive_category_id = pred_cat
+            positive_iou = target_iou
+            positive_gt_id = matched_gt_id
+            positive_source = "detector_label"
+            if args.positive_source == "proposal_iou":
+                positive_category_id = int(best_any_cat) if best_any_cat is not None else pred_cat
+                positive_iou = best_any_iou
+                positive_gt_id = best_any_gt_id
+                positive_source = "proposal_iou"
+
+            if positive_iou >= args.pos_iou_thresh and positive_category_id in categories:
                 positives.append(
                     _base_row(
                         split=split,
                         image_info=image_info,
                         pred=pred,
-                        target_category_id=pred_cat,
-                        phrase=categories[pred_cat],
+                        target_category_id=positive_category_id,
+                        phrase=categories[positive_category_id],
                         label=1,
-                        target_iou=target_iou,
-                        matched_gt_id=matched_gt_id,
+                        target_iou=positive_iou,
+                        matched_gt_id=positive_gt_id,
                         best_any_iou=best_any_iou,
                         best_any_category_id=best_any_cat,
                         best_any_gt_id=best_any_gt_id,
                         negative_type=None,
+                        positive_source=positive_source,
                     )
                 )
             elif target_iou <= args.neg_iou_thresh:
@@ -396,6 +413,15 @@ def parse_args() -> argparse.Namespace:
         help="Directory for train.jsonl, val.jsonl, all.jsonl, and summary.json.",
     )
     parser.add_argument("--pred-topk-per-image", type=int, default=100)
+    parser.add_argument(
+        "--positive-source",
+        choices=("detector_label", "proposal_iou"),
+        default="detector_label",
+        help=(
+            "How to form positive pairs. detector_label requires the predicted category to match GT; "
+            "proposal_iou pairs any high-IoU proposal box with the best-overlapping GT phrase."
+        ),
+    )
     parser.add_argument("--pos-iou-thresh", type=float, default=0.5)
     parser.add_argument("--neg-iou-thresh", type=float, default=0.3)
     parser.add_argument("--wrong-phrase-neg-per-pos", type=int, default=2)
