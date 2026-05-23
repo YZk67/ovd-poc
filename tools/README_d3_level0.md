@@ -1612,3 +1612,83 @@ If it improves over the frozen top300 ROI verifier (`11.0259` on
 
 If crop-level OpenCLIP does not improve, move to token-level/cross-attention
 verification rather than tuning the pooled-ROI MLP further.
+
+## 22. Token-level cross-attention verifier
+
+The crop cosine test only gives a weak calibration signal. The next verifier
+uses frozen CLIP tokens and trains a small cross-attention head:
+
+```text
+candidate crop patch tokens
+  x phrase tokens
+  -> text-to-image cross attention
+  -> verifier logit
+  -> detector/verifier score fusion
+```
+
+Use the `lami` environment for this step. Do not install CLIP packages into
+`lami-clean`.
+
+First run a smoke train on the 100-image top300x50 export:
+
+```bash
+conda activate lami
+export TMP_OUT=/root/autodl-tmp/LaMI-DETR-output
+export HF_ENDPOINT=https://hf-mirror.com
+
+python tools/train_d3_token_cross_verifier.py \
+  --train-jsonl "$TMP_OUT/d3_topk_candidate_pairs_w075_top300x50_smoke/train.jsonl" \
+  --val-jsonl "$TMP_OUT/d3_topk_candidate_pairs_w075_top300x50_smoke/val.jsonl" \
+  --image-root dataset/d3/images \
+  --output-dir "$TMP_OUT/d3_token_cross_verifier_smoke" \
+  --clip-backend open_clip \
+  --clip-model ViT-L-14 \
+  --clip-pretrained laion2b_s32b_b82k \
+  --max-train-samples 12000 \
+  --max-val-samples 3000 \
+  --epochs 1 \
+  --batch-size 8 \
+  --eval-batch-size 16
+```
+
+Then evaluate the smoke checkpoint as a top-k reranker:
+
+```bash
+python tools/rerank_d3_topk_candidates_with_token_verifier.py \
+  --annotation dataset/d3/annotations/d3_intra_full.json \
+  --image-root dataset/d3/images \
+  --phrases-json dataset/metadata/d3_phrases.json \
+  --saved-output-dir "$TMP_OUT/d3_topk_candidate_dumps_w075/pth" \
+  --verifier-checkpoint "$TMP_OUT/d3_token_cross_verifier_smoke/verifier_best.pt" \
+  --output "$TMP_OUT/d3_token_cross_verifier_smoke_eval/d3_intra_full/top100x20_results.json" \
+  --box-topk 100 \
+  --phrase-topk 20 \
+  --keep-topk-per-image 100 \
+  --max-images 100 \
+  --fusion logit_add \
+  --fusion-weight 1.0 \
+  --eval
+```
+
+If this beats the crop-cosine smoke result (`15.7` AP on the same 100 images),
+scale the training sample before running large eval:
+
+```bash
+python tools/train_d3_token_cross_verifier.py \
+  --train-jsonl "$TMP_OUT/d3_topk_candidate_pairs_w075_top300x50/train.jsonl" \
+  --val-jsonl "$TMP_OUT/d3_topk_candidate_pairs_w075_top300x50/val.jsonl" \
+  --image-root dataset/d3/images \
+  --output-dir "$TMP_OUT/d3_token_cross_verifier_80k" \
+  --clip-backend open_clip \
+  --clip-model ViT-L-14 \
+  --clip-pretrained laion2b_s32b_b82k \
+  --max-train-samples 80000 \
+  --max-val-samples 20000 \
+  --epochs 1 \
+  --batch-size 8 \
+  --eval-batch-size 16
+```
+
+If the smoke checkpoint does not beat crop cosine, do not run the 80k/full
+version; inspect failure cases or switch to a stronger pretrained grounding
+encoder.
