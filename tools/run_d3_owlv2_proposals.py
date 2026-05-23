@@ -186,7 +186,13 @@ def _predict_one_image(
 
     for start in range(0, len(prompts), args.text_chunk_size):
         chunk_prompts = list(prompts[start : start + args.text_chunk_size])
-        inputs = processor(text=[chunk_prompts], images=image, return_tensors="pt")
+        inputs = processor(
+            text=[chunk_prompts],
+            images=image,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        )
         inputs = _move_inputs(inputs, device=args.device, dtype=dtype)
         outputs = model(**inputs)
         result = processor.post_process_object_detection(
