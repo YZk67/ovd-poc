@@ -1404,3 +1404,60 @@ Each row stores `query_index`, `phrase_rank`, `target_iou`,
 with IoU >= 0.5. The most important hard negatives are
 `wrong_phrase_good_box`: the box is good for some GT phrase, but not the target
 phrase.
+
+## 19. Train pooled-ROI top-k candidate reranker
+
+Train the first candidate-distribution verifier from the top300x50 rows. This
+still uses pooled detector ROI features, so it is a distribution fix rather than
+the later cross-attention model.
+
+Run a small smoke first:
+
+```bash
+export TMP_OUT=/root/autodl-tmp/LaMI-DETR-output
+
+python tools/train_d3_candidate_reranker.py \
+  --train-jsonl "$TMP_OUT/d3_topk_candidate_pairs_w075_top300x50_smoke/train.jsonl" \
+  --val-jsonl "$TMP_OUT/d3_topk_candidate_pairs_w075_top300x50_smoke/val.jsonl" \
+  --saved-output-dir "$TMP_OUT/d3_topk_candidate_dumps_w075/pth" \
+  --cache-dir "$TMP_OUT/d3_candidate_reranker_w075_top300x50_smoke/cache" \
+  --output-dir "$TMP_OUT/d3_candidate_reranker_w075_top300x50_smoke" \
+  --cache-fp16 \
+  --epochs 1 \
+  --batch-size 2048
+```
+
+Then full training:
+
+```bash
+python tools/train_d3_candidate_reranker.py \
+  --train-jsonl "$TMP_OUT/d3_topk_candidate_pairs_w075_top300x50/train.jsonl" \
+  --val-jsonl "$TMP_OUT/d3_topk_candidate_pairs_w075_top300x50/val.jsonl" \
+  --saved-output-dir "$TMP_OUT/d3_topk_candidate_dumps_w075/pth" \
+  --cache-dir "$TMP_OUT/d3_candidate_reranker_w075_top300x50/cache" \
+  --output-dir "$TMP_OUT/d3_candidate_reranker_w075_top300x50" \
+  --cache-fp16 \
+  --epochs 5 \
+  --batch-size 4096 \
+  --lr 1e-3
+```
+
+The checkpoint is compatible with `model.region_verifier_checkpoint`. Evaluate
+it in the same top300 reranker path:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python tools/train_net.py \
+  --config-file lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_zeroshot_d3_internal_roi_verifier_w075_top300_rerank.py \
+  --num-gpus 1 \
+  --eval-only \
+  train.init_checkpoint=/root/autodl-tmp/model_final_ovd_lvis_kang.pth \
+  model.region_verifier_checkpoint="$TMP_OUT/d3_candidate_reranker_w075_top300x50/verifier_best.pt" \
+  dataloader.test.dataset.names=d3_intra_full \
+  train.output_dir="$TMP_OUT/d3_candidate_reranker_eval/d3_intra_full/top300_box_phrase50" \
+  dataloader.evaluator.output_dir="$TMP_OUT/d3_candidate_reranker_eval/d3_intra_full/top300_box_phrase50"
+```
+
+If the full-split AP beats the frozen top300 reranker (`11.0259`), repeat on
+`d3_intra_pres` and `d3_intra_abs`. If it does not, run the same trainer with
+`--feature-mode full` to test whether the learned verifier needs detector score
+calibration in addition to ROI/text matching.
