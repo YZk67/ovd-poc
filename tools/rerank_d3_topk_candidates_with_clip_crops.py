@@ -268,10 +268,7 @@ def _fuse_score(
 
 
 def _load_openclip(model_name: str, pretrained: str, device: str):
-    try:
-        import open_clip
-    except ImportError as exc:
-        raise ImportError("open_clip is required. Run this script in the lami env.") from exc
+    import open_clip
 
     model, _, preprocess = open_clip.create_model_and_transforms(
         model_name,
@@ -279,7 +276,48 @@ def _load_openclip(model_name: str, pretrained: str, device: str):
         device=device,
     )
     model.eval()
-    return model, preprocess, open_clip.tokenize
+    return model, preprocess, open_clip.tokenize, f"open_clip:{model_name}:{pretrained}"
+
+
+def _load_openai_clip(model_name: str, device: str):
+    import clip
+
+    model, preprocess = clip.load(model_name, device=device)
+    model.eval()
+    return model, preprocess, clip.tokenize, f"openai_clip:{model_name}"
+
+
+def _load_clip_model(args: argparse.Namespace):
+    errors = []
+    if args.clip_backend in {"auto", "open_clip"}:
+        try:
+            return _load_openclip(args.model, args.pretrained, args.device)
+        except Exception as exc:
+            errors.append(f"open_clip unavailable: {exc}")
+            if args.clip_backend == "open_clip":
+                raise RuntimeError(
+                    "Failed to load --clip-backend open_clip. If this is a HuggingFace "
+                    "download timeout, try: export HF_ENDPOINT=https://hf-mirror.com"
+                ) from exc
+
+    if args.clip_backend in {"auto", "openai_clip"}:
+        try:
+            return _load_openai_clip(args.openai_clip_model, args.device)
+        except Exception as exc:
+            errors.append(f"openai clip unavailable: {exc}")
+            if args.clip_backend == "openai_clip":
+                raise RuntimeError(
+                    "Failed to load --clip-backend openai_clip. Install/check weights with: "
+                    "pip install git+https://github.com/openai/CLIP.git"
+                ) from exc
+
+    details = "\n".join(errors) if errors else "no backend attempted"
+    raise ImportError(
+        "No CLIP backend is available.\n"
+        f"{details}\n"
+        "Preferred install: pip install open_clip_torch\n"
+        "Fallback install: pip install git+https://github.com/openai/CLIP.git"
+    )
 
 
 @torch.no_grad()
@@ -414,7 +452,8 @@ def rerank(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Dict[str, An
     device = args.device
     model = preprocess = tokenizer = text_features = None
     if not args.skip_rerank:
-        model, preprocess, tokenizer = _load_openclip(args.model, args.pretrained, device)
+        model, preprocess, tokenizer, backend_name = _load_clip_model(args)
+        print(f"loaded crop-text backend: {backend_name}")
         text_features = _encode_texts(
             model,
             tokenizer,
@@ -611,8 +650,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vlm-temperature", type=float, default=100.0)
     parser.add_argument("--beta", type=float, default=0.1)
     parser.add_argument("--prompt-template", default="the described target is {phrase}")
+    parser.add_argument(
+        "--clip-backend",
+        choices=("auto", "open_clip", "openai_clip"),
+        default="auto",
+        help="Crop-text model backend. auto tries open_clip first, then OpenAI CLIP.",
+    )
     parser.add_argument("--model", default="convnext_large_d_320", help="OpenCLIP model name.")
     parser.add_argument("--pretrained", default="laion2b_s29b_b131k_ft_soup", help="OpenCLIP pretrained tag.")
+    parser.add_argument("--openai-clip-model", default="ViT-L/14", help="OpenAI CLIP model name for fallback.")
     parser.add_argument("--crop-margin", type=float, default=0.25)
     parser.add_argument("--fusion", choices=("logit_add", "linear", "replace"), default="logit_add")
     parser.add_argument("--fusion-weight", type=float, default=0.25)

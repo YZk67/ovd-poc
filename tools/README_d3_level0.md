@@ -1561,6 +1561,25 @@ python tools/rerank_d3_topk_candidates_with_clip_crops.py \
   --eval
 ```
 
+The script tries `open_clip` first. If the remote environment cannot download
+from HuggingFace, use the mirror:
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+```
+
+If the remote environment does not have `open_clip`, either install it:
+
+```bash
+pip install open_clip_torch
+```
+
+or use the OpenAI CLIP fallback if `clip` is already installed:
+
+```bash
+--clip-backend openai_clip --openai-clip-model ViT-L/14
+```
+
 If the smoke runs cleanly, run the comparable top300 x top50 full-split test:
 
 ```bash
