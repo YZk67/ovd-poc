@@ -1840,3 +1840,16 @@ python tools/rerank_d3_predictions_with_clip_crops.py \
   --max-images 200 \
   --eval
 ```
+
+For expensive reranking runs, use the saved JSON to rerun COCOeval without
+reranking again:
+
+```bash
+python tools/evaluate_coco_predictions.py \
+  --annotation dataset/d3/annotations/d3_intra_full.json \
+  --predictions "$TMP_OUT/d3_owlv2_large_allval/expand_verifier_val200/results.json"
+```
+
+This evaluator defaults to the image ids present in the prediction JSON. Pass
+`--all-annotation-images` only when the prediction file covers the full
+annotation set.

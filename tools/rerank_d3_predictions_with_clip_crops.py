@@ -830,8 +830,18 @@ def main() -> None:
     print(f"saved reranked predictions to {args.output}")
     if args.eval:
         eval_image_ids = None
+        output_image_ids = sorted({int(result["image_id"]) for result in results})
         if args.eval_output_images_only or args.max_images is not None or args.image_id_jsonl is not None:
-            eval_image_ids = sorted({int(result["image_id"]) for result in results})
+            eval_image_ids = output_image_ids
+        else:
+            annotation = _load_json(args.annotation)
+            annotation_image_ids = {int(item["id"]) for item in annotation.get("images", [])}
+            if len(output_image_ids) < len(annotation_image_ids):
+                eval_image_ids = output_image_ids
+                print(
+                    "evaluation output covers a subset of annotation images; "
+                    f"restricting COCOeval to output image ids: {len(output_image_ids)}"
+                )
         _evaluate_coco(args.annotation, results, image_ids=eval_image_ids)
 
 
