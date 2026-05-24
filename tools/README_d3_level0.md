@@ -1841,6 +1841,27 @@ python tools/rerank_d3_predictions_with_clip_crops.py \
   --eval
 ```
 
+If the verifier improves recall but hurts AP, preserve OWLv2's original
+category-specific scores as the base score:
+
+```bash
+python tools/rerank_d3_predictions_with_clip_crops.py \
+  --annotation dataset/d3/annotations/d3_intra_full.json \
+  --image-root dataset/d3/images \
+  --phrases-json dataset/metadata/d3_phrases.json \
+  --predictions "$TMP_OUT/d3_owlv2_large_allval/d3_intra_full/results.json" \
+  --output "$TMP_OUT/d3_owlv2_large_allval/expand_verifier_category_score/results.json" \
+  --expand-all-phrases \
+  --expanded-base-score category_score \
+  --proposal-topk-per-image 100 \
+  --proposal-nms-thresh 0.9 \
+  --keep-topk-per-image 100 \
+  --verifier-checkpoint "$TMP_OUT/d3_owlv2_large_allval/proposal_iou_crop_verifier/verifier_best.pt" \
+  --verifier-fusion logit_add \
+  --verifier-fusion-weight 1.0 \
+  --eval
+```
+
 For expensive reranking runs, use the saved JSON to rerun COCOeval without
 reranking again:
 

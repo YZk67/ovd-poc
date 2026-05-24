@@ -121,6 +121,43 @@ def _select_class_agnostic_proposals(
     return selected
 
 
+def _expanded_base_scores(
+    proposals: Sequence[Mapping[str, Any]],
+    predictions: Sequence[Mapping[str, Any]],
+    *,
+    category_to_row: Mapping[int, int],
+    num_categories: int,
+    mode: str,
+    match_iou: float,
+    missing_category_score_scale: float,
+) -> np.ndarray:
+    proposal_scores = np.asarray([float(proposal["score"]) for proposal in proposals], dtype=np.float32)
+    if mode == "objectness":
+        return np.repeat(proposal_scores[:, None], num_categories, axis=1)
+    if mode != "category_score":
+        raise ValueError(f"Unsupported expanded base score mode: {mode}")
+
+    fallback = np.clip(proposal_scores[:, None] * missing_category_score_scale, 1e-6, 1.0 - 1e-6)
+    scores = np.repeat(fallback, num_categories, axis=1).astype(np.float32)
+    proposal_boxes = [proposal["bbox"] for proposal in proposals]
+    for pred in predictions:
+        cat_id = int(pred.get("category_id", -1))
+        if cat_id not in category_to_row:
+            continue
+        pred_box = pred["bbox"]
+        best_idx = -1
+        best_iou = 0.0
+        for proposal_idx, proposal_box in enumerate(proposal_boxes):
+            iou = _xywh_iou(pred_box, proposal_box)
+            if iou > best_iou:
+                best_iou = iou
+                best_idx = proposal_idx
+        if best_idx >= 0 and best_iou >= match_iou:
+            row = category_to_row[cat_id]
+            scores[best_idx, row] = max(scores[best_idx, row], float(pred.get("score", 0.0)))
+    return scores
+
+
 def _resolve_image_path(image_root: Path, file_name: str) -> Path:
     file_path = Path(file_name)
     if file_path.is_absolute() and file_path.exists():
@@ -290,17 +327,19 @@ def _score_expanded_pairs(
     *,
     image_features: torch.Tensor,
     text_features: torch.Tensor,
-    proposal_scores: Sequence[float],
+    base_scores: np.ndarray,
     verifier: Optional[nn.Module],
     verifier_feature_mode: str,
     args: argparse.Namespace,
 ) -> np.ndarray:
-    proposal_scores_np = np.asarray(proposal_scores, dtype=np.float32)
+    base_scores_np = np.asarray(base_scores, dtype=np.float32)
+    if base_scores_np.ndim == 1:
+        base_scores_np = np.repeat(base_scores_np[:, None], int(text_features.shape[0]), axis=1)
     if verifier is None:
         clip_scores = (image_features @ text_features.T).numpy()
         clip_logits = args.clip_scale * (clip_scores - args.clip_center)
         clip_probs = 1.0 / (1.0 + np.exp(-clip_logits))
-        proposal_probs = proposal_scores_np[:, None]
+        proposal_probs = base_scores_np
         if args.fusion == "logit_add":
             clipped = np.clip(proposal_probs, 1e-6, 1.0 - 1e-6)
             proposal_logits = np.log(clipped / (1.0 - clipped))
@@ -320,7 +359,7 @@ def _score_expanded_pairs(
         flat_idx = all_indices[start : start + args.verifier_pair_batch_size]
         proposal_idx = torch.div(flat_idx, num_categories, rounding_mode="floor")
         category_idx = flat_idx.remainder(num_categories)
-        proposal_batch_scores = proposal_scores_np[proposal_idx.numpy()]
+        proposal_batch_scores = base_scores_np[proposal_idx.numpy(), category_idx.numpy()]
         features = _build_verifier_features(
             image_features[proposal_idx],
             text_features[category_idx],
@@ -515,11 +554,19 @@ def rerank(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     batch_size=args.image_batch_size,
                     device=device,
                 )
-                proposal_scores = [float(proposal["score"]) for proposal in valid_proposals]
+                base_scores = _expanded_base_scores(
+                    valid_proposals,
+                    preds,
+                    category_to_row=category_to_row,
+                    num_categories=len(category_ids),
+                    mode=args.expanded_base_score,
+                    match_iou=args.category_score_match_iou,
+                    missing_category_score_scale=args.missing_category_score_scale,
+                )
                 pair_scores = _score_expanded_pairs(
                     image_features=image_features,
                     text_features=text_features,
-                    proposal_scores=proposal_scores,
+                    base_scores=base_scores,
                     verifier=verifier,
                     verifier_feature_mode=verifier_feature_mode,
                     args=args,
@@ -537,6 +584,7 @@ def rerank(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     }
                     if args.include_debug_fields:
                         pred["proposal_score"] = float(proposal["score"])
+                        pred["base_score"] = float(base_scores[proposal_idx, category_idx])
                         pred["source_category_id"] = int(proposal["source_category_id"])
                     reranked_results.append(pred)
             image.close()
@@ -719,6 +767,28 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.9,
         help="Class-agnostic IoU threshold used to deduplicate proposal boxes before expansion.",
+    )
+    parser.add_argument(
+        "--expanded-base-score",
+        choices=("objectness", "category_score"),
+        default="objectness",
+        help=(
+            "Base score used for expanded box-phrase pairs. objectness uses the proposal's max "
+            "OWLv2 score for every phrase. category_score preserves OWLv2's original score for "
+            "matching proposal/category pairs and uses a scaled objectness fallback otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--category-score-match-iou",
+        type=float,
+        default=0.9,
+        help="IoU threshold for matching original category predictions back to deduplicated proposals.",
+    )
+    parser.add_argument(
+        "--missing-category-score-scale",
+        type=float,
+        default=0.05,
+        help="Fallback base score multiplier for box-phrase pairs without an original category score.",
     )
     parser.add_argument(
         "--skip-rerank",
