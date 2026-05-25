@@ -1763,6 +1763,82 @@ Interpretation:
   quality and the next source should be GroundingDINO/GLIP or a stronger OVD
   detector, not another crop verifier.
 
+## 23.1 GroundingDINO proposal-source probe
+
+After OWLv2 reaches the current `24` AP plateau with reranking, probe a second
+proposal/scorer source before adding more verifier losses. This script uses
+HuggingFace GroundingDINO and writes the same COCO result JSON as OWLv2.
+GroundingDINO returns text spans rather than class indices, so labels are mapped
+back to D3 phrases inside each prompt chunk.
+
+Start with a small held-out smoke because this is slower than OWLv2:
+
+```bash
+export TMP_OUT=/root/autodl-tmp/LaMI-DETR-output
+export HF_ENDPOINT=https://hf-mirror.com
+
+python tools/run_d3_groundingdino_proposals.py \
+  --annotation dataset/d3/annotations/d3_intra_full.json \
+  --image-root dataset/d3/images \
+  --phrases-json dataset/metadata/d3_phrases.json \
+  --image-id-jsonl "$TMP_OUT/d3_topk_candidate_pairs_w075_top300x50/val.jsonl" \
+  --output "$TMP_OUT/d3_groundingdino_base_val200/d3_intra_full/results.json" \
+  --per-image-output-dir "$TMP_OUT/d3_groundingdino_base_val200/d3_intra_full/per_image" \
+  --reuse-per-image \
+  --model-name IDEA-Research/grounding-dino-base \
+  --prompt-template "{phrase}" \
+  --text-chunk-size 16 \
+  --box-threshold 0.15 \
+  --text-threshold 0.20 \
+  --label-match-threshold 0.45 \
+  --keep-topk-per-image 300 \
+  --max-images 200 \
+  --eval
+```
+
+Then compute oracle recall on the same subset:
+
+```bash
+python tools/analyze_d3_oracle_recall.py \
+  --annotation dataset/d3/annotations/d3_intra_full.json \
+  --predictions "$TMP_OUT/d3_groundingdino_base_val200/d3_intra_full/results.json" \
+  --topk 20,50,100,300 \
+  --output "$TMP_OUT/d3_groundingdino_base_val200/d3_intra_full/oracle_recall.csv" \
+  --json-output "$TMP_OUT/d3_groundingdino_base_val200/d3_intra_full/oracle_recall.json"
+
+cat "$TMP_OUT/d3_groundingdino_base_val200/d3_intra_full/oracle_recall.csv"
+```
+
+If direct AP or oracle recall is competitive with OWLv2 on the smoke, run the
+full val split:
+
+```bash
+python tools/run_d3_groundingdino_proposals.py \
+  --annotation dataset/d3/annotations/d3_intra_full.json \
+  --image-root dataset/d3/images \
+  --phrases-json dataset/metadata/d3_phrases.json \
+  --image-id-jsonl "$TMP_OUT/d3_topk_candidate_pairs_w075_top300x50/val.jsonl" \
+  --output "$TMP_OUT/d3_groundingdino_base_allval/d3_intra_full/results.json" \
+  --per-image-output-dir "$TMP_OUT/d3_groundingdino_base_allval/d3_intra_full/per_image" \
+  --reuse-per-image \
+  --model-name IDEA-Research/grounding-dino-base \
+  --prompt-template "{phrase}" \
+  --text-chunk-size 16 \
+  --box-threshold 0.15 \
+  --text-threshold 0.20 \
+  --label-match-threshold 0.45 \
+  --keep-topk-per-image 300 \
+  --eval
+```
+
+Use the same interpretation as OWLv2:
+
+- If direct AP beats OWLv2's `17.1`, connect the existing crop/token verifier.
+- If direct AP is lower but top300 oracle is stronger, use GroundingDINO as an
+  additional proposal source in an ensemble.
+- If both direct AP and oracle are lower, stop this source and try a different
+  detector or return to phrase-conditioned training.
+
 ## 24. OWLv2 proposal-aware phrase reranking
 
 If OWLv2 direct AP is modest but top-k oracle is strong, the missing piece is
