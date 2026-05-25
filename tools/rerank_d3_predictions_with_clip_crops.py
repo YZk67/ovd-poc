@@ -31,6 +31,9 @@ from PIL import Image
 from tqdm import tqdm
 
 
+EXPANDED_SCORE_CACHE_VERSION = 1
+
+
 def _load_json(path: Path) -> Any:
     with path.open("r") as f:
         return json.load(f)
@@ -121,24 +124,15 @@ def _select_class_agnostic_proposals(
     return selected
 
 
-def _expanded_base_scores(
+def _expanded_category_scores(
     proposals: Sequence[Mapping[str, Any]],
     predictions: Sequence[Mapping[str, Any]],
     *,
     category_to_row: Mapping[int, int],
     num_categories: int,
-    mode: str,
     match_iou: float,
-    missing_category_score_scale: float,
 ) -> np.ndarray:
-    proposal_scores = np.asarray([float(proposal["score"]) for proposal in proposals], dtype=np.float32)
-    if mode == "objectness":
-        return np.repeat(proposal_scores[:, None], num_categories, axis=1)
-    if mode != "category_score":
-        raise ValueError(f"Unsupported expanded base score mode: {mode}")
-
-    fallback = np.clip(proposal_scores[:, None] * missing_category_score_scale, 1e-6, 1.0 - 1e-6)
-    scores = np.repeat(fallback, num_categories, axis=1).astype(np.float32)
+    scores = np.full((len(proposals), num_categories), np.nan, dtype=np.float32)
     proposal_boxes = [proposal["bbox"] for proposal in proposals]
     for pred in predictions:
         cat_id = int(pred.get("category_id", -1))
@@ -154,8 +148,29 @@ def _expanded_base_scores(
                 best_idx = proposal_idx
         if best_idx >= 0 and best_iou >= match_iou:
             row = category_to_row[cat_id]
-            scores[best_idx, row] = max(scores[best_idx, row], float(pred.get("score", 0.0)))
+            current = scores[best_idx, row]
+            pred_score = float(pred.get("score", 0.0))
+            if not np.isfinite(current) or pred_score > current:
+                scores[best_idx, row] = pred_score
     return scores
+
+
+def _expanded_base_scores_from_category_scores(
+    proposals: Sequence[Mapping[str, Any]],
+    category_scores: np.ndarray,
+    *,
+    num_categories: int,
+    mode: str,
+    missing_category_score_scale: float,
+) -> np.ndarray:
+    proposal_scores = np.asarray([float(proposal["score"]) for proposal in proposals], dtype=np.float32)
+    if mode == "objectness":
+        return np.repeat(proposal_scores[:, None], num_categories, axis=1)
+    if mode != "category_score":
+        raise ValueError(f"Unsupported expanded base score mode: {mode}")
+
+    fallback = np.clip(proposal_scores[:, None] * missing_category_score_scale, 1e-6, 1.0 - 1e-6)
+    return np.where(np.isfinite(category_scores), category_scores, fallback).astype(np.float32)
 
 
 def _resolve_image_path(image_root: Path, file_name: str) -> Path:
@@ -247,6 +262,52 @@ def _fuse_logit_score(
     raise ValueError(f"Unsupported verifier fusion mode: {mode}")
 
 
+def _fuse_clip_score_matrix(
+    base_scores: np.ndarray,
+    clip_scores: np.ndarray,
+    *,
+    mode: str,
+    fusion_weight: float,
+    clip_scale: float,
+    clip_center: float,
+) -> np.ndarray:
+    clip_logits = clip_scale * (clip_scores - clip_center)
+    clip_probs = 1.0 / (1.0 + np.exp(-clip_logits))
+    base_scores = np.asarray(base_scores, dtype=np.float32)
+    if mode == "logit_add":
+        clipped = np.clip(base_scores, 1e-6, 1.0 - 1e-6)
+        base_logits = np.log(clipped / (1.0 - clipped))
+        logits = base_logits + fusion_weight * clip_logits
+        return (1.0 / (1.0 + np.exp(-logits))).astype(np.float32)
+    if mode == "linear":
+        return ((1.0 - fusion_weight) * base_scores + fusion_weight * clip_probs).astype(np.float32)
+    if mode == "replace":
+        return clip_probs.astype(np.float32)
+    raise ValueError(f"Unsupported fusion mode: {mode}")
+
+
+def _fuse_verifier_logit_matrix(
+    base_scores: np.ndarray,
+    verifier_logits: np.ndarray,
+    *,
+    mode: str,
+    fusion_weight: float,
+) -> np.ndarray:
+    base_scores = np.asarray(base_scores, dtype=np.float32)
+    verifier_logits = np.asarray(verifier_logits, dtype=np.float32)
+    verifier_probs = 1.0 / (1.0 + np.exp(-verifier_logits))
+    if mode == "logit_add":
+        clipped = np.clip(base_scores, 1e-6, 1.0 - 1e-6)
+        base_logits = np.log(clipped / (1.0 - clipped))
+        logits = base_logits + fusion_weight * verifier_logits
+        return (1.0 / (1.0 + np.exp(-logits))).astype(np.float32)
+    if mode == "linear":
+        return ((1.0 - fusion_weight) * base_scores + fusion_weight * verifier_probs).astype(np.float32)
+    if mode == "replace":
+        return verifier_probs.astype(np.float32)
+    raise ValueError(f"Unsupported verifier fusion mode: {mode}")
+
+
 class CropDescriptionVerifier(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, dropout: float) -> None:
         super().__init__()
@@ -323,7 +384,7 @@ def _build_verifier_features(
 
 
 @torch.no_grad()
-def _score_expanded_pairs(
+def _score_expanded_pair_signal(
     *,
     image_features: torch.Tensor,
     text_features: torch.Tensor,
@@ -336,24 +397,11 @@ def _score_expanded_pairs(
     if base_scores_np.ndim == 1:
         base_scores_np = np.repeat(base_scores_np[:, None], int(text_features.shape[0]), axis=1)
     if verifier is None:
-        clip_scores = (image_features @ text_features.T).numpy()
-        clip_logits = args.clip_scale * (clip_scores - args.clip_center)
-        clip_probs = 1.0 / (1.0 + np.exp(-clip_logits))
-        proposal_probs = base_scores_np
-        if args.fusion == "logit_add":
-            clipped = np.clip(proposal_probs, 1e-6, 1.0 - 1e-6)
-            proposal_logits = np.log(clipped / (1.0 - clipped))
-            logits = proposal_logits + args.fusion_weight * clip_logits
-            return (1.0 / (1.0 + np.exp(-logits))).astype(np.float32)
-        if args.fusion == "linear":
-            return ((1.0 - args.fusion_weight) * proposal_probs + args.fusion_weight * clip_probs).astype(np.float32)
-        if args.fusion == "replace":
-            return clip_probs.astype(np.float32)
-        raise ValueError(f"Unsupported fusion mode: {args.fusion}")
+        return (image_features @ text_features.T).numpy().astype(np.float32)
 
     num_proposals = int(image_features.shape[0])
     num_categories = int(text_features.shape[0])
-    flat_scores = np.empty((num_proposals * num_categories,), dtype=np.float32)
+    flat_logits = np.empty((num_proposals * num_categories,), dtype=np.float32)
     all_indices = torch.arange(num_proposals * num_categories, dtype=torch.long)
     for start in range(0, int(all_indices.numel()), args.verifier_pair_batch_size):
         flat_idx = all_indices[start : start + args.verifier_pair_batch_size]
@@ -367,14 +415,32 @@ def _score_expanded_pairs(
             verifier_feature_mode,
         ).to(args.device)
         logits = verifier(features).float().cpu().numpy()
-        for offset, logit in enumerate(logits):
-            flat_scores[start + offset] = _fuse_logit_score(
-                float(proposal_batch_scores[offset]),
-                float(logit),
-                mode=args.verifier_fusion,
-                fusion_weight=args.verifier_fusion_weight,
-            )
-    return flat_scores.reshape(num_proposals, num_categories)
+        flat_logits[start : start + len(logits)] = logits
+    return flat_logits.reshape(num_proposals, num_categories)
+
+
+def _fuse_expanded_pair_scores(
+    *,
+    base_scores: np.ndarray,
+    pair_signal: np.ndarray,
+    verifier: Optional[nn.Module],
+    args: argparse.Namespace,
+) -> np.ndarray:
+    if verifier is None:
+        return _fuse_clip_score_matrix(
+            base_scores,
+            pair_signal,
+            mode=args.fusion,
+            fusion_weight=args.fusion_weight,
+            clip_scale=args.clip_scale,
+            clip_center=args.clip_center,
+        )
+    return _fuse_verifier_logit_matrix(
+        base_scores,
+        pair_signal,
+        mode=args.verifier_fusion,
+        fusion_weight=args.verifier_fusion_weight,
+    )
 
 
 def _top_matrix_indices(scores: np.ndarray, topk: int) -> List[Tuple[int, int]]:
@@ -386,6 +452,136 @@ def _top_matrix_indices(scores: np.ndarray, topk: int) -> List[Tuple[int, int]]:
         candidate = np.argsort(-flat, kind="mergesort")
     num_categories = scores.shape[1]
     return [(int(idx // num_categories), int(idx % num_categories)) for idx in candidate]
+
+
+def _expanded_score_cache_path(cache_dir: Path, image_id: int) -> Path:
+    return cache_dir / f"{int(image_id):012d}.pt"
+
+
+def _expanded_feature_cache_meta(
+    args: argparse.Namespace,
+    *,
+    category_ids: Sequence[int],
+) -> Dict[str, Any]:
+    return {
+        "version": EXPANDED_SCORE_CACHE_VERSION,
+        "category_ids": [int(category_id) for category_id in category_ids],
+        "prompt_template": str(args.prompt_template),
+        "model": str(args.model),
+        "pretrained": str(args.pretrained),
+        "crop_margin": float(args.crop_margin),
+        "proposal_topk_per_image": int(args.proposal_topk_per_image),
+        "proposal_nms_thresh": float(args.proposal_nms_thresh),
+        "category_score_match_iou": float(args.category_score_match_iou),
+    }
+
+
+def _expanded_signal_cache_meta(
+    args: argparse.Namespace,
+    *,
+    verifier_feature_mode: str,
+) -> Dict[str, Any]:
+    return {
+        "expanded_base_score": str(args.expanded_base_score),
+        "missing_category_score_scale": float(args.missing_category_score_scale),
+        "verifier_checkpoint": str(args.verifier_checkpoint) if args.verifier_checkpoint else None,
+        "verifier_feature_mode": str(verifier_feature_mode),
+        "signal": "verifier_logits" if args.verifier_checkpoint else "clip_scores",
+    }
+
+
+def _meta_matches(expected: Mapping[str, Any], actual: Mapping[str, Any]) -> bool:
+    for key, expected_value in expected.items():
+        if key not in actual:
+            return False
+        actual_value = actual[key]
+        if isinstance(expected_value, float):
+            try:
+                if abs(float(actual_value) - expected_value) > 1e-9:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        else:
+            if actual_value != expected_value:
+                return False
+    return True
+
+
+def _load_expanded_score_cache(
+    path: Path,
+    *,
+    expected_feature_meta: Mapping[str, Any],
+    expected_signal_meta: Mapping[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], bool]:
+    if not path.exists():
+        return None, False
+    try:
+        cache = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        cache = torch.load(path, map_location="cpu")
+    if not isinstance(cache, Mapping):
+        return None, False
+    meta = cache.get("meta", {})
+    if not isinstance(meta, Mapping):
+        return None, False
+    feature_meta = meta.get("feature")
+    signal_meta = meta.get("signal")
+    if not isinstance(feature_meta, Mapping) or not _meta_matches(expected_feature_meta, feature_meta):
+        return None, False
+    signal_valid = (
+        isinstance(signal_meta, Mapping)
+        and _meta_matches(expected_signal_meta, signal_meta)
+        and "pair_signal" in cache
+    )
+    return dict(cache), signal_valid
+
+
+def _save_expanded_score_cache(
+    path: Path,
+    *,
+    feature_meta: Mapping[str, Any],
+    signal_meta: Mapping[str, Any],
+    proposals: Sequence[Mapping[str, Any]],
+    category_scores: np.ndarray,
+    image_features: torch.Tensor,
+    pair_signal: np.ndarray,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "meta": {"feature": dict(feature_meta), "signal": dict(signal_meta)},
+            "bboxes": torch.tensor([proposal["bbox"] for proposal in proposals], dtype=torch.float32),
+            "proposal_scores": torch.tensor([float(proposal["score"]) for proposal in proposals], dtype=torch.float32),
+            "source_category_ids": torch.tensor(
+                [int(proposal["source_category_id"]) for proposal in proposals],
+                dtype=torch.long,
+            ),
+            "category_scores": torch.from_numpy(category_scores.astype(np.float16, copy=False)),
+            "image_features": image_features.detach().cpu().to(dtype=torch.float16),
+            "pair_signal": torch.from_numpy(pair_signal.astype(np.float16, copy=False)),
+        },
+        path,
+    )
+
+
+def _expanded_cache_to_arrays(
+    cache: Mapping[str, Any],
+) -> Tuple[List[Dict[str, Any]], np.ndarray, Optional[np.ndarray], Optional[torch.Tensor]]:
+    bboxes = cache["bboxes"].float().numpy()
+    proposal_scores = cache["proposal_scores"].float().numpy()
+    source_category_ids = cache["source_category_ids"].long().numpy()
+    proposals = [
+        {
+            "bbox": [float(v) for v in bbox],
+            "score": float(score),
+            "source_category_id": int(source_category_id),
+        }
+        for bbox, score, source_category_id in zip(bboxes, proposal_scores, source_category_ids)
+    ]
+    category_scores = cache["category_scores"].float().numpy()
+    pair_signal = cache["pair_signal"].float().numpy() if "pair_signal" in cache else None
+    image_features = cache["image_features"].float() if "image_features" in cache else None
+    return proposals, category_scores, pair_signal, image_features
 
 
 def _load_openclip(model_name: str, pretrained: str, device: str):
@@ -509,17 +705,95 @@ def rerank(args: argparse.Namespace) -> List[Dict[str, Any]]:
         batch_size=args.text_batch_size,
         device=device,
     )
+    expanded_feature_cache_meta = _expanded_feature_cache_meta(
+        args,
+        category_ids=category_ids,
+    )
+    expanded_signal_cache_meta = _expanded_signal_cache_meta(
+        args,
+        verifier_feature_mode=verifier_feature_mode,
+    )
 
     reranked_results: List[Dict[str, Any]] = []
     missing_images = 0
     invalid_crops = 0
     processed_crops = 0
+    reused_expanded_score_caches = 0
+    saved_expanded_score_caches = 0
 
     for image_id in tqdm(image_ids, desc="reranking images"):
         preds = grouped[image_id]
         image_info = image_infos.get(image_id)
         if image_info is None:
             continue
+
+        if args.expand_all_phrases and args.expanded_score_cache_dir is not None:
+            cache_path = _expanded_score_cache_path(args.expanded_score_cache_dir, image_id)
+            cache = None
+            signal_valid = False
+            if args.reuse_expanded_score_cache and not args.overwrite_expanded_score_cache:
+                cache, signal_valid = _load_expanded_score_cache(
+                    cache_path,
+                    expected_feature_meta=expanded_feature_cache_meta,
+                    expected_signal_meta=expanded_signal_cache_meta,
+                )
+            if cache is not None:
+                valid_proposals, category_scores, pair_signal, image_features = _expanded_cache_to_arrays(cache)
+                base_scores = _expanded_base_scores_from_category_scores(
+                    valid_proposals,
+                    category_scores,
+                    num_categories=len(category_ids),
+                    mode=args.expanded_base_score,
+                    missing_category_score_scale=args.missing_category_score_scale,
+                )
+                if not signal_valid:
+                    if image_features is None:
+                        cache = None
+                    else:
+                        pair_signal = _score_expanded_pair_signal(
+                            image_features=image_features,
+                            text_features=text_features,
+                            base_scores=base_scores,
+                            verifier=verifier,
+                            verifier_feature_mode=verifier_feature_mode,
+                            args=args,
+                        )
+                        _save_expanded_score_cache(
+                            cache_path,
+                            feature_meta=expanded_feature_cache_meta,
+                            signal_meta=expanded_signal_cache_meta,
+                            proposals=valid_proposals,
+                            category_scores=category_scores,
+                            image_features=image_features,
+                            pair_signal=pair_signal,
+                        )
+                        saved_expanded_score_caches += 1
+                if cache is None:
+                    pass
+                else:
+                    assert pair_signal is not None
+                    pair_scores = _fuse_expanded_pair_scores(
+                        base_scores=base_scores,
+                        pair_signal=pair_signal,
+                        verifier=verifier,
+                        args=args,
+                    )
+                    for proposal_idx, category_idx in _top_matrix_indices(pair_scores, args.keep_topk_per_image):
+                        proposal = valid_proposals[proposal_idx]
+                        cat_id = category_ids[category_idx]
+                        pred = {
+                            "image_id": int(image_id),
+                            "category_id": int(cat_id),
+                            "bbox": [float(v) for v in proposal["bbox"]],
+                            "score": float(pair_scores[proposal_idx, category_idx]),
+                        }
+                        if args.include_debug_fields:
+                            pred["proposal_score"] = float(proposal["score"])
+                            pred["base_score"] = float(base_scores[proposal_idx, category_idx])
+                            pred["source_category_id"] = int(proposal["source_category_id"])
+                        reranked_results.append(pred)
+                    reused_expanded_score_caches += 1
+                    continue
 
         image_path = _resolve_image_path(args.image_root, str(image_info["file_name"]))
         if not image_path.exists():
@@ -554,21 +828,43 @@ def rerank(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     batch_size=args.image_batch_size,
                     device=device,
                 )
-                base_scores = _expanded_base_scores(
+                category_scores = _expanded_category_scores(
                     valid_proposals,
                     preds,
                     category_to_row=category_to_row,
                     num_categories=len(category_ids),
-                    mode=args.expanded_base_score,
                     match_iou=args.category_score_match_iou,
+                )
+                base_scores = _expanded_base_scores_from_category_scores(
+                    valid_proposals,
+                    category_scores,
+                    num_categories=len(category_ids),
+                    mode=args.expanded_base_score,
                     missing_category_score_scale=args.missing_category_score_scale,
                 )
-                pair_scores = _score_expanded_pairs(
+                pair_signal = _score_expanded_pair_signal(
                     image_features=image_features,
                     text_features=text_features,
                     base_scores=base_scores,
                     verifier=verifier,
                     verifier_feature_mode=verifier_feature_mode,
+                    args=args,
+                )
+                if args.expanded_score_cache_dir is not None:
+                    _save_expanded_score_cache(
+                        _expanded_score_cache_path(args.expanded_score_cache_dir, image_id),
+                        feature_meta=expanded_feature_cache_meta,
+                        signal_meta=expanded_signal_cache_meta,
+                        proposals=valid_proposals,
+                        category_scores=category_scores,
+                        image_features=image_features,
+                        pair_signal=pair_signal,
+                    )
+                    saved_expanded_score_caches += 1
+                pair_scores = _fuse_expanded_pair_scores(
+                    base_scores=base_scores,
+                    pair_signal=pair_signal,
+                    verifier=verifier,
                     args=args,
                 )
                 processed_crops += len(crop_tensors)
@@ -671,6 +967,8 @@ def rerank(args: argparse.Namespace) -> List[Dict[str, Any]]:
     print(f"processed crops: {processed_crops}")
     print(f"missing images: {missing_images}")
     print(f"invalid crops: {invalid_crops}")
+    print(f"reused expanded score caches: {reused_expanded_score_caches}")
+    print(f"saved expanded score caches: {saved_expanded_score_caches}")
     return reranked_results
 
 
@@ -848,6 +1146,25 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=8192,
         help="Batch size for verifier scoring in --expand-all-phrases mode.",
+    )
+    parser.add_argument(
+        "--expanded-score-cache-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional per-image cache directory for --expand-all-phrases pair signals. "
+            "Caches selected proposals, matched category scores, and verifier logits or CLIP scores."
+        ),
+    )
+    parser.add_argument(
+        "--reuse-expanded-score-cache",
+        action="store_true",
+        help="Reuse compatible per-image expanded score caches when available.",
+    )
+    parser.add_argument(
+        "--overwrite-expanded-score-cache",
+        action="store_true",
+        help="Recompute and overwrite expanded score caches even when compatible cache files exist.",
     )
     parser.add_argument(
         "--image-batch-size",

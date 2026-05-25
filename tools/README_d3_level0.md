@@ -1862,6 +1862,39 @@ python tools/rerank_d3_predictions_with_clip_crops.py \
   --eval
 ```
 
+Expanded all-phrase reranking is expensive because the same proposal crops are
+encoded for every sweep. Cache the expanded proposal features and pair signals
+before scanning `missing-category-score-scale` / verifier weights:
+
+```bash
+python tools/rerank_d3_predictions_with_clip_crops.py \
+  --annotation dataset/d3/annotations/d3_intra_full.json \
+  --image-root dataset/d3/images \
+  --phrases-json dataset/metadata/d3_phrases.json \
+  --predictions "$TMP_OUT/d3_owlv2_large_allval/d3_intra_full/results.json" \
+  --output "$TMP_OUT/d3_owlv2_large_train/proposal_iou_crop_verifier_160k_eval/d3_intra_full/category_score_s0.05_w0.5_results.json" \
+  --expand-all-phrases \
+  --expanded-base-score category_score \
+  --missing-category-score-scale 0.05 \
+  --proposal-topk-per-image 100 \
+  --proposal-nms-thresh 0.9 \
+  --keep-topk-per-image 100 \
+  --verifier-checkpoint "$TMP_OUT/d3_owlv2_large_train/proposal_iou_crop_verifier_160k/verifier_best.pt" \
+  --verifier-fusion logit_add \
+  --verifier-fusion-weight 0.5 \
+  --expanded-score-cache-dir "$TMP_OUT/d3_owlv2_large_train/proposal_iou_crop_verifier_160k_eval/d3_intra_full/expanded_score_cache" \
+  --reuse-expanded-score-cache \
+  --eval
+```
+
+For the same `missing-category-score-scale`, later `--verifier-fusion-weight`
+sweeps reuse cached verifier logits and only refusion/rank the saved matrix.
+When changing `missing-category-score-scale`, the script reuses cached crop
+features and category scores, then recomputes verifier logits without opening
+and encoding the crops again. Use `--overwrite-expanded-score-cache` only when
+proposal selection, crop settings, model/checkpoint, or phrase metadata changed
+and the old cache should be replaced.
+
 For expensive reranking runs, use the saved JSON to rerun COCOeval without
 reranking again:
 
