@@ -1791,6 +1791,7 @@ python tools/run_d3_groundingdino_proposals.py \
   --box-threshold 0.15 \
   --text-threshold 0.20 \
   --label-match-threshold 0.45 \
+  --dtype float32 \
   --keep-topk-per-image 300 \
   --max-images 200 \
   --eval
@@ -1827,6 +1828,7 @@ python tools/run_d3_groundingdino_proposals.py \
   --box-threshold 0.15 \
   --text-threshold 0.20 \
   --label-match-threshold 0.45 \
+  --dtype float32 \
   --keep-topk-per-image 300 \
   --eval
 ```

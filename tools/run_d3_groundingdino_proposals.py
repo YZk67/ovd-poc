@@ -420,7 +420,12 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Lowercase the joined caption before tokenization.",
     )
-    parser.add_argument("--dtype", choices=("auto", "float16", "bfloat16", "float32"), default="auto")
+    parser.add_argument(
+        "--dtype",
+        choices=("auto", "float16", "bfloat16", "float32"),
+        default="float32",
+        help="GroundingDINO's HF implementation can hit mixed text dtype errors in fp16; float32 is safer.",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--eval", action="store_true")
     parser.add_argument("--eval-output-images-only", action="store_true")
