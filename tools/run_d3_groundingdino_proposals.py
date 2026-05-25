@@ -10,6 +10,7 @@ text labels are mapped back to the D3 phrase bank.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import re
 from pathlib import Path
@@ -178,23 +179,30 @@ def _post_process_grounded(
         )
 
     input_ids = inputs.get("input_ids")
+    signature = inspect.signature(post_process)
+    parameters = signature.parameters
+    kwargs = {"outputs": outputs, "target_sizes": target_sizes}
+    if "input_ids" in parameters:
+        kwargs["input_ids"] = input_ids
+    if "box_threshold" in parameters:
+        kwargs["box_threshold"] = args.box_threshold
+    elif "threshold" in parameters:
+        kwargs["threshold"] = args.box_threshold
+    if "text_threshold" in parameters:
+        kwargs["text_threshold"] = args.text_threshold
+
     attempts = (
+        lambda: post_process(**kwargs),
         lambda: post_process(
-            outputs=outputs,
-            input_ids=input_ids,
-            box_threshold=args.box_threshold,
+            outputs,
+            input_ids,
+            threshold=args.box_threshold,
             text_threshold=args.text_threshold,
             target_sizes=target_sizes,
         ),
         lambda: post_process(
             outputs,
             input_ids,
-            box_threshold=args.box_threshold,
-            text_threshold=args.text_threshold,
-            target_sizes=target_sizes,
-        ),
-        lambda: post_process(
-            outputs=outputs,
             box_threshold=args.box_threshold,
             text_threshold=args.text_threshold,
             target_sizes=target_sizes,
