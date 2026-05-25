@@ -1895,6 +1895,110 @@ and encoding the crops again. Use `--overwrite-expanded-score-cache` only when
 proposal selection, crop settings, model/checkpoint, or phrase metadata changed
 and the old cache should be replaced.
 
+After the calibration sweep, treat `S=0.30, W=0.45` as the current top100
+working point. Before changing verifier architecture, probe whether more
+proposals help:
+
+```bash
+CACHE_DIR_200="$TMP_OUT/d3_owlv2_large_train/proposal_iou_crop_verifier_160k_eval/d3_intra_full/expanded_score_cache_top200_nms09"
+
+python tools/rerank_d3_predictions_with_clip_crops.py \
+  --annotation dataset/d3/annotations/d3_intra_full.json \
+  --image-root dataset/d3/images \
+  --phrases-json dataset/metadata/d3_phrases.json \
+  --predictions "$TMP_OUT/d3_owlv2_large_allval/d3_intra_full/results.json" \
+  --output "$TMP_OUT/d3_owlv2_large_train/proposal_iou_crop_verifier_160k_eval/d3_intra_full/category_score_top200_s0.3_w0.45_results.json" \
+  --expand-all-phrases \
+  --expanded-base-score category_score \
+  --missing-category-score-scale 0.3 \
+  --proposal-topk-per-image 200 \
+  --proposal-nms-thresh 0.9 \
+  --keep-topk-per-image 100 \
+  --verifier-checkpoint "$TMP_OUT/d3_owlv2_large_train/proposal_iou_crop_verifier_160k/verifier_best.pt" \
+  --verifier-fusion logit_add \
+  --verifier-fusion-weight 0.45 \
+  --expanded-score-cache-dir "$CACHE_DIR_200" \
+  --reuse-expanded-score-cache \
+  --eval
+```
+
+If top200 does not beat top100, keep proposal top-k at 100 and move to a
+stronger phrase scorer. The token-level verifier can train directly on the
+OWLv2 `proposal_iou` pairs:
+
+```bash
+python tools/train_d3_token_cross_verifier.py \
+  --train-jsonl "$TMP_OUT/d3_owlv2_large_train/proposal_iou_pairs/train.jsonl" \
+  --val-jsonl "$TMP_OUT/d3_owlv2_large_train/proposal_iou_pairs/val.jsonl" \
+  --image-root dataset/d3/images \
+  --output-dir "$TMP_OUT/d3_owlv2_large_train/proposal_iou_token_cross_verifier_rank_160k" \
+  --clip-backend open_clip \
+  --clip-model ViT-L-14 \
+  --clip-pretrained laion2b_s32b_b82k \
+  --max-train-samples 160000 \
+  --max-val-samples 40000 \
+  --epochs 1 \
+  --batch-size 8 \
+  --eval-batch-size 16 \
+  --loss-type bce_pairwise \
+  --rank-group image_category \
+  --rank-neg-types wrong_phrase_same_region:global_wrong_phrase,wrong_phrase_same_region:present_wrong_phrase,same_phrase_bad_box \
+  --rank-loss-weight 1.0
+```
+
+For token-verifier inference, first refresh the expanded crop-verifier cache at
+the same `S/W` used for candidate preselection:
+
+```bash
+python tools/rerank_d3_predictions_with_clip_crops.py \
+  --annotation dataset/d3/annotations/d3_intra_full.json \
+  --image-root dataset/d3/images \
+  --phrases-json dataset/metadata/d3_phrases.json \
+  --predictions "$TMP_OUT/d3_owlv2_large_allval/d3_intra_full/results.json" \
+  --output "$TMP_OUT/d3_owlv2_large_train/proposal_iou_crop_verifier_160k_eval/d3_intra_full/category_score_s0.3_w0.45_results.json" \
+  --expand-all-phrases \
+  --expanded-base-score category_score \
+  --missing-category-score-scale 0.3 \
+  --proposal-topk-per-image 100 \
+  --proposal-nms-thresh 0.9 \
+  --keep-topk-per-image 100 \
+  --verifier-checkpoint "$TMP_OUT/d3_owlv2_large_train/proposal_iou_crop_verifier_160k/verifier_best.pt" \
+  --verifier-fusion logit_add \
+  --verifier-fusion-weight 0.45 \
+  --expanded-score-cache-dir "$CACHE_DIR" \
+  --reuse-expanded-score-cache
+```
+
+Then use the cache as a first-stage candidate scorer and run token
+cross-attention only on the top box/phrase pairs:
+
+```bash
+python tools/rerank_d3_predictions_with_token_verifier.py \
+  --annotation dataset/d3/annotations/d3_intra_full.json \
+  --image-root dataset/d3/images \
+  --phrases-json dataset/metadata/d3_phrases.json \
+  --predictions "$TMP_OUT/d3_owlv2_large_allval/d3_intra_full/results.json" \
+  --verifier-checkpoint "$TMP_OUT/d3_owlv2_large_train/proposal_iou_token_cross_verifier_rank_160k/verifier_best.pt" \
+  --output "$TMP_OUT/d3_owlv2_large_train/proposal_iou_token_cross_verifier_rank_160k_eval/d3_intra_full/cache_top1000_s0.3_w0.45_token_w0.5_results.json" \
+  --candidate-source cache_signal \
+  --candidate-score-cache-dir "$CACHE_DIR" \
+  --candidate-topk-per-image 1000 \
+  --expanded-base-score category_score \
+  --missing-category-score-scale 0.3 \
+  --candidate-verifier-fusion logit_add \
+  --candidate-verifier-fusion-weight 0.45 \
+  --proposal-topk-per-image 100 \
+  --proposal-nms-thresh 0.9 \
+  --keep-topk-per-image 100 \
+  --token-base-score candidate_score \
+  --token-fusion logit_add \
+  --token-fusion-weight 0.5 \
+  --eval
+```
+
+Use `--candidate-topk-per-image 500` for the first smoke run if full-val token
+reranking is too slow.
+
 For expensive reranking runs, use the saved JSON to rerun COCOeval without
 reranking again:
 

@@ -65,6 +65,10 @@ def _negative_kind(row: Mapping[str, Any]) -> str:
     return str(value) if value is not None else "positive"
 
 
+def _is_wrong_phrase_negative(kind: str) -> bool:
+    return kind == "wrong_phrase_good_box" or kind.startswith("wrong_phrase_same_region:")
+
+
 def _resolve_image_path(image_root: Path, file_name: str) -> Path:
     file_path = Path(file_name)
     if file_path.is_absolute() and file_path.exists():
@@ -120,7 +124,11 @@ def _sample_rows(
 ) -> List[Dict[str, Any]]:
     rng = random.Random(seed)
     positives = [dict(row) for row in rows if int(row.get("label", 0)) == 1]
-    wrong = [dict(row) for row in rows if int(row.get("label", 0)) == 0 and _negative_kind(row) == "wrong_phrase_good_box"]
+    wrong = [
+        dict(row)
+        for row in rows
+        if int(row.get("label", 0)) == 0 and _is_wrong_phrase_negative(_negative_kind(row))
+    ]
     same = [dict(row) for row in rows if int(row.get("label", 0)) == 0 and _negative_kind(row) == "same_phrase_bad_box"]
     background = [dict(row) for row in rows if int(row.get("label", 0)) == 0 and _negative_kind(row) == "background_bad_box"]
     other_neg = [
@@ -1055,7 +1063,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--rank-neg-types",
-        default="wrong_phrase_good_box,same_phrase_bad_box",
+        default=(
+            "wrong_phrase_good_box,"
+            "wrong_phrase_same_region:global_wrong_phrase,"
+            "wrong_phrase_same_region:present_wrong_phrase,"
+            "same_phrase_bad_box"
+        ),
         help="Comma-separated negative_type list for ranking, or 'all'.",
     )
     parser.add_argument("--ranking-margin", type=float, default=0.0)
