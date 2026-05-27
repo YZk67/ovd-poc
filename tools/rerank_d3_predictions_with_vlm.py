@@ -284,6 +284,8 @@ class QwenVLScorer:
             min_pixels=args.min_pixels,
             max_pixels=args.max_pixels,
         )
+        if hasattr(self.processor, "tokenizer"):
+            self.processor.tokenizer.padding_side = "left"
         self.process_vision_info = process_vision_info
         self.device = args.device
         self.max_new_tokens = int(args.max_new_tokens)
