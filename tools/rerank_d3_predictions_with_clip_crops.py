@@ -45,6 +45,13 @@ def _save_json(path: Path, data: Any) -> None:
         json.dump(data, f, separators=(",", ":"))
 
 
+def _jsonable_args(args: argparse.Namespace) -> Dict[str, Any]:
+    values = {}
+    for key, value in vars(args).items():
+        values[key] = str(value) if isinstance(value, Path) else value
+    return values
+
+
 def _load_categories(annotation: Mapping[str, Any], phrases_json: Optional[Path]) -> Dict[int, str]:
     if phrases_json is not None:
         phrases = _load_json(phrases_json)
@@ -795,7 +802,7 @@ def _evaluate_coco(
     results: Sequence[Mapping[str, Any]],
     *,
     image_ids: Optional[Sequence[int]] = None,
-) -> None:
+) -> Dict[str, float]:
     from pycocotools.coco import COCO
     from pycocotools.cocoeval import COCOeval
 
@@ -811,6 +818,21 @@ def _evaluate_coco(
     evaluator.evaluate()
     evaluator.accumulate()
     evaluator.summarize()
+    names = [
+        "AP",
+        "AP50",
+        "AP75",
+        "APs",
+        "APm",
+        "APl",
+        "AR1",
+        "AR10",
+        "AR100",
+        "ARs",
+        "ARm",
+        "ARl",
+    ]
+    return {name: float(value) for name, value in zip(names, evaluator.stats)}
 
 
 def rerank(args: argparse.Namespace) -> List[Dict[str, Any]]:
@@ -1375,6 +1397,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--summary-output",
+        type=Path,
+        default=None,
+        help="Optional JSON path for args, output counts, and COCOeval metrics.",
+    )
+    parser.add_argument(
         "--include-debug-fields",
         action="store_true",
         help="Store det_score and clip_score in output predictions.",
@@ -1387,6 +1415,11 @@ def main() -> None:
     results = rerank(args)
     _save_json(args.output, results)
     print(f"saved reranked predictions to {args.output}")
+    summary: Dict[str, Any] = {
+        "args": _jsonable_args(args),
+        "output_predictions": len(results),
+        "output_images": len({int(result["image_id"]) for result in results}),
+    }
     if args.eval:
         eval_image_ids = None
         output_image_ids = sorted({int(result["image_id"]) for result in results})
@@ -1401,7 +1434,13 @@ def main() -> None:
                     "evaluation output covers a subset of annotation images; "
                     f"restricting COCOeval to output image ids: {len(output_image_ids)}"
                 )
-        _evaluate_coco(args.annotation, results, image_ids=eval_image_ids)
+        summary["eval_image_ids"] = None if eval_image_ids is None else len(set(eval_image_ids))
+        summary["coco_eval"] = _evaluate_coco(args.annotation, results, image_ids=eval_image_ids)
+
+    if args.summary_output is not None or args.eval:
+        summary_output = args.summary_output or args.output.with_suffix(args.output.suffix + ".summary.json")
+        _save_json(summary_output, summary)
+        print(f"saved summary to {summary_output}")
 
 
 if __name__ == "__main__":
