@@ -187,6 +187,10 @@ class D3CandidateCropDataset(Dataset):
         image_root: Path,
         prompt_template: str,
         rank_group: str,
+        target_field: str,
+        weight_field: Optional[str],
+        positive_threshold: float,
+        positive_weight: float,
     ) -> None:
         self.rows = [dict(row) for row in rows]
         self.image_root = image_root
@@ -205,6 +209,13 @@ class D3CandidateCropDataset(Dataset):
                 for image_id, category_id in zip(self.image_ids, self.target_category_ids)
             ]
         self.labels = [float(row.get("label", 0.0)) for row in self.rows]
+        self.targets = [float(row.get(target_field, row.get("label", 0.0))) for row in self.rows]
+        self.weights = []
+        for target, row in zip(self.targets, self.rows):
+            weight = float(row.get(weight_field, 1.0)) if weight_field else 1.0
+            if target >= positive_threshold:
+                weight *= positive_weight
+            self.weights.append(float(weight))
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -218,6 +229,8 @@ class D3CandidateCropDataset(Dataset):
             "phrase": str(row["phrase"]),
             "text": self.prompt_template.format(phrase=str(row["phrase"])),
             "label": float(row.get("label", 0)),
+            "target": float(self.targets[index]),
+            "weight": float(self.weights[index]),
             "target_category_id": self.target_category_ids[index],
             "group_id": self.group_ids[index],
             "detector_score": float(row.get("detector_score", row.get("score", 0.0))),
@@ -565,6 +578,33 @@ def _binary_metrics(scores: np.ndarray, labels: np.ndarray) -> Dict[str, float]:
     }
 
 
+def _subset_metrics(
+    scores: np.ndarray,
+    labels: np.ndarray,
+    negative_types: Sequence[str],
+    *,
+    prefix: str,
+) -> Dict[str, float]:
+    if prefix == "overall":
+        mask = np.ones(len(labels), dtype=bool)
+    elif prefix == "same_phrase_bad_box":
+        mask = np.asarray(
+            [(label == 1) or (kind == "same_phrase_bad_box") for label, kind in zip(labels, negative_types)],
+            dtype=bool,
+        )
+    elif prefix == "wrong_phrase_same_region":
+        mask = np.asarray(
+            [
+                (label == 1) or str(kind).startswith("wrong_phrase_same_region")
+                for label, kind in zip(labels, negative_types)
+            ],
+            dtype=bool,
+        )
+    else:
+        raise ValueError(prefix)
+    return _binary_metrics(scores[mask], labels[mask])
+
+
 def _collate_rows(
     batch: Sequence[Mapping[str, Any]],
     *,
@@ -576,6 +616,8 @@ def _collate_rows(
     images = []
     texts = []
     labels = []
+    targets = []
+    weights = []
     detector_scores = []
     group_ids = []
     target_category_ids = []
@@ -597,6 +639,8 @@ def _collate_rows(
         images.append(preprocess(image.crop(xyxy)))
         texts.append(str(row["text"]))
         labels.append(float(row["label"]))
+        targets.append(float(row["target"]))
+        weights.append(float(row["weight"]))
         detector_scores.append(float(row["detector_score"]))
         group_ids.append(int(row["group_id"]))
         target_category_ids.append(int(row["target_category_id"]))
@@ -607,6 +651,8 @@ def _collate_rows(
         image_tensor = torch.stack(images, dim=0)
         text_tokens = tokenizer(texts)
         label_tensor = torch.tensor(labels, dtype=torch.float32)
+        target_tensor = torch.tensor(targets, dtype=torch.float32)
+        weight_tensor = torch.tensor(weights, dtype=torch.float32)
         score_tensor = torch.tensor(detector_scores, dtype=torch.float32)
         group_tensor = torch.tensor(group_ids, dtype=torch.long)
         target_category_tensor = torch.tensor(target_category_ids, dtype=torch.long)
@@ -614,6 +660,8 @@ def _collate_rows(
         image_tensor = torch.empty(0)
         text_tokens = torch.empty(0, dtype=torch.long)
         label_tensor = torch.empty(0, dtype=torch.float32)
+        target_tensor = torch.empty(0, dtype=torch.float32)
+        weight_tensor = torch.empty(0, dtype=torch.float32)
         score_tensor = torch.empty(0, dtype=torch.float32)
         group_tensor = torch.empty(0, dtype=torch.long)
         target_category_tensor = torch.empty(0, dtype=torch.long)
@@ -622,6 +670,8 @@ def _collate_rows(
         "images": image_tensor,
         "text_tokens": text_tokens,
         "labels": label_tensor,
+        "targets": target_tensor,
+        "weights": weight_tensor,
         "detector_scores": score_tensor,
         "group_ids": group_tensor,
         "target_category_ids": target_category_tensor,
@@ -662,16 +712,18 @@ def _parse_rank_neg_types(value: str) -> Optional[set]:
 
 def _pairwise_rank_loss(
     logits: torch.Tensor,
-    labels: torch.Tensor,
+    targets: torch.Tensor,
     group_ids: torch.Tensor,
     negative_types: Sequence[str],
     *,
     margin: float,
     rank_neg_types: Optional[set],
     max_pairs_per_group: int,
+    positive_threshold: float,
+    negative_threshold: float,
 ) -> Tuple[torch.Tensor, int, int]:
     if rank_neg_types is None:
-        neg_type_mask = torch.ones_like(labels, dtype=torch.bool)
+        neg_type_mask = torch.ones_like(targets, dtype=torch.bool)
     else:
         neg_type_mask = torch.tensor(
             [str(kind) in rank_neg_types for kind in negative_types],
@@ -684,8 +736,8 @@ def _pairwise_rank_loss(
     rank_group_count = 0
     for group_id in torch.unique(group_ids):
         in_group = group_ids == group_id
-        pos_logits = logits[in_group & (labels > 0.5)]
-        neg_logits = logits[in_group & (labels <= 0.5) & neg_type_mask]
+        pos_logits = logits[in_group & (targets >= positive_threshold)]
+        neg_logits = logits[in_group & (targets <= negative_threshold) & neg_type_mask]
         if pos_logits.numel() == 0 or neg_logits.numel() == 0:
             continue
 
@@ -705,7 +757,9 @@ def _pairwise_rank_loss(
 
 def _compute_train_loss(
     logits: torch.Tensor,
+    targets: torch.Tensor,
     labels: torch.Tensor,
+    weights: torch.Tensor,
     group_ids: torch.Tensor,
     negative_types: Sequence[str],
     *,
@@ -713,15 +767,19 @@ def _compute_train_loss(
     pos_weight: torch.Tensor,
     rank_neg_types: Optional[set],
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    bce_loss = F.binary_cross_entropy_with_logits(logits, labels, pos_weight=pos_weight)
+    bce_terms = F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight, reduction="none")
+    weights = weights.to(device=logits.device, dtype=bce_terms.dtype)
+    bce_loss = (bce_terms * weights).sum() / weights.sum().clamp_min(1e-6)
     rank_loss, rank_pair_count, rank_group_count = _pairwise_rank_loss(
         logits,
-        labels,
+        targets,
         group_ids,
         negative_types,
         margin=args.ranking_margin,
         rank_neg_types=rank_neg_types,
         max_pairs_per_group=args.rank_max_pairs_per_group,
+        positive_threshold=args.ranking_positive_threshold,
+        negative_threshold=args.ranking_negative_threshold,
     )
 
     if args.loss_type == "bce":
@@ -752,6 +810,7 @@ def evaluate(
     logits_all = []
     labels_all = []
     detector_scores_all = []
+    negative_types_all: List[str] = []
     invalid_crops = 0
     missing_images = 0
     with torch.no_grad():
@@ -769,6 +828,7 @@ def evaluate(
             logits_all.append(logits.detach().cpu())
             labels_all.append(batch["labels"].detach().cpu())
             detector_scores_all.append(batch["detector_scores"].detach().cpu())
+            negative_types_all.extend(str(kind) for kind in batch["negative_types"])
 
     if not logits_all:
         raise RuntimeError("No validation samples were encoded.")
@@ -778,6 +838,18 @@ def evaluate(
     detector_np = torch.cat(detector_scores_all).numpy()
     return {
         "token_verifier": _binary_metrics(logits_np, labels_np),
+        "token_verifier_same_phrase": _subset_metrics(
+            logits_np,
+            labels_np,
+            negative_types_all,
+            prefix="same_phrase_bad_box",
+        ),
+        "token_verifier_wrong_phrase": _subset_metrics(
+            logits_np,
+            labels_np,
+            negative_types_all,
+            prefix="wrong_phrase_same_region",
+        ),
         "detector_score": _binary_metrics(detector_np, labels_np),
         "invalid_crops": invalid_crops,
         "missing_images": missing_images,
@@ -809,6 +881,10 @@ def _save_checkpoint(
         "openai_clip_model": args.openai_clip_model,
         "prompt_template": args.prompt_template,
         "crop_margin": args.crop_margin,
+        "target_field": args.target_field,
+        "weight_field": args.weight_field,
+        "positive_threshold": args.positive_threshold,
+        "positive_weight": args.positive_weight,
         "epoch": epoch,
         "score": score,
         "history": list(history),
@@ -872,12 +948,20 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
         image_root=args.image_root,
         prompt_template=args.prompt_template,
         rank_group=args.rank_group,
+        target_field=args.target_field,
+        weight_field=args.weight_field,
+        positive_threshold=args.positive_threshold,
+        positive_weight=args.positive_weight,
     )
     val_dataset = D3CandidateCropDataset(
         val_rows,
         image_root=args.image_root,
         prompt_template=args.prompt_template,
         rank_group=args.rank_group,
+        target_field=args.target_field,
+        weight_field=args.weight_field,
+        positive_threshold=args.positive_threshold,
+        positive_weight=args.positive_weight,
     )
 
     collate = lambda batch: _collate_rows(  # noqa: E731
@@ -954,10 +1038,14 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
             if logits is None:
                 continue
             labels = batch["labels"].to(device)
+            targets = batch["targets"].to(device)
+            weights = batch["weights"].to(device)
             group_ids = batch["group_ids"].to(device)
             loss, loss_parts = _compute_train_loss(
                 logits,
+                targets,
                 labels,
+                weights,
                 group_ids,
                 batch["negative_types"],
                 args=args,
@@ -1035,6 +1123,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clip-pretrained", default="openai", help="OpenCLIP pretrained tag.")
     parser.add_argument("--openai-clip-model", default="ViT-L/14")
     parser.add_argument("--crop-margin", type=float, default=0.25)
+    parser.add_argument(
+        "--target-field",
+        default="label",
+        help="JSONL field used as BCE target. Use soft_label for Qwen distillation rows.",
+    )
+    parser.add_argument("--weight-field", default=None, help="Optional JSONL field used as per-row loss weight.")
+    parser.add_argument("--positive-threshold", type=float, default=0.5)
+    parser.add_argument("--positive-weight", type=float, default=1.0)
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
@@ -1072,6 +1168,8 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated negative_type list for ranking, or 'all'.",
     )
     parser.add_argument("--ranking-margin", type=float, default=0.0)
+    parser.add_argument("--ranking-positive-threshold", type=float, default=0.5)
+    parser.add_argument("--ranking-negative-threshold", type=float, default=0.3)
     parser.add_argument(
         "--rank-loss-weight",
         type=float,
