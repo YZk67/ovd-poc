@@ -78,6 +78,14 @@ def _negative_type(*, label: int, target_category_id: int, source_category_id: i
     return "wrong_phrase_same_region:vlm_soft"
 
 
+def _rank_weight(rank: int, *, focus_topk: int, power: float, min_weight: float) -> float:
+    if focus_topk <= 0:
+        return 1.0
+    rank = max(1, int(rank))
+    weight = (float(focus_topk) / float(rank)) ** float(power)
+    return max(float(min_weight), min(1.0, weight))
+
+
 def build_pairs(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     annotation = _load_json(args.annotation)
     predictions = _load_json(args.predictions)
@@ -141,6 +149,7 @@ def build_pairs(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Dict[st
         )
 
         split = "val" if image_id in val_ids else "train"
+        image_items: List[Dict[str, Any]] = []
         for vlm_row in vlm_rows_by_image[image_id]:
             if args.require_parse_ok and not bool(vlm_row.get("parse_ok", False)):
                 skipped_parse_failures += 1
@@ -157,7 +166,29 @@ def build_pairs(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Dict[st
                 continue
 
             proposal_idx, proposal = proposal_item
+            base_score = float(base_scores[proposal_idx, category_idx])
             soft_label = float(np.clip(float(vlm_row["vlm_score"]), 0.0, 1.0))
+            image_items.append(
+                {
+                    "vlm_row": vlm_row,
+                    "proposal_idx": int(proposal_idx),
+                    "proposal": proposal,
+                    "category_idx": int(category_idx),
+                    "target_category_id": int(target_category_id),
+                    "base_score": base_score,
+                    "soft_label": soft_label,
+                }
+            )
+
+        image_items.sort(key=lambda item: float(item["base_score"]), reverse=True)
+        for candidate_rank, item in enumerate(image_items, start=1):
+            proposal = item["proposal"]
+            proposal_idx = int(item["proposal_idx"])
+            target_category_id = int(item["target_category_id"])
+            category_idx = int(item["category_idx"])
+            vlm_row = item["vlm_row"]
+            base_score = float(item["base_score"])
+            soft_label = float(item["soft_label"])
             label = int(soft_label >= args.positive_threshold)
             source_category_id = int(proposal.get("source_category_id", -1))
             negative_type = _negative_type(
@@ -165,6 +196,14 @@ def build_pairs(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Dict[st
                 target_category_id=target_category_id,
                 source_category_id=source_category_id,
             )
+            sample_weight = _rank_weight(
+                candidate_rank,
+                focus_topk=args.rank_focus_topk,
+                power=args.rank_weight_power,
+                min_weight=args.min_rank_weight,
+            )
+            if args.soft_label_weight > 0:
+                sample_weight *= 1.0 + args.soft_label_weight * soft_label
             row = {
                 "split": split,
                 "image_id": int(image_id),
@@ -175,9 +214,13 @@ def build_pairs(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Dict[st
                 "detector_category_id": source_category_id,
                 "target_category_id": target_category_id,
                 "phrase": str(categories_by_id[target_category_id]),
-                "detector_score": float(base_scores[proposal_idx, category_idx]),
+                "detector_score": base_score,
                 "proposal_score": float(proposal["score"]),
-                "candidate_score": float(base_scores[proposal_idx, category_idx]),
+                "candidate_score": base_score,
+                "proposal_idx": proposal_idx,
+                "category_idx": category_idx,
+                "candidate_rank": int(candidate_rank),
+                "sample_weight": float(sample_weight),
                 "soft_label": soft_label,
                 "label": label,
                 "vlm_score": soft_label,
@@ -221,6 +264,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--category-score-match-iou", type=float, default=0.9)
     parser.add_argument("--missing-category-score-scale", type=float, default=0.3)
     parser.add_argument("--positive-threshold", type=float, default=0.5)
+    parser.add_argument("--rank-focus-topk", type=int, default=20)
+    parser.add_argument("--rank-weight-power", type=float, default=0.5)
+    parser.add_argument("--min-rank-weight", type=float, default=0.25)
+    parser.add_argument("--soft-label-weight", type=float, default=0.0)
     parser.add_argument("--require-parse-ok", action="store_true")
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)

@@ -27,7 +27,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageDraw
 from tqdm import tqdm
 
 
@@ -208,6 +208,41 @@ def _expanded_xyxy(
     if x1 <= x0 + 1 or y1 <= y0 + 1:
         return None
     return int(math.floor(x0)), int(math.floor(y0)), int(math.ceil(x1)), int(math.ceil(y1))
+
+
+def _draw_boxed_image(
+    image: Image.Image,
+    xyxy: Tuple[int, int, int, int],
+    *,
+    line_width: int,
+) -> Image.Image:
+    boxed = image.copy()
+    draw = ImageDraw.Draw(boxed)
+    x0, y0, x1, y1 = xyxy
+    width = max(2, int(line_width))
+    for offset in range(width):
+        draw.rectangle((x0 - offset, y0 - offset, x1 + offset, y1 + offset), outline=(255, 0, 0), width=1)
+    return boxed
+
+
+def _make_region_image(
+    image: Image.Image,
+    bbox_xywh: Sequence[float],
+    *,
+    image_mode: str,
+    crop_margin: float,
+    box_line_width: int,
+) -> Optional[Image.Image]:
+    width, height = image.size
+    tight_xyxy = _expanded_xyxy(bbox_xywh, width=width, height=height, margin=0.0)
+    if tight_xyxy is None:
+        return None
+    if image_mode == "boxed":
+        return _draw_boxed_image(image, tight_xyxy, line_width=box_line_width)
+    if image_mode == "crop":
+        crop_xyxy = _expanded_xyxy(bbox_xywh, width=width, height=height, margin=crop_margin)
+        return image.crop(crop_xyxy) if crop_xyxy is not None else None
+    raise ValueError(f"Unsupported image mode: {image_mode}")
 
 
 def _sigmoid(value: float) -> float:
@@ -469,7 +504,9 @@ def _expanded_feature_cache_meta(
         "prompt_template": str(args.prompt_template),
         "model": str(args.model),
         "pretrained": str(args.pretrained),
+        "image_mode": str(args.image_mode),
         "crop_margin": float(args.crop_margin),
+        "box_line_width": int(args.box_line_width),
         "proposal_topk_per_image": int(args.proposal_topk_per_image),
         "proposal_nms_thresh": float(args.proposal_nms_thresh),
         "category_score_match_iou": float(args.category_score_match_iou),
@@ -814,11 +851,17 @@ def rerank(args: argparse.Namespace) -> List[Dict[str, Any]]:
             crop_tensors = []
             valid_proposals: List[Dict[str, Any]] = []
             for proposal in proposals:
-                xyxy = _expanded_xyxy(proposal["bbox"], width=width, height=height, margin=args.crop_margin)
-                if xyxy is None:
+                region_image = _make_region_image(
+                    image,
+                    proposal["bbox"],
+                    image_mode=args.image_mode,
+                    crop_margin=args.crop_margin,
+                    box_line_width=args.box_line_width,
+                )
+                if region_image is None:
                     invalid_crops += 1
                     continue
-                crop_tensors.append(preprocess(image.crop(xyxy)))
+                crop_tensors.append(preprocess(region_image))
                 valid_proposals.append(proposal)
 
             if crop_tensors:
@@ -896,12 +939,17 @@ def rerank(args: argparse.Namespace) -> List[Dict[str, Any]]:
             cat_id = int(pred["category_id"])
             if cat_id not in category_to_row:
                 continue
-            xyxy = _expanded_xyxy(pred["bbox"], width=width, height=height, margin=args.crop_margin)
-            if xyxy is None:
+            region_image = _make_region_image(
+                image,
+                pred["bbox"],
+                image_mode=args.image_mode,
+                crop_margin=args.crop_margin,
+                box_line_width=args.box_line_width,
+            )
+            if region_image is None:
                 invalid_crops += 1
                 continue
-            crop = image.crop(xyxy)
-            crop_tensors.append(preprocess(crop))
+            crop_tensors.append(preprocess(region_image))
             crop_positions.append(position)
             crop_cat_rows.append(category_to_row[cat_id])
             crop_detector_scores.append(float(pred.get("score", 0.0)))
@@ -1099,6 +1147,13 @@ def parse_args() -> argparse.Namespace:
         default=0.25,
         help="Relative bbox margin added before cropping.",
     )
+    parser.add_argument(
+        "--image-mode",
+        choices=("crop", "boxed"),
+        default="crop",
+        help="Region image passed to OpenCLIP. boxed uses the full image with a red target box.",
+    )
+    parser.add_argument("--box-line-width", type=int, default=6)
     parser.add_argument(
         "--fusion",
         choices=("logit_add", "linear", "replace"),

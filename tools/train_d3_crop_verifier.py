@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Train a lightweight D3 crop-description verifier.
+Train a lightweight D3 image-region-description verifier.
 
 This is intentionally kept outside the detector. It answers one question first:
-given a detector box crop and a target phrase, can a small verifier distinguish
-matching region-description pairs from hard negatives?
+given a detector box region and a target phrase, can a small verifier
+distinguish matching region-description pairs from hard negatives?
 
 Inputs are JSONL files produced by tools/build_d3_verifier_pairs.py.
 The script can either encode OpenCLIP crop/text features into a cache or train
@@ -25,7 +25,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageDraw
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -210,6 +210,41 @@ def _expanded_xyxy(
     return int(math.floor(x0)), int(math.floor(y0)), int(math.ceil(x1)), int(math.ceil(y1))
 
 
+def _draw_boxed_image(
+    image: Image.Image,
+    xyxy: Tuple[int, int, int, int],
+    *,
+    line_width: int,
+) -> Image.Image:
+    boxed = image.copy()
+    draw = ImageDraw.Draw(boxed)
+    x0, y0, x1, y1 = xyxy
+    width = max(2, int(line_width))
+    for offset in range(width):
+        draw.rectangle((x0 - offset, y0 - offset, x1 + offset, y1 + offset), outline=(255, 0, 0), width=1)
+    return boxed
+
+
+def _make_region_image(
+    image: Image.Image,
+    bbox_xywh: Sequence[float],
+    *,
+    image_mode: str,
+    crop_margin: float,
+    box_line_width: int,
+) -> Optional[Image.Image]:
+    width, height = image.size
+    tight_xyxy = _expanded_xyxy(bbox_xywh, width=width, height=height, margin=0.0)
+    if tight_xyxy is None:
+        return None
+    if image_mode == "boxed":
+        return _draw_boxed_image(image, tight_xyxy, line_width=box_line_width)
+    if image_mode == "crop":
+        crop_xyxy = _expanded_xyxy(bbox_xywh, width=width, height=height, margin=crop_margin)
+        return image.crop(crop_xyxy) if crop_xyxy is not None else None
+    raise ValueError(f"Unsupported image mode: {image_mode}")
+
+
 def _load_openclip(model_name: str, pretrained: str, device: str):
     try:
         import open_clip
@@ -279,9 +314,14 @@ def _encode_rows_to_cache(
     rows: Sequence[Mapping[str, Any]],
     *,
     image_root: Path,
+    image_mode: str,
     crop_margin: float,
+    box_line_width: int,
     prompt_template: str,
     target_field: str,
+    weight_field: Optional[str],
+    positive_threshold: float,
+    positive_weight: float,
     model,
     preprocess,
     tokenizer,
@@ -307,6 +347,7 @@ def _encode_rows_to_cache(
     text_feats: List[torch.Tensor] = []
     labels: List[float] = []
     targets: List[float] = []
+    weights: List[float] = []
     detector_scores: List[float] = []
     negative_types: List[str] = []
     target_category_ids: List[int] = []
@@ -325,8 +366,14 @@ def _encode_rows_to_cache(
             prompt = _prompt_for_row(row, prompt_template)
             crop_feats.append(feat)
             text_feats.append(text_by_prompt[prompt])
-            labels.append(float(row["label"]))
-            targets.append(float(row.get(target_field, row["label"])))
+            label = float(row["label"])
+            target = float(row.get(target_field, row["label"]))
+            weight = float(row.get(weight_field, 1.0)) if weight_field else 1.0
+            if target >= positive_threshold:
+                weight *= positive_weight
+            labels.append(label)
+            targets.append(target)
+            weights.append(weight)
             detector_scores.append(float(row.get("detector_score", 0.0)))
             negative_types.append(_negative_kind(row))
             target_category_ids.append(int(row.get("target_category_id", -1)))
@@ -334,20 +381,25 @@ def _encode_rows_to_cache(
         pending_crops.clear()
         pending_rows.clear()
 
-    for file_name, file_rows in tqdm(rows_by_file.items(), desc="encoding crop images"):
+    for file_name, file_rows in tqdm(rows_by_file.items(), desc="encoding region images"):
         image_path = _resolve_image_path(image_root, file_name)
         if not image_path.exists():
             missing_images += len(file_rows)
             continue
 
         image = Image.open(image_path).convert("RGB")
-        width, height = image.size
         for row in file_rows:
-            xyxy = _expanded_xyxy(row["bbox"], width=width, height=height, margin=crop_margin)
-            if xyxy is None:
+            region_image = _make_region_image(
+                image,
+                row["bbox"],
+                image_mode=image_mode,
+                crop_margin=crop_margin,
+                box_line_width=box_line_width,
+            )
+            if region_image is None:
                 invalid_crops += 1
                 continue
-            pending_crops.append(preprocess(image.crop(xyxy)))
+            pending_crops.append(preprocess(region_image))
             pending_rows.append(row)
             if len(pending_crops) >= image_batch_size:
                 flush()
@@ -362,6 +414,7 @@ def _encode_rows_to_cache(
         "text_feats": torch.stack(text_feats, dim=0).float(),
         "labels": torch.tensor(labels, dtype=torch.float32),
         "targets": torch.tensor(targets, dtype=torch.float32),
+        "weights": torch.tensor(weights, dtype=torch.float32),
         "detector_scores": torch.tensor(detector_scores, dtype=torch.float32),
         "negative_types": negative_types,
         "target_category_ids": torch.tensor(target_category_ids, dtype=torch.long),
@@ -371,9 +424,14 @@ def _encode_rows_to_cache(
             "num_encoded_rows": len(labels),
             "missing_images": missing_images,
             "invalid_crops": invalid_crops,
+            "image_mode": image_mode,
             "crop_margin": crop_margin,
+            "box_line_width": int(box_line_width),
             "prompt_template": prompt_template,
             "target_field": target_field,
+            "weight_field": weight_field,
+            "positive_threshold": float(positive_threshold),
+            "positive_weight": float(positive_weight),
         },
     }
     print(json.dumps(cache["meta"], indent=2))
@@ -420,9 +478,14 @@ def _load_or_build_cache(
     cache = _encode_rows_to_cache(
         rows,
         image_root=args.image_root,
+        image_mode=args.image_mode,
         crop_margin=args.crop_margin,
+        box_line_width=args.box_line_width,
         prompt_template=args.prompt_template,
         target_field=args.target_field,
+        weight_field=args.weight_field,
+        positive_threshold=args.positive_threshold,
+        positive_weight=args.positive_weight,
         model=model,
         preprocess=preprocess,
         tokenizer=tokenizer,
@@ -441,6 +504,7 @@ class PairFeatureDataset(Dataset):
         self.text_feats = cache["text_feats"].float()
         self.labels = cache["labels"].float()
         self.targets = cache.get("targets", self.labels).float()
+        self.weights = cache.get("weights", torch.ones_like(self.labels)).float()
         self.detector_scores = cache["detector_scores"].float()
         self.feature_mode = feature_mode
         if self.crop_feats.shape != self.text_feats.shape:
@@ -460,7 +524,7 @@ class PairFeatureDataset(Dataset):
             self.feature_mode,
         ).shape[1])
 
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         crop = self.crop_feats[index]
         text = self.text_feats[index]
         score = self.detector_scores[index : index + 1]
@@ -470,7 +534,7 @@ class PairFeatureDataset(Dataset):
             score,
             self.feature_mode,
         ).squeeze(0)
-        return features, self.targets[index], self.labels[index]
+        return features, self.targets[index], self.labels[index], self.weights[index]
 
 
 def _build_pair_features(
@@ -627,6 +691,39 @@ def _subset_metrics(
     return _binary_metrics(logits[mask], labels[mask])
 
 
+def _weighted_bce_loss(logits: torch.Tensor, targets: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    weights = weights.to(dtype=loss.dtype)
+    return (loss * weights).sum() / weights.sum().clamp_min(1e-6)
+
+
+def _pairwise_ranking_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    positive_threshold: float,
+    negative_threshold: float,
+    margin: float,
+    max_items_per_side: int,
+) -> torch.Tensor:
+    pos_idx = torch.nonzero(targets >= positive_threshold, as_tuple=False).flatten()
+    neg_idx = torch.nonzero(targets <= negative_threshold, as_tuple=False).flatten()
+    if pos_idx.numel() == 0 or neg_idx.numel() == 0:
+        return logits.new_zeros(())
+
+    if max_items_per_side > 0:
+        if pos_idx.numel() > max_items_per_side:
+            order = torch.randperm(pos_idx.numel(), device=pos_idx.device)[:max_items_per_side]
+            pos_idx = pos_idx[order]
+        if neg_idx.numel() > max_items_per_side:
+            order = torch.randperm(neg_idx.numel(), device=neg_idx.device)[:max_items_per_side]
+            neg_idx = neg_idx[order]
+
+    margin_tensor = logits.new_tensor(float(margin))
+    pair_diffs = logits[pos_idx].view(-1, 1) - logits[neg_idx].view(1, -1)
+    return F.relu(margin_tensor - pair_diffs).mean()
+
+
 @torch.no_grad()
 def evaluate(
     model: nn.Module,
@@ -644,14 +741,15 @@ def evaluate(
     total_loss = 0.0
     total_count = 0
 
-    for features, targets, labels in loader:
+    for features, targets, labels, weights in loader:
         features = features.to(device)
         targets = targets.to(device)
         labels = labels.to(device)
+        weights = weights.to(device)
         logits = model(features)
-        loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="sum")
-        total_loss += float(loss.item())
-        total_count += int(targets.numel())
+        loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        total_loss += float((loss * weights).sum().item())
+        total_count += float(weights.sum().item())
         logits_chunks.append(logits.cpu())
         label_chunks.append(labels.cpu())
 
@@ -659,7 +757,7 @@ def evaluate(
     labels_np = torch.cat(label_chunks).numpy()
     negative_types = list(cache["negative_types"])
     metrics = {
-        "loss": total_loss / max(1, total_count),
+        "loss": total_loss / max(1e-6, total_count),
         "overall": _subset_metrics(logits_np, labels_np, negative_types, prefix="overall"),
         "same_phrase_bad_box": _subset_metrics(
             logits_np,
@@ -707,11 +805,22 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
         model.train()
         train_loss = 0.0
         train_count = 0
-        for features, targets, _labels in tqdm(loader, desc=f"epoch {epoch}/{args.epochs}"):
+        for features, targets, _labels, weights in tqdm(loader, desc=f"epoch {epoch}/{args.epochs}"):
             features = features.to(args.device)
             targets = targets.to(args.device)
+            weights = weights.to(args.device)
             logits = model(features)
-            loss = F.binary_cross_entropy_with_logits(logits, targets)
+            loss = _weighted_bce_loss(logits, targets, weights)
+            if args.loss_type == "bce_rank" and args.ranking_weight > 0:
+                rank_loss = _pairwise_ranking_loss(
+                    logits,
+                    targets,
+                    positive_threshold=args.ranking_positive_threshold,
+                    negative_threshold=args.ranking_negative_threshold,
+                    margin=args.ranking_margin,
+                    max_items_per_side=args.ranking_max_items_per_side,
+                )
+                loss = loss + args.ranking_weight * rank_loss
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -719,8 +828,8 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
                 nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
 
-            train_loss += float(loss.item()) * int(targets.numel())
-            train_count += int(targets.numel())
+            train_loss += float(loss.item()) * float(weights.sum().item())
+            train_count += float(weights.sum().item())
 
         val_metrics = evaluate(
             model,
@@ -732,7 +841,7 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
         )
         epoch_record = {
             "epoch": epoch,
-            "train_loss": train_loss / max(1, train_count),
+            "train_loss": train_loss / max(1e-6, train_count),
             "val": val_metrics,
         }
         history.append(epoch_record)
@@ -751,6 +860,9 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
                     "dropout": args.dropout,
                     "feature_mode": args.feature_mode,
                     "target_field": args.target_field,
+                    "weight_field": args.weight_field,
+                    "image_mode": args.image_mode,
+                    "loss_type": args.loss_type,
                     "epoch": epoch,
                     "score": score,
                     "args": _jsonable_args(args),
@@ -808,7 +920,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-template", default="the described target is {phrase}")
     parser.add_argument("--model", default="convnext_large_d_320")
     parser.add_argument("--pretrained", default="laion2b_s29b_b131k_ft_soup")
+    parser.add_argument(
+        "--image-mode",
+        choices=("crop", "boxed"),
+        default="crop",
+        help="Region image passed to OpenCLIP. boxed uses the full image with a red target box.",
+    )
     parser.add_argument("--crop-margin", type=float, default=0.1)
+    parser.add_argument("--box-line-width", type=int, default=6)
     parser.add_argument(
         "--target-field",
         default="label",
@@ -817,6 +936,9 @@ def parse_args() -> argparse.Namespace:
             "use soft_label for VLM distillation rows."
         ),
     )
+    parser.add_argument("--weight-field", default=None, help="Optional JSONL field used as per-row loss weight.")
+    parser.add_argument("--positive-threshold", type=float, default=0.5)
+    parser.add_argument("--positive-weight", type=float, default=1.0)
     parser.add_argument("--same-phrase-neg-per-pos", type=float, default=1.0)
     parser.add_argument("--wrong-phrase-neg-per-pos", type=float, default=2.0)
     parser.add_argument("--max-positives", type=int, default=None)
@@ -829,6 +951,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text-batch-size", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=512)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--loss-type", choices=("bce", "bce_rank"), default="bce")
+    parser.add_argument("--ranking-weight", type=float, default=0.0)
+    parser.add_argument("--ranking-margin", type=float, default=0.0)
+    parser.add_argument("--ranking-positive-threshold", type=float, default=0.5)
+    parser.add_argument("--ranking-negative-threshold", type=float, default=0.3)
+    parser.add_argument("--ranking-max-items-per-side", type=int, default=128)
     parser.add_argument(
         "--feature-mode",
         choices=("full", "no_text", "no_detector_score"),
