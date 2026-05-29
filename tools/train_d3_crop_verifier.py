@@ -26,7 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image, ImageDraw
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm import tqdm
 
 
@@ -506,6 +506,7 @@ class PairFeatureDataset(Dataset):
         self.targets = cache.get("targets", self.labels).float()
         self.weights = cache.get("weights", torch.ones_like(self.labels)).float()
         self.detector_scores = cache["detector_scores"].float()
+        self.image_ids = cache.get("image_ids", torch.arange(self.labels.numel())).long()
         self.feature_mode = feature_mode
         if self.crop_feats.shape != self.text_feats.shape:
             raise ValueError(
@@ -524,7 +525,10 @@ class PairFeatureDataset(Dataset):
             self.feature_mode,
         ).shape[1])
 
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(
+        self,
+        index: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         crop = self.crop_feats[index]
         text = self.text_feats[index]
         score = self.detector_scores[index : index + 1]
@@ -534,7 +538,61 @@ class PairFeatureDataset(Dataset):
             score,
             self.feature_mode,
         ).squeeze(0)
-        return features, self.targets[index], self.labels[index], self.weights[index]
+        return (
+            features,
+            self.targets[index],
+            self.labels[index],
+            self.weights[index],
+            self.image_ids[index],
+            self.detector_scores[index],
+        )
+
+
+class GroupedFeatureBatchSampler(Sampler[List[int]]):
+    def __init__(self, image_ids: torch.Tensor, *, batch_size: int, seed: int, shuffle: bool = True) -> None:
+        self.batch_size = int(batch_size)
+        self.seed = int(seed)
+        self.shuffle = bool(shuffle)
+        self.epoch = 0
+        groups: Dict[int, List[int]] = defaultdict(list)
+        for index, image_id in enumerate(image_ids.tolist()):
+            groups[int(image_id)].append(index)
+        self.groups = list(groups.values())
+        self._length = self._estimate_length()
+
+    def _estimate_length(self) -> int:
+        length = 0
+        current = 0
+        for group in self.groups:
+            group_size = len(group)
+            if current and current + group_size > self.batch_size:
+                length += 1
+                current = 0
+            current += group_size
+        if current:
+            length += 1
+        return max(1, length)
+
+    def __len__(self) -> int:
+        return self._length
+
+    def __iter__(self) -> Iterable[List[int]]:
+        rng = random.Random(self.seed + self.epoch)
+        self.epoch += 1
+        groups = [list(group) for group in self.groups]
+        if self.shuffle:
+            rng.shuffle(groups)
+            for group in groups:
+                rng.shuffle(group)
+
+        batch: List[int] = []
+        for group in groups:
+            if batch and len(batch) + len(group) > self.batch_size:
+                yield batch
+                batch = []
+            batch.extend(group)
+        if batch:
+            yield batch
 
 
 def _build_pair_features(
@@ -804,6 +862,63 @@ def _weighted_bce_loss(logits: torch.Tensor, targets: torch.Tensor, weights: tor
     return (loss * weights).sum() / weights.sum().clamp_min(1e-6)
 
 
+def _safe_logit(scores: torch.Tensor) -> torch.Tensor:
+    scores = scores.clamp(1e-6, 1.0 - 1e-6)
+    return torch.log(scores / (1.0 - scores))
+
+
+def _teacher_scores(
+    detector_scores: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    mode: str,
+    fusion_weight: float,
+) -> torch.Tensor:
+    detector_scores = detector_scores.to(dtype=targets.dtype).clamp(1e-6, 1.0 - 1e-6)
+    targets = targets.clamp(1e-6, 1.0 - 1e-6)
+    if mode == "logit_add":
+        return torch.sigmoid(_safe_logit(detector_scores) + float(fusion_weight) * _safe_logit(targets))
+    if mode == "linear":
+        return (1.0 - float(fusion_weight)) * detector_scores + float(fusion_weight) * targets
+    if mode == "replace":
+        return targets
+    raise ValueError(f"Unsupported listwise teacher mode: {mode}")
+
+
+def _listwise_distillation_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    detector_scores: torch.Tensor,
+    image_ids: torch.Tensor,
+    *,
+    teacher_mode: str,
+    teacher_fusion_weight: float,
+    topk: int,
+    temperature: float,
+) -> torch.Tensor:
+    teacher = _teacher_scores(
+        detector_scores,
+        targets,
+        mode=teacher_mode,
+        fusion_weight=teacher_fusion_weight,
+    )
+    temperature = max(float(temperature), 1e-6)
+    losses = []
+    for image_id in torch.unique(image_ids):
+        group = torch.nonzero(image_ids == image_id, as_tuple=False).flatten()
+        if group.numel() < 2:
+            continue
+        if topk > 0 and group.numel() > topk:
+            top = torch.topk(teacher[group], k=int(topk), largest=True).indices
+            group = group[top]
+        teacher_distribution = F.softmax(teacher[group] / temperature, dim=0)
+        student_log_distribution = F.log_softmax(logits[group] / temperature, dim=0)
+        losses.append(-(teacher_distribution.detach() * student_log_distribution).sum())
+    if not losses:
+        return logits.new_zeros(())
+    return torch.stack(losses).mean()
+
+
 def _pairwise_ranking_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
@@ -848,7 +963,7 @@ def evaluate(
     total_loss = 0.0
     total_count = 0
 
-    for features, targets, labels, weights in loader:
+    for features, targets, labels, weights, _image_ids, _detector_scores in loader:
         features = features.to(device)
         targets = targets.to(device)
         labels = labels.to(device)
@@ -898,13 +1013,26 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
         projection_dim=args.projection_dim,
     ).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        drop_last=False,
-    )
+    uses_listwise = args.loss_type in {"listwise", "bce_listwise", "bce_rank_listwise"}
+    if uses_listwise:
+        loader = DataLoader(
+            train_dataset,
+            batch_sampler=GroupedFeatureBatchSampler(
+                train_dataset.image_ids,
+                batch_size=args.batch_size,
+                seed=args.seed,
+                shuffle=True,
+            ),
+            num_workers=args.num_workers,
+        )
+    else:
+        loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            drop_last=False,
+        )
 
     history: List[Dict[str, Any]] = []
     best_score = -float("inf")
@@ -914,14 +1042,24 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
     for epoch in range(1, args.epochs + 1):
         model.train()
         train_loss = 0.0
+        train_bce_loss = 0.0
+        train_rank_loss = 0.0
+        train_listwise_loss = 0.0
         train_count = 0
-        for features, targets, _labels, weights in tqdm(loader, desc=f"epoch {epoch}/{args.epochs}"):
+        for features, targets, _labels, weights, image_ids, detector_scores in tqdm(
+            loader,
+            desc=f"epoch {epoch}/{args.epochs}",
+        ):
             features = features.to(args.device)
             targets = targets.to(args.device)
             weights = weights.to(args.device)
+            image_ids = image_ids.to(args.device)
+            detector_scores = detector_scores.to(args.device)
             logits = model(features)
-            loss = _weighted_bce_loss(logits, targets, weights)
-            if args.loss_type == "bce_rank" and args.ranking_weight > 0:
+            bce_loss = _weighted_bce_loss(logits, targets, weights)
+            rank_loss = logits.new_zeros(())
+            listwise_loss = logits.new_zeros(())
+            if args.loss_type in {"bce_rank", "bce_rank_listwise"} and args.ranking_weight > 0:
                 rank_loss = _pairwise_ranking_loss(
                     logits,
                     targets,
@@ -930,7 +1068,30 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
                     margin=args.ranking_margin,
                     max_items_per_side=args.ranking_max_items_per_side,
                 )
-                loss = loss + args.ranking_weight * rank_loss
+            if uses_listwise and args.listwise_weight > 0:
+                listwise_loss = _listwise_distillation_loss(
+                    logits,
+                    targets,
+                    detector_scores,
+                    image_ids,
+                    teacher_mode=args.listwise_teacher_mode,
+                    teacher_fusion_weight=args.listwise_teacher_fusion_weight,
+                    topk=args.listwise_topk,
+                    temperature=args.listwise_temperature,
+                )
+
+            if args.loss_type == "listwise":
+                loss = listwise_loss
+            elif args.loss_type == "bce":
+                loss = bce_loss
+            elif args.loss_type == "bce_rank":
+                loss = bce_loss + args.ranking_weight * rank_loss
+            elif args.loss_type == "bce_listwise":
+                loss = bce_loss + args.listwise_weight * listwise_loss
+            elif args.loss_type == "bce_rank_listwise":
+                loss = bce_loss + args.ranking_weight * rank_loss + args.listwise_weight * listwise_loss
+            else:
+                raise ValueError(f"Unsupported loss_type={args.loss_type!r}.")
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -938,8 +1099,12 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
                 nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
 
-            train_loss += float(loss.item()) * float(weights.sum().item())
-            train_count += float(weights.sum().item())
+            batch_weight = float(weights.sum().item())
+            train_loss += float(loss.item()) * batch_weight
+            train_bce_loss += float(bce_loss.item()) * batch_weight
+            train_rank_loss += float(rank_loss.item()) * batch_weight
+            train_listwise_loss += float(listwise_loss.item()) * batch_weight
+            train_count += batch_weight
 
         val_metrics = evaluate(
             model,
@@ -952,6 +1117,9 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
         epoch_record = {
             "epoch": epoch,
             "train_loss": train_loss / max(1e-6, train_count),
+            "train_bce_loss": train_bce_loss / max(1e-6, train_count),
+            "train_rank_loss": train_rank_loss / max(1e-6, train_count),
+            "train_listwise_loss": train_listwise_loss / max(1e-6, train_count),
             "val": val_metrics,
         }
         history.append(epoch_record)
@@ -975,6 +1143,11 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
                     "weight_field": args.weight_field,
                     "image_mode": args.image_mode,
                     "loss_type": args.loss_type,
+                    "listwise_weight": args.listwise_weight,
+                    "listwise_topk": args.listwise_topk,
+                    "listwise_temperature": args.listwise_temperature,
+                    "listwise_teacher_mode": args.listwise_teacher_mode,
+                    "listwise_teacher_fusion_weight": args.listwise_teacher_fusion_weight,
                     "epoch": epoch,
                     "score": score,
                     "args": _jsonable_args(args),
@@ -988,6 +1161,9 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
                 {
                     "epoch": epoch,
                     "train_loss": epoch_record["train_loss"],
+                    "train_bce_loss": epoch_record["train_bce_loss"],
+                    "train_rank_loss": epoch_record["train_rank_loss"],
+                    "train_listwise_loss": epoch_record["train_listwise_loss"],
                     "overall_ap": val_metrics["overall"]["ap"],
                     "overall_auc": val_metrics["overall"]["auc"],
                     "wrong_phrase_ap": val_metrics["wrong_phrase_same_region"]["ap"],
@@ -1078,12 +1254,46 @@ def parse_args() -> argparse.Namespace:
         help="Low-rank interaction dimension used by --verifier-arch gated_bilinear.",
     )
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--loss-type", choices=("bce", "bce_rank"), default="bce")
+    parser.add_argument(
+        "--loss-type",
+        choices=("bce", "bce_rank", "listwise", "bce_listwise", "bce_rank_listwise"),
+        default="bce",
+    )
     parser.add_argument("--ranking-weight", type=float, default=0.0)
     parser.add_argument("--ranking-margin", type=float, default=0.0)
     parser.add_argument("--ranking-positive-threshold", type=float, default=0.5)
     parser.add_argument("--ranking-negative-threshold", type=float, default=0.3)
     parser.add_argument("--ranking-max-items-per-side", type=int, default=128)
+    parser.add_argument(
+        "--listwise-weight",
+        type=float,
+        default=1.0,
+        help="Weight for per-image top-k teacher-distribution distillation losses.",
+    )
+    parser.add_argument(
+        "--listwise-topk",
+        type=int,
+        default=20,
+        help="Teacher-ranked candidates per image used in listwise distillation. Use 0 for all candidates.",
+    )
+    parser.add_argument(
+        "--listwise-temperature",
+        type=float,
+        default=0.07,
+        help="Softmax temperature for listwise teacher and student distributions.",
+    )
+    parser.add_argument(
+        "--listwise-teacher-mode",
+        choices=("logit_add", "linear", "replace"),
+        default="logit_add",
+        help="How to combine detector score and soft_label into the listwise teacher score.",
+    )
+    parser.add_argument(
+        "--listwise-teacher-fusion-weight",
+        type=float,
+        default=0.04,
+        help="Fusion weight used by the listwise teacher; 0.04 matches the best Qwen cached setting.",
+    )
     parser.add_argument(
         "--feature-mode",
         choices=("full", "no_text", "no_detector_score"),
