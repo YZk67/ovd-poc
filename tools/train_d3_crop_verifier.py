@@ -581,6 +581,18 @@ def _validate_cache_labels(name: str, cache: Mapping[str, Any]) -> None:
         )
 
 
+def _infer_clip_feature_dim(input_dim: int, feature_mode: str) -> Tuple[int, bool]:
+    if feature_mode == "full":
+        if (input_dim - 1) % 4 != 0:
+            raise ValueError(f"Cannot infer CLIP feature dim from full input_dim={input_dim}.")
+        return (input_dim - 1) // 4, True
+    if feature_mode == "no_detector_score":
+        if input_dim % 4 != 0:
+            raise ValueError(f"Cannot infer CLIP feature dim from no_detector_score input_dim={input_dim}.")
+        return input_dim // 4, False
+    raise ValueError(f"gated_bilinear verifier requires text features; got feature_mode={feature_mode}.")
+
+
 class CropDescriptionVerifier(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, dropout: float) -> None:
         super().__init__()
@@ -597,6 +609,101 @@ class CropDescriptionVerifier(nn.Module):
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         return self.net(features).squeeze(-1)
+
+
+class GatedBilinearDescriptionVerifier(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        dropout: float,
+        *,
+        feature_mode: str,
+        projection_dim: int,
+    ) -> None:
+        super().__init__()
+        clip_dim, has_detector_score = _infer_clip_feature_dim(input_dim, feature_mode)
+        self.clip_dim = clip_dim
+        self.has_detector_score = has_detector_score
+        self.feature_mode = feature_mode
+
+        projection_dim = int(projection_dim)
+        if projection_dim <= 0:
+            raise ValueError("--projection-dim must be positive for gated_bilinear.")
+
+        self.image_norm = nn.LayerNorm(clip_dim)
+        self.text_norm = nn.LayerNorm(clip_dim)
+        self.pair_norm = nn.LayerNorm(input_dim)
+        self.image_proj = nn.Linear(clip_dim, projection_dim)
+        self.text_proj = nn.Linear(clip_dim, projection_dim)
+        self.pair_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.interaction_gate = nn.Sequential(
+            nn.Linear(hidden_dim, projection_dim),
+            nn.Sigmoid(),
+        )
+
+        score_dim = 2 if has_detector_score else 0
+        head_dim = hidden_dim + projection_dim * 4 + 1 + score_dim
+        second_hidden = max(64, hidden_dim // 2)
+        self.head = nn.Sequential(
+            nn.LayerNorm(head_dim),
+            nn.Linear(head_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, second_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(second_hidden, 1),
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        image = features[:, : self.clip_dim]
+        text = features[:, self.clip_dim : self.clip_dim * 2]
+        image_proj = self.image_proj(self.image_norm(image))
+        text_proj = self.text_proj(self.text_norm(text))
+        pair_proj = self.pair_proj(self.pair_norm(features))
+        gate = self.interaction_gate(pair_proj)
+        interaction = image_proj * text_proj * gate
+        cosine = (image * text).sum(dim=-1, keepdim=True)
+
+        parts = [
+            pair_proj,
+            image_proj,
+            text_proj,
+            interaction,
+            torch.abs(image_proj - text_proj),
+            cosine,
+        ]
+        if self.has_detector_score:
+            score = features[:, -1:].clamp(1e-6, 1.0 - 1e-6)
+            parts.extend([score, torch.logit(score)])
+        return self.head(torch.cat(parts, dim=-1)).squeeze(-1)
+
+
+def _build_verifier_model(
+    *,
+    arch: str,
+    input_dim: int,
+    hidden_dim: int,
+    dropout: float,
+    feature_mode: str,
+    projection_dim: int,
+) -> nn.Module:
+    if arch == "mlp":
+        return CropDescriptionVerifier(input_dim=input_dim, hidden_dim=hidden_dim, dropout=dropout)
+    if arch == "gated_bilinear":
+        return GatedBilinearDescriptionVerifier(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+            feature_mode=feature_mode,
+            projection_dim=projection_dim,
+        )
+    raise ValueError(f"Unsupported verifier architecture: {arch}")
 
 
 def _average_precision(scores: np.ndarray, labels: np.ndarray) -> float:
@@ -782,10 +889,13 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
 
     train_dataset = PairFeatureDataset(train_cache, feature_mode=args.feature_mode)
     val_dataset = PairFeatureDataset(val_cache, feature_mode=args.feature_mode)
-    model = CropDescriptionVerifier(
+    model = _build_verifier_model(
+        arch=args.verifier_arch,
         input_dim=train_dataset.input_dim,
         hidden_dim=args.hidden_dim,
         dropout=args.dropout,
+        feature_mode=args.feature_mode,
+        projection_dim=args.projection_dim,
     ).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     loader = DataLoader(
@@ -858,6 +968,8 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
                     "input_dim": train_dataset.input_dim,
                     "hidden_dim": args.hidden_dim,
                     "dropout": args.dropout,
+                    "verifier_arch": args.verifier_arch,
+                    "projection_dim": args.projection_dim,
                     "feature_mode": args.feature_mode,
                     "target_field": args.target_field,
                     "weight_field": args.weight_field,
@@ -949,7 +1061,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--image-batch-size", type=int, default=64)
     parser.add_argument("--text-batch-size", type=int, default=256)
+    parser.add_argument(
+        "--verifier-arch",
+        choices=("mlp", "gated_bilinear"),
+        default="mlp",
+        help=(
+            "Verifier architecture. mlp preserves the original concat-feature scorer; "
+            "gated_bilinear adds low-rank image-text interaction on top of the same cache."
+        ),
+    )
     parser.add_argument("--hidden-dim", type=int, default=512)
+    parser.add_argument(
+        "--projection-dim",
+        type=int,
+        default=256,
+        help="Low-rank interaction dimension used by --verifier-arch gated_bilinear.",
+    )
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--loss-type", choices=("bce", "bce_rank"), default="bce")
     parser.add_argument("--ranking-weight", type=float, default=0.0)

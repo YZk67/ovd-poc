@@ -343,6 +343,18 @@ def _fuse_verifier_logit_matrix(
     raise ValueError(f"Unsupported verifier fusion mode: {mode}")
 
 
+def _infer_clip_feature_dim(input_dim: int, feature_mode: str) -> Tuple[int, bool]:
+    if feature_mode == "full":
+        if (input_dim - 1) % 4 != 0:
+            raise ValueError(f"Cannot infer CLIP feature dim from full input_dim={input_dim}.")
+        return (input_dim - 1) // 4, True
+    if feature_mode == "no_detector_score":
+        if input_dim % 4 != 0:
+            raise ValueError(f"Cannot infer CLIP feature dim from no_detector_score input_dim={input_dim}.")
+        return input_dim // 4, False
+    raise ValueError(f"gated_bilinear verifier requires text features; got feature_mode={feature_mode}.")
+
+
 class CropDescriptionVerifier(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, dropout: float) -> None:
         super().__init__()
@@ -361,6 +373,101 @@ class CropDescriptionVerifier(nn.Module):
         return self.net(features).squeeze(-1)
 
 
+class GatedBilinearDescriptionVerifier(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        dropout: float,
+        *,
+        feature_mode: str,
+        projection_dim: int,
+    ) -> None:
+        super().__init__()
+        clip_dim, has_detector_score = _infer_clip_feature_dim(input_dim, feature_mode)
+        self.clip_dim = clip_dim
+        self.has_detector_score = has_detector_score
+        self.feature_mode = feature_mode
+
+        projection_dim = int(projection_dim)
+        if projection_dim <= 0:
+            raise ValueError("projection_dim must be positive for gated_bilinear.")
+
+        self.image_norm = nn.LayerNorm(clip_dim)
+        self.text_norm = nn.LayerNorm(clip_dim)
+        self.pair_norm = nn.LayerNorm(input_dim)
+        self.image_proj = nn.Linear(clip_dim, projection_dim)
+        self.text_proj = nn.Linear(clip_dim, projection_dim)
+        self.pair_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.interaction_gate = nn.Sequential(
+            nn.Linear(hidden_dim, projection_dim),
+            nn.Sigmoid(),
+        )
+
+        score_dim = 2 if has_detector_score else 0
+        head_dim = hidden_dim + projection_dim * 4 + 1 + score_dim
+        second_hidden = max(64, hidden_dim // 2)
+        self.head = nn.Sequential(
+            nn.LayerNorm(head_dim),
+            nn.Linear(head_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, second_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(second_hidden, 1),
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        image = features[:, : self.clip_dim]
+        text = features[:, self.clip_dim : self.clip_dim * 2]
+        image_proj = self.image_proj(self.image_norm(image))
+        text_proj = self.text_proj(self.text_norm(text))
+        pair_proj = self.pair_proj(self.pair_norm(features))
+        gate = self.interaction_gate(pair_proj)
+        interaction = image_proj * text_proj * gate
+        cosine = (image * text).sum(dim=-1, keepdim=True)
+
+        parts = [
+            pair_proj,
+            image_proj,
+            text_proj,
+            interaction,
+            torch.abs(image_proj - text_proj),
+            cosine,
+        ]
+        if self.has_detector_score:
+            score = features[:, -1:].clamp(1e-6, 1.0 - 1e-6)
+            parts.extend([score, torch.logit(score)])
+        return self.head(torch.cat(parts, dim=-1)).squeeze(-1)
+
+
+def _build_verifier_model(
+    *,
+    arch: str,
+    input_dim: int,
+    hidden_dim: int,
+    dropout: float,
+    feature_mode: str,
+    projection_dim: int,
+) -> nn.Module:
+    if arch == "mlp":
+        return CropDescriptionVerifier(input_dim=input_dim, hidden_dim=hidden_dim, dropout=dropout)
+    if arch == "gated_bilinear":
+        return GatedBilinearDescriptionVerifier(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+            feature_mode=feature_mode,
+            projection_dim=projection_dim,
+        )
+    raise ValueError(f"Unsupported verifier architecture: {arch}")
+
+
 def _load_torch_checkpoint(path: Path, device: str) -> Mapping[str, Any]:
     try:
         return torch.load(path, map_location=device, weights_only=False)
@@ -368,19 +475,29 @@ def _load_torch_checkpoint(path: Path, device: str) -> Mapping[str, Any]:
         return torch.load(path, map_location=device)
 
 
-def _load_verifier(path: Path, device: str) -> Tuple[CropDescriptionVerifier, str]:
+def _load_verifier(path: Path, device: str) -> Tuple[nn.Module, str]:
     checkpoint = _load_torch_checkpoint(path, device)
     input_dim = int(checkpoint["input_dim"])
     hidden_dim = int(checkpoint.get("hidden_dim", 512))
     dropout = float(checkpoint.get("dropout", 0.0))
     feature_mode = str(checkpoint.get("feature_mode", "full"))
-    verifier = CropDescriptionVerifier(input_dim=input_dim, hidden_dim=hidden_dim, dropout=dropout)
+    arch = str(checkpoint.get("verifier_arch", "mlp"))
+    projection_dim = int(checkpoint.get("projection_dim", 256))
+    verifier = _build_verifier_model(
+        arch=arch,
+        input_dim=input_dim,
+        hidden_dim=hidden_dim,
+        dropout=dropout,
+        feature_mode=feature_mode,
+        projection_dim=projection_dim,
+    )
     verifier.load_state_dict(checkpoint["model_state"])
     verifier.to(device)
     verifier.eval()
     print(
         f"loaded verifier: {path} "
-        f"(epoch={checkpoint.get('epoch')}, score={checkpoint.get('score')}, feature_mode={feature_mode})"
+        f"(epoch={checkpoint.get('epoch')}, score={checkpoint.get('score')}, "
+        f"arch={arch}, feature_mode={feature_mode})"
     )
     return verifier, feature_mode
 
