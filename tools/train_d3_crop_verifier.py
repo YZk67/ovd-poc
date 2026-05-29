@@ -908,12 +908,15 @@ def _listwise_distillation_loss(
         group = torch.nonzero(image_ids == image_id, as_tuple=False).flatten()
         if group.numel() < 2:
             continue
-        if topk > 0 and group.numel() > topk:
-            top = torch.topk(teacher[group], k=int(topk), largest=True).indices
-            group = group[top]
-        teacher_distribution = F.softmax(teacher[group] / temperature, dim=0)
+        teacher_group = teacher[group]
         student_log_distribution = F.log_softmax(logits[group] / temperature, dim=0)
-        losses.append(-(teacher_distribution.detach() * student_log_distribution).sum())
+        if topk > 0 and group.numel() > topk:
+            top = torch.topk(teacher_group, k=int(topk), largest=True).indices
+            teacher_distribution = F.softmax(_safe_logit(teacher_group[top]) / temperature, dim=0)
+            losses.append(-(teacher_distribution.detach() * student_log_distribution[top]).sum())
+        else:
+            teacher_distribution = F.softmax(_safe_logit(teacher_group) / temperature, dim=0)
+            losses.append(-(teacher_distribution.detach() * student_log_distribution).sum())
     if not losses:
         return logits.new_zeros(())
     return torch.stack(losses).mean()
