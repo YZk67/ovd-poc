@@ -281,6 +281,7 @@ def _encode_rows_to_cache(
     image_root: Path,
     crop_margin: float,
     prompt_template: str,
+    target_field: str,
     model,
     preprocess,
     tokenizer,
@@ -305,6 +306,7 @@ def _encode_rows_to_cache(
     crop_feats: List[torch.Tensor] = []
     text_feats: List[torch.Tensor] = []
     labels: List[float] = []
+    targets: List[float] = []
     detector_scores: List[float] = []
     negative_types: List[str] = []
     target_category_ids: List[int] = []
@@ -324,6 +326,7 @@ def _encode_rows_to_cache(
             crop_feats.append(feat)
             text_feats.append(text_by_prompt[prompt])
             labels.append(float(row["label"]))
+            targets.append(float(row.get(target_field, row["label"])))
             detector_scores.append(float(row.get("detector_score", 0.0)))
             negative_types.append(_negative_kind(row))
             target_category_ids.append(int(row.get("target_category_id", -1)))
@@ -358,6 +361,7 @@ def _encode_rows_to_cache(
         "crop_feats": torch.stack(crop_feats, dim=0).float(),
         "text_feats": torch.stack(text_feats, dim=0).float(),
         "labels": torch.tensor(labels, dtype=torch.float32),
+        "targets": torch.tensor(targets, dtype=torch.float32),
         "detector_scores": torch.tensor(detector_scores, dtype=torch.float32),
         "negative_types": negative_types,
         "target_category_ids": torch.tensor(target_category_ids, dtype=torch.long),
@@ -369,6 +373,7 @@ def _encode_rows_to_cache(
             "invalid_crops": invalid_crops,
             "crop_margin": crop_margin,
             "prompt_template": prompt_template,
+            "target_field": target_field,
         },
     }
     print(json.dumps(cache["meta"], indent=2))
@@ -417,6 +422,7 @@ def _load_or_build_cache(
         image_root=args.image_root,
         crop_margin=args.crop_margin,
         prompt_template=args.prompt_template,
+        target_field=args.target_field,
         model=model,
         preprocess=preprocess,
         tokenizer=tokenizer,
@@ -434,6 +440,7 @@ class PairFeatureDataset(Dataset):
         self.crop_feats = cache["crop_feats"].float()
         self.text_feats = cache["text_feats"].float()
         self.labels = cache["labels"].float()
+        self.targets = cache.get("targets", self.labels).float()
         self.detector_scores = cache["detector_scores"].float()
         self.feature_mode = feature_mode
         if self.crop_feats.shape != self.text_feats.shape:
@@ -453,7 +460,7 @@ class PairFeatureDataset(Dataset):
             self.feature_mode,
         ).shape[1])
 
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         crop = self.crop_feats[index]
         text = self.text_feats[index]
         score = self.detector_scores[index : index + 1]
@@ -463,7 +470,7 @@ class PairFeatureDataset(Dataset):
             score,
             self.feature_mode,
         ).squeeze(0)
-        return features, self.labels[index]
+        return features, self.targets[index], self.labels[index]
 
 
 def _build_pair_features(
@@ -637,13 +644,14 @@ def evaluate(
     total_loss = 0.0
     total_count = 0
 
-    for features, labels in loader:
+    for features, targets, labels in loader:
         features = features.to(device)
+        targets = targets.to(device)
         labels = labels.to(device)
         logits = model(features)
-        loss = F.binary_cross_entropy_with_logits(logits, labels, reduction="sum")
+        loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="sum")
         total_loss += float(loss.item())
-        total_count += int(labels.numel())
+        total_count += int(targets.numel())
         logits_chunks.append(logits.cpu())
         label_chunks.append(labels.cpu())
 
@@ -699,11 +707,11 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
         model.train()
         train_loss = 0.0
         train_count = 0
-        for features, labels in tqdm(loader, desc=f"epoch {epoch}/{args.epochs}"):
+        for features, targets, _labels in tqdm(loader, desc=f"epoch {epoch}/{args.epochs}"):
             features = features.to(args.device)
-            labels = labels.to(args.device)
+            targets = targets.to(args.device)
             logits = model(features)
-            loss = F.binary_cross_entropy_with_logits(logits, labels)
+            loss = F.binary_cross_entropy_with_logits(logits, targets)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -711,8 +719,8 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
                 nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
 
-            train_loss += float(loss.item()) * int(labels.numel())
-            train_count += int(labels.numel())
+            train_loss += float(loss.item()) * int(targets.numel())
+            train_count += int(targets.numel())
 
         val_metrics = evaluate(
             model,
@@ -742,6 +750,7 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
                     "hidden_dim": args.hidden_dim,
                     "dropout": args.dropout,
                     "feature_mode": args.feature_mode,
+                    "target_field": args.target_field,
                     "epoch": epoch,
                     "score": score,
                     "args": _jsonable_args(args),
@@ -800,6 +809,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="convnext_large_d_320")
     parser.add_argument("--pretrained", default="laion2b_s29b_b131k_ft_soup")
     parser.add_argument("--crop-margin", type=float, default=0.1)
+    parser.add_argument(
+        "--target-field",
+        default="label",
+        help=(
+            "JSONL field used as BCE training target. Keep the default for hard labels; "
+            "use soft_label for VLM distillation rows."
+        ),
+    )
     parser.add_argument("--same-phrase-neg-per-pos", type=float, default=1.0)
     parser.add_argument("--wrong-phrase-neg-per-pos", type=float, default=2.0)
     parser.add_argument("--max-positives", type=int, default=None)
