@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Post-hoc D3 crop reranking with OpenCLIP.
+Post-hoc D3 crop reranking with CLIP/SigLIP-style encoders.
 
 This is a lightweight pilot for region-level description verification:
 
@@ -482,7 +482,7 @@ def _load_torch_checkpoint(path: Path, device: str) -> Mapping[str, Any]:
         return torch.load(path, map_location=device)
 
 
-def _load_verifier(path: Path, device: str) -> Tuple[nn.Module, str]:
+def _load_verifier(path: Path, device: str) -> Tuple[nn.Module, str, Dict[str, Any]]:
     checkpoint = _load_torch_checkpoint(path, device)
     input_dim = int(checkpoint["input_dim"])
     hidden_dim = int(checkpoint.get("hidden_dim", 512))
@@ -506,7 +506,36 @@ def _load_verifier(path: Path, device: str) -> Tuple[nn.Module, str]:
         f"(epoch={checkpoint.get('epoch')}, score={checkpoint.get('score')}, "
         f"arch={arch}, feature_mode={feature_mode})"
     )
-    return verifier, feature_mode
+    metadata = {
+        "encoder_backend": checkpoint.get("encoder_backend"),
+        "encoder_model": checkpoint.get("encoder_model"),
+        "encoder_pretrained": checkpoint.get("encoder_pretrained"),
+    }
+    return verifier, feature_mode, metadata
+
+
+def _validate_verifier_encoder(args: argparse.Namespace, metadata: Mapping[str, Any]) -> None:
+    expected_backend = metadata.get("encoder_backend")
+    if expected_backend is None:
+        return
+    expected_model = metadata.get("encoder_model")
+    expected_pretrained = metadata.get("encoder_pretrained")
+    mismatches = []
+    if str(args.encoder_backend) != str(expected_backend):
+        mismatches.append(f"backend checkpoint={expected_backend!r} args={args.encoder_backend!r}")
+    if expected_model is not None and str(args.model) != str(expected_model):
+        mismatches.append(f"model checkpoint={expected_model!r} args={args.model!r}")
+    if (
+        str(expected_backend) == "open_clip"
+        and expected_pretrained is not None
+        and str(args.pretrained) != str(expected_pretrained)
+    ):
+        mismatches.append(f"pretrained checkpoint={expected_pretrained!r} args={args.pretrained!r}")
+    if mismatches:
+        raise ValueError(
+            "Verifier checkpoint encoder does not match rerank encoder. "
+            + "; ".join(mismatches)
+        )
 
 
 def _build_verifier_features(
@@ -626,6 +655,7 @@ def _expanded_feature_cache_meta(
         "version": EXPANDED_SCORE_CACHE_VERSION,
         "category_ids": [int(category_id) for category_id in category_ids],
         "prompt_template": str(args.prompt_template),
+        "encoder_backend": str(args.encoder_backend),
         "model": str(args.model),
         "pretrained": str(args.pretrained),
         "image_mode": str(args.image_mode),
@@ -761,6 +791,59 @@ def _load_openclip(model_name: str, pretrained: str, device: str):
     return model, preprocess, tokenizer
 
 
+class _SiglipAdapter:
+    def __init__(self, model) -> None:
+        self.model = model
+
+    def eval(self):
+        self.model.eval()
+        return self
+
+    def encode_text(self, tokens) -> torch.Tensor:
+        return self.model.get_text_features(**tokens)
+
+    def encode_image(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        return self.model.get_image_features(pixel_values=pixel_values)
+
+
+def _load_siglip(model_name: str, _pretrained: str, device: str):
+    try:
+        from transformers import AutoModel, AutoProcessor
+    except ImportError as exc:
+        raise ImportError("transformers is required for --encoder-backend siglip.") from exc
+
+    processor = AutoProcessor.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name).to(device)
+    model.eval()
+    adapter = _SiglipAdapter(model)
+
+    def preprocess(image: Image.Image) -> torch.Tensor:
+        return processor(images=image, return_tensors="pt")["pixel_values"].squeeze(0)
+
+    def tokenize(texts: Sequence[str]):
+        return processor(
+            text=list(texts),
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+
+    return adapter, preprocess, tokenize
+
+
+def _load_encoder(backend: str, model_name: str, pretrained: str, device: str):
+    if backend == "open_clip":
+        model, preprocess, tokenizer = _load_openclip(model_name, pretrained, device)
+    elif backend == "siglip":
+        model, preprocess, tokenizer = _load_siglip(model_name, pretrained, device)
+    else:
+        raise ValueError(f"Unsupported encoder backend: {backend}")
+    setattr(model, "backend_name", backend)
+    setattr(model, "model_name", model_name)
+    setattr(model, "pretrained_name", pretrained)
+    return model, preprocess, tokenizer
+
+
 @torch.no_grad()
 def _encode_texts(
     model,
@@ -869,11 +952,13 @@ def rerank(args: argparse.Namespace) -> List[Dict[str, Any]]:
         return reranked_results
 
     device = args.device
-    model, preprocess, tokenizer = _load_openclip(args.model, args.pretrained, device)
     verifier = None
     verifier_feature_mode = "full"
+    verifier_encoder_meta: Dict[str, Any] = {}
     if args.verifier_checkpoint:
-        verifier, verifier_feature_mode = _load_verifier(args.verifier_checkpoint, device)
+        verifier, verifier_feature_mode, verifier_encoder_meta = _load_verifier(args.verifier_checkpoint, device)
+        _validate_verifier_encoder(args, verifier_encoder_meta)
+    model, preprocess, tokenizer = _load_encoder(args.encoder_backend, args.model, args.pretrained, device)
     text_features = _encode_texts(
         model,
         tokenizer,
@@ -1206,14 +1291,20 @@ def parse_args() -> argparse.Namespace:
         help="Text prompt used for crop-text scoring.",
     )
     parser.add_argument(
+        "--encoder-backend",
+        choices=("open_clip", "siglip"),
+        default="open_clip",
+        help="Feature encoder backend used for crop/text scoring.",
+    )
+    parser.add_argument(
         "--model",
         default="convnext_large_d_320",
-        help="OpenCLIP model name.",
+        help="OpenCLIP model name or HuggingFace model id for --encoder-backend siglip.",
     )
     parser.add_argument(
         "--pretrained",
         default="laion2b_s29b_b131k_ft_soup",
-        help="OpenCLIP pretrained tag.",
+        help="OpenCLIP pretrained tag. Ignored by --encoder-backend siglip.",
     )
     parser.add_argument(
         "--rerank-topk-per-image",
@@ -1290,7 +1381,7 @@ def parse_args() -> argparse.Namespace:
         "--image-mode",
         choices=("crop", "boxed"),
         default="crop",
-        help="Region image passed to OpenCLIP. boxed uses the full image with a red target box.",
+        help="Region image passed to the encoder. boxed uses the full image with a red target box.",
     )
     parser.add_argument("--box-line-width", type=int, default=6)
     parser.add_argument(

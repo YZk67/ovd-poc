@@ -7,8 +7,8 @@ given a detector box region and a target phrase, can a small verifier
 distinguish matching region-description pairs from hard negatives?
 
 Inputs are JSONL files produced by tools/build_d3_verifier_pairs.py.
-The script can either encode OpenCLIP crop/text features into a cache or train
-directly from precomputed cache files.
+The script can either encode crop/text features into a cache or train directly
+from precomputed cache files.
 """
 
 from __future__ import annotations
@@ -260,6 +260,59 @@ def _load_openclip(model_name: str, pretrained: str, device: str):
     return model, preprocess, open_clip.tokenize
 
 
+class _SiglipAdapter:
+    def __init__(self, model) -> None:
+        self.model = model
+
+    def eval(self):
+        self.model.eval()
+        return self
+
+    def encode_text(self, tokens) -> torch.Tensor:
+        return self.model.get_text_features(**tokens)
+
+    def encode_image(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        return self.model.get_image_features(pixel_values=pixel_values)
+
+
+def _load_siglip(model_name: str, _pretrained: str, device: str):
+    try:
+        from transformers import AutoModel, AutoProcessor
+    except ImportError as exc:
+        raise ImportError("transformers is required for --encoder-backend siglip.") from exc
+
+    processor = AutoProcessor.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name).to(device)
+    model.eval()
+    adapter = _SiglipAdapter(model)
+
+    def preprocess(image: Image.Image) -> torch.Tensor:
+        return processor(images=image, return_tensors="pt")["pixel_values"].squeeze(0)
+
+    def tokenize(texts: Sequence[str]):
+        return processor(
+            text=list(texts),
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+
+    return adapter, preprocess, tokenize
+
+
+def _load_encoder(backend: str, model_name: str, pretrained: str, device: str):
+    if backend == "open_clip":
+        model, preprocess, tokenizer = _load_openclip(model_name, pretrained, device)
+    elif backend == "siglip":
+        model, preprocess, tokenizer = _load_siglip(model_name, pretrained, device)
+    else:
+        raise ValueError(f"Unsupported encoder backend: {backend}")
+    setattr(model, "backend_name", backend)
+    setattr(model, "model_name", model_name)
+    setattr(model, "pretrained_name", pretrained)
+    return model, preprocess, tokenizer
+
+
 @torch.no_grad()
 def _encode_texts(
     model,
@@ -424,6 +477,9 @@ def _encode_rows_to_cache(
             "num_encoded_rows": len(labels),
             "missing_images": missing_images,
             "invalid_crops": invalid_crops,
+            "encoder_backend": str(getattr(model, "backend_name", "")),
+            "encoder_model": str(getattr(model, "model_name", "")),
+            "encoder_pretrained": str(getattr(model, "pretrained_name", "")),
             "image_mode": image_mode,
             "crop_margin": crop_margin,
             "box_line_width": int(box_line_width),
@@ -462,7 +518,7 @@ def _load_or_build_cache(
     if jsonl_path is None:
         raise ValueError(f"{split} cache does not exist; pass --{split}-jsonl to build it.")
     if model is None or preprocess is None or tokenizer is None:
-        raise ValueError("OpenCLIP model/preprocess/tokenizer are required to build feature caches.")
+        raise ValueError("Feature encoder model/preprocess/tokenizer are required to build feature caches.")
 
     rows = _read_jsonl(jsonl_path)
     rows = _sample_rows(
@@ -1041,6 +1097,10 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
     best_score = -float("inf")
     best_epoch = -1
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    train_meta = train_cache.get("meta", {})
+    encoder_backend = str(train_meta.get("encoder_backend") or args.encoder_backend)
+    encoder_model = str(train_meta.get("encoder_model") or args.model)
+    encoder_pretrained = str(train_meta.get("encoder_pretrained") or args.pretrained)
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -1142,6 +1202,9 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
                     "verifier_arch": args.verifier_arch,
                     "projection_dim": args.projection_dim,
                     "feature_mode": args.feature_mode,
+                    "encoder_backend": encoder_backend,
+                    "encoder_model": encoder_model,
+                    "encoder_pretrained": encoder_pretrained,
                     "target_field": args.target_field,
                     "weight_field": args.weight_field,
                     "image_mode": args.image_mode,
@@ -1209,13 +1272,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("output/d3_crop_verifier_w075"))
     parser.add_argument("--image-root", type=Path, default=Path("dataset/d3/images"))
     parser.add_argument("--prompt-template", default="the described target is {phrase}")
-    parser.add_argument("--model", default="convnext_large_d_320")
-    parser.add_argument("--pretrained", default="laion2b_s29b_b131k_ft_soup")
+    parser.add_argument(
+        "--encoder-backend",
+        choices=("open_clip", "siglip"),
+        default="open_clip",
+        help="Feature encoder backend used to build crop/text caches.",
+    )
+    parser.add_argument(
+        "--model",
+        default="convnext_large_d_320",
+        help="OpenCLIP model name or HuggingFace model id for --encoder-backend siglip.",
+    )
+    parser.add_argument(
+        "--pretrained",
+        default="laion2b_s29b_b131k_ft_soup",
+        help="OpenCLIP pretrained tag. Ignored by --encoder-backend siglip.",
+    )
     parser.add_argument(
         "--image-mode",
         choices=("crop", "boxed"),
         default="crop",
-        help="Region image passed to OpenCLIP. boxed uses the full image with a red target box.",
+        help="Region image passed to the encoder. boxed uses the full image with a red target box.",
     )
     parser.add_argument("--crop-margin", type=float, default=0.1)
     parser.add_argument("--box-line-width", type=int, default=6)
@@ -1328,7 +1405,12 @@ def main() -> None:
 
     model = preprocess = tokenizer = None
     if needs_encoding:
-        model, preprocess, tokenizer = _load_openclip(args.model, args.pretrained, args.device)
+        model, preprocess, tokenizer = _load_encoder(
+            args.encoder_backend,
+            args.model,
+            args.pretrained,
+            args.device,
+        )
 
     train_cache = _load_or_build_cache(
         split="train",
