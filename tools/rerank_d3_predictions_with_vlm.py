@@ -145,6 +145,40 @@ def _build_uncached_inputs(
     return proposals, category_scores, base_scores
 
 
+def _build_emitted_inputs(
+    *,
+    preds: Sequence[Mapping[str, Any]],
+    candidate_topk: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    sorted_preds = sorted(preds, key=lambda item: float(item.get("score", 0.0)), reverse=True)
+    if candidate_topk > 0:
+        sorted_preds = sorted_preds[:candidate_topk]
+
+    proposals: List[Dict[str, Any]] = []
+    pairs: List[Dict[str, Any]] = []
+    for idx, pred in enumerate(sorted_preds):
+        score = float(pred.get("score", 0.0))
+        category_id = int(pred["category_id"])
+        proposals.append(
+            {
+                "bbox": [float(value) for value in pred["bbox"]],
+                "score": score,
+                "source_category_id": category_id,
+            }
+        )
+        pairs.append(
+            {
+                "proposal_idx": int(idx),
+                "category_idx": -1,
+                "category_id": category_id,
+                "base_score": score,
+                "candidate_score": score,
+                "vlm_base_score": score,
+            }
+        )
+    return proposals, pairs
+
+
 def _bbox_signature(bbox: Sequence[float]) -> str:
     return ",".join(f"{float(value):.2f}" for value in bbox)
 
@@ -429,7 +463,12 @@ def rerank(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Dict[str, An
             continue
         processed_image_ids.append(image_id)
 
-        if args.candidate_source == "cache_signal":
+        if args.candidate_source == "emitted":
+            proposals, candidate_pairs = _build_emitted_inputs(
+                preds=preds,
+                candidate_topk=args.candidate_topk_per_image,
+            )
+        elif args.candidate_source == "cache_signal":
             if args.candidate_score_cache_dir is None:
                 raise ValueError("--candidate-source cache_signal requires --candidate-score-cache-dir.")
             cache = _load_candidate_cache(args.candidate_score_cache_dir, image_id)
@@ -458,13 +497,14 @@ def rerank(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Dict[str, An
 
         if not proposals:
             continue
-        candidate_pairs = _select_candidate_pairs(
-            proposals=proposals,
-            base_scores=base_scores,
-            candidate_scores=candidate_scores,
-            category_ids=category_ids,
-            args=args,
-        )
+        if args.candidate_source != "emitted":
+            candidate_pairs = _select_candidate_pairs(
+                proposals=proposals,
+                base_scores=base_scores,
+                candidate_scores=candidate_scores,
+                category_ids=category_ids,
+                args=args,
+            )
         if not candidate_pairs:
             continue
 
@@ -562,7 +602,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--phrases-json", type=Path, default=Path("dataset/metadata/d3_phrases.json"))
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--image-id-jsonl", type=Path, default=None)
-    parser.add_argument("--candidate-source", choices=("category_score", "cache_signal"), default="cache_signal")
+    parser.add_argument(
+        "--candidate-source",
+        choices=("category_score", "cache_signal", "emitted"),
+        default="cache_signal",
+        help=(
+            "Candidate generation mode. emitted scores the detector's original category predictions directly; "
+            "category_score/cache_signal build class-agnostic proposals and phrase expansion candidates."
+        ),
+    )
     parser.add_argument("--candidate-score-cache-dir", type=Path, default=None)
     parser.add_argument("--candidate-topk-per-image", type=int, default=50)
     parser.add_argument("--candidate-verifier-fusion", choices=("logit_add", "linear", "replace"), default="logit_add")

@@ -31,7 +31,7 @@ from rerank_d3_predictions_with_clip_crops import (  # noqa: E402
     _load_json,
     _select_class_agnostic_proposals,
 )
-from rerank_d3_predictions_with_vlm import _bbox_signature, _load_vlm_score_cache  # noqa: E402
+from rerank_d3_predictions_with_vlm import _bbox_signature, _cache_key, _load_vlm_score_cache  # noqa: E402
 
 
 def _jsonable_args(args: argparse.Namespace) -> Dict[str, Any]:
@@ -97,7 +97,8 @@ def build_pairs(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Dict[st
     category_ids = sorted(categories_by_id)
     category_to_row = {category_id: idx for idx, category_id in enumerate(category_ids)}
     grouped_predictions = _group_predictions(predictions)
-    vlm_rows_by_image = _group_vlm_rows(_load_vlm_score_cache(args.vlm_score_cache))
+    vlm_cache = _load_vlm_score_cache(args.vlm_score_cache)
+    vlm_rows_by_image = _group_vlm_rows(vlm_cache)
 
     image_ids = sorted(set(grouped_predictions) & set(vlm_rows_by_image))
     if args.image_id_jsonl is not None:
@@ -121,64 +122,99 @@ def build_pairs(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Dict[st
             missing_images += 1
             continue
 
-        proposals = _select_class_agnostic_proposals(
-            preds,
-            topk=args.proposal_topk_per_image,
-            nms_thresh=args.proposal_nms_thresh,
-        )
-        if not proposals:
-            missing_proposals += len(vlm_rows_by_image[image_id])
-            continue
-
-        proposal_by_bbox = {
-            _bbox_signature(proposal["bbox"]): (idx, proposal) for idx, proposal in enumerate(proposals)
-        }
-        category_scores = _expanded_category_scores(
-            proposals,
-            preds,
-            category_to_row=category_to_row,
-            num_categories=len(category_ids),
-            match_iou=args.category_score_match_iou,
-        )
-        base_scores = _expanded_base_scores_from_category_scores(
-            proposals,
-            category_scores,
-            num_categories=len(category_ids),
-            mode=args.expanded_base_score,
-            missing_category_score_scale=args.missing_category_score_scale,
-        )
-
         split = "val" if image_id in val_ids else "train"
         image_items: List[Dict[str, Any]] = []
-        for vlm_row in vlm_rows_by_image[image_id]:
-            if args.require_parse_ok and not bool(vlm_row.get("parse_ok", False)):
-                skipped_parse_failures += 1
-                continue
-
-            target_category_id = int(vlm_row["category_id"])
-            category_idx = category_to_row.get(target_category_id)
-            if category_idx is None:
-                invalid_categories += 1
-                continue
-            proposal_item = proposal_by_bbox.get(_bbox_signature(vlm_row["bbox"]))
-            if proposal_item is None:
-                missing_proposals += 1
-                continue
-
-            proposal_idx, proposal = proposal_item
-            base_score = float(base_scores[proposal_idx, category_idx])
-            soft_label = float(np.clip(float(vlm_row["vlm_score"]), 0.0, 1.0))
-            image_items.append(
-                {
-                    "vlm_row": vlm_row,
-                    "proposal_idx": int(proposal_idx),
-                    "proposal": proposal,
-                    "category_idx": int(category_idx),
-                    "target_category_id": int(target_category_id),
-                    "base_score": base_score,
-                    "soft_label": soft_label,
-                }
+        if args.candidate_mode == "emitted":
+            emitted_preds = sorted(preds, key=lambda item: float(item.get("score", 0.0)), reverse=True)
+            if args.candidate_topk_per_image > 0:
+                emitted_preds = emitted_preds[: args.candidate_topk_per_image]
+            for proposal_idx, pred in enumerate(emitted_preds):
+                target_category_id = int(pred["category_id"])
+                category_idx = category_to_row.get(target_category_id)
+                if category_idx is None:
+                    invalid_categories += 1
+                    continue
+                vlm_row = vlm_cache.get(_cache_key(image_id, target_category_id, pred["bbox"]))
+                if vlm_row is None:
+                    missing_proposals += 1
+                    continue
+                if args.require_parse_ok and not bool(vlm_row.get("parse_ok", False)):
+                    skipped_parse_failures += 1
+                    continue
+                base_score = float(pred.get("score", 0.0))
+                soft_label = float(np.clip(float(vlm_row["vlm_score"]), 0.0, 1.0))
+                image_items.append(
+                    {
+                        "vlm_row": vlm_row,
+                        "proposal_idx": int(proposal_idx),
+                        "proposal": {
+                            "bbox": [float(value) for value in pred["bbox"]],
+                            "score": base_score,
+                            "source_category_id": target_category_id,
+                        },
+                        "category_idx": int(category_idx),
+                        "target_category_id": int(target_category_id),
+                        "base_score": base_score,
+                        "soft_label": soft_label,
+                    }
+                )
+        else:
+            proposals = _select_class_agnostic_proposals(
+                preds,
+                topk=args.proposal_topk_per_image,
+                nms_thresh=args.proposal_nms_thresh,
             )
+            if not proposals:
+                missing_proposals += len(vlm_rows_by_image[image_id])
+                continue
+
+            proposal_by_bbox = {
+                _bbox_signature(proposal["bbox"]): (idx, proposal) for idx, proposal in enumerate(proposals)
+            }
+            category_scores = _expanded_category_scores(
+                proposals,
+                preds,
+                category_to_row=category_to_row,
+                num_categories=len(category_ids),
+                match_iou=args.category_score_match_iou,
+            )
+            base_scores = _expanded_base_scores_from_category_scores(
+                proposals,
+                category_scores,
+                num_categories=len(category_ids),
+                mode=args.expanded_base_score,
+                missing_category_score_scale=args.missing_category_score_scale,
+            )
+
+            for vlm_row in vlm_rows_by_image[image_id]:
+                if args.require_parse_ok and not bool(vlm_row.get("parse_ok", False)):
+                    skipped_parse_failures += 1
+                    continue
+
+                target_category_id = int(vlm_row["category_id"])
+                category_idx = category_to_row.get(target_category_id)
+                if category_idx is None:
+                    invalid_categories += 1
+                    continue
+                proposal_item = proposal_by_bbox.get(_bbox_signature(vlm_row["bbox"]))
+                if proposal_item is None:
+                    missing_proposals += 1
+                    continue
+
+                proposal_idx, proposal = proposal_item
+                base_score = float(base_scores[proposal_idx, category_idx])
+                soft_label = float(np.clip(float(vlm_row["vlm_score"]), 0.0, 1.0))
+                image_items.append(
+                    {
+                        "vlm_row": vlm_row,
+                        "proposal_idx": int(proposal_idx),
+                        "proposal": proposal,
+                        "category_idx": int(category_idx),
+                        "target_category_id": int(target_category_id),
+                        "base_score": base_score,
+                        "soft_label": soft_label,
+                    }
+                )
 
         image_items.sort(key=lambda item: float(item["base_score"]), reverse=True)
         for candidate_rank, item in enumerate(image_items, start=1):
@@ -258,6 +294,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--phrases-json", type=Path, default=Path("dataset/metadata/d3_phrases.json"))
     parser.add_argument("--image-id-jsonl", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--candidate-mode",
+        choices=("expanded", "emitted"),
+        default="expanded",
+        help=(
+            "Candidate interpretation for cached VLM scores. expanded matches the class-agnostic "
+            "proposal x phrase cache; emitted matches detector-emitted category predictions directly."
+        ),
+    )
+    parser.add_argument(
+        "--candidate-topk-per-image",
+        type=int,
+        default=100,
+        help="Detector-emitted predictions per image to use with --candidate-mode emitted.",
+    )
     parser.add_argument("--proposal-topk-per-image", type=int, default=100)
     parser.add_argument("--proposal-nms-thresh", type=float, default=0.9)
     parser.add_argument("--expanded-base-score", choices=("category_score", "objectness"), default="category_score")
