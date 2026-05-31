@@ -25,6 +25,10 @@ ABS parallel:  28.8
 
 Those are the sanity targets for the baseline environment.
 
+GroundingDINO note: `bbox_head.num_classes` is the text-token classification
+width, not the D3 phrase count. Keep it at the OpenMMLab default `256`; the
+422 D3 phrases enter through `DODDataset` text/positive maps.
+
 ## Setup
 
 On AutoDL, keep MMDetection outside this repo:

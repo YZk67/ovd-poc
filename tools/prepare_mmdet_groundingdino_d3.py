@@ -64,7 +64,10 @@ lang_model_name = {_quote(lang_model_name)}
 
 model = dict(
     language_model=dict(name=lang_model_name),
-    bbox_head=dict(num_classes={num_classes}),
+    # GroundingDINO predicts over text-token positions, not dataset category ids.
+    # Keep the OpenMMLab default text-token classification width; D3's 422
+    # phrases are supplied through DODDataset text/positive maps.
+    bbox_head=dict(num_classes={args.text_token_classes}),
     test_cfg=dict(max_per_img={args.max_per_img}),
 )
 
@@ -194,6 +197,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--max-per-img", type=int, default=300)
+    parser.add_argument(
+        "--text-token-classes",
+        type=int,
+        default=256,
+        help="GroundingDINO head text-token classification width; do not set this to D3 category count.",
+    )
     parser.add_argument("--test-short-edge", type=int, default=800)
     parser.add_argument("--test-long-edge", type=int, default=1333)
     return parser.parse_args()
