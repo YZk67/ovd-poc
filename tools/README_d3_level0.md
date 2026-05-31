@@ -2,6 +2,24 @@
 
 这个接入把 D3 的 `sent_id` 当成固定检测类别，先验证现有 LaMI-DETR checkpoint 能否在 D3 上走完整的 `box + sent_id -> COCO-style AP` 流水线。
 
+## 0. 不要混淆实验协议
+
+后续所有 D3 数字必须先标清楚属于哪条协议。不同协议的 AP 不能横向比较，也不能把一个协议里的目标替换成另一个协议里的目标。
+
+| Protocol | Prediction source / method family | Typical numbers in this repo | How to use it |
+|:--|:--|:--|:--|
+| D3 detector / proposal-source eval | LaMI-DINO, ROI verifier, OWLv2/GroundingDINO proposals, detector-internal verifier | `7 -> 10/11 -> 19 strict-val`, OWLv2/rerank plateau around `24` | This is the paper/SOTA line. The `30+` target belongs here. |
+| APE post-hoc rerank strict subset | Existing APE prediction JSON (`ape_b_same2116_full.json`) plus crop/SigLIP/Qwen verifier fusion | APE direct around `48.8`, rerank around `49.x`, possible `50+` target | Diagnostic/teacher/proposal reference only. Do not call this D3 detector SOTA. |
+| Verifier binary validation | Crop/ROI/token verifier AP/AUC on constructed pair datasets | e.g. verifier AP/AUC around `0.87/0.95` | Measures pair classification quality only. Not COCO bbox AP. |
+
+Guardrails:
+
+- Every result table must state the prediction source, annotation JSON, evaluated image set, and whether it uses external test-time reranking.
+- `50+` belongs to the APE post-hoc rerank protocol; it is not the same goal as pushing the D3 detector/proposal-source line to `30+`.
+- The main ICLR/SOTA target is the detector/proposal-source protocol: strong proposal source plus description-aware phrase reranking or detector-internal verifier.
+- APE strict-subset results can guide teacher labels and scorer design, but they should not be mixed with LaMI-DINO/OWLv2/GroundingDINO detector AP in claims.
+- If a number looks unexpectedly high, first check whether it came from an already-strong APE prediction file rather than a detector/proposal-source run.
+
 ## 1. 准备 D3 数据
 
 官方下载后至少需要：
