@@ -912,6 +912,20 @@ def _subset_metrics(
     return _binary_metrics(logits[mask], labels[mask])
 
 
+def _is_valid_selection_metric(metrics: Mapping[str, Any]) -> bool:
+    return int(metrics.get("positive", 0)) > 0 and int(metrics.get("negative", 0)) > 0
+
+
+def _select_checkpoint_score(val_metrics: Mapping[str, Any]) -> Tuple[str, float]:
+    for name in ("wrong_phrase_same_region", "same_phrase_bad_box", "overall"):
+        metrics = val_metrics[name]
+        if _is_valid_selection_metric(metrics):
+            score = float(metrics["ap"])
+            if not math.isnan(score):
+                return f"{name}_ap", score
+    return "overall_ap", float("-inf")
+
+
 def _weighted_bce_loss(logits: torch.Tensor, targets: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
     weights = weights.to(dtype=loss.dtype)
@@ -1095,6 +1109,7 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
 
     history: List[Dict[str, Any]] = []
     best_score = -float("inf")
+    best_metric = ""
     best_epoch = -1
     args.output_dir.mkdir(parents=True, exist_ok=True)
     train_meta = train_cache.get("meta", {})
@@ -1187,11 +1202,10 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
         }
         history.append(epoch_record)
 
-        wrong_ap = float(val_metrics["wrong_phrase_same_region"]["ap"])
-        overall_ap = float(val_metrics["overall"]["ap"])
-        score = wrong_ap if not math.isnan(wrong_ap) else overall_ap
+        score_metric, score = _select_checkpoint_score(val_metrics)
         if score > best_score:
             best_score = score
+            best_metric = score_metric
             best_epoch = epoch
             torch.save(
                 {
@@ -1209,6 +1223,7 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
                     "weight_field": args.weight_field,
                     "image_mode": args.image_mode,
                     "loss_type": args.loss_type,
+                    "score_metric": score_metric,
                     "listwise_weight": args.listwise_weight,
                     "listwise_topk": args.listwise_topk,
                     "listwise_temperature": args.listwise_temperature,
@@ -1246,6 +1261,7 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
                 {
                     "best_epoch": best_epoch,
                     "best_score": best_score,
+                    "best_metric": best_metric,
                     "history": history,
                     "args": _jsonable_args(args),
                     "train_cache_meta": train_cache.get("meta", {}),
@@ -1258,6 +1274,7 @@ def train(args: argparse.Namespace, train_cache: Mapping[str, Any], val_cache: M
     return {
         "best_epoch": best_epoch,
         "best_score": best_score,
+        "best_metric": best_metric,
         "history": history,
     }
 
