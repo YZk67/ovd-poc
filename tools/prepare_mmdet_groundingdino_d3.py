@@ -119,6 +119,9 @@ test_evaluator = dict(
 val_evaluator = test_evaluator
 
 train_cfg = None
+train_dataloader = None
+optim_wrapper = None
+param_scheduler = None
 """
 
 

@@ -36,12 +36,26 @@ cd "$MMDET_DIR"
 pip install -U openmim
 mim install "mmcv>=2.0.0"
 pip install -r requirements/multimodal.txt
+pip install "transformers<5" "huggingface-hub<1"
 pip install -v -e .
 pip install ddd-dataset
 ```
 
 If HuggingFace access is unavailable, download `bert-base-uncased` elsewhere and
 pass `--bert-path /path/to/bert-base-uncased` to the preparation script below.
+
+If editable install fails with a PEP 660 error, use non-editable install:
+
+```bash
+pip install -v . --no-build-isolation
+```
+
+Keep NumPy below 2 for PyTorch/mmcv compatibility:
+
+```bash
+pip install "numpy<2" "opencv-python<4.10" --force-reinstall
+pip install "numpy<2" --force-reinstall
+```
 
 ## Generate The Baseline Config
 
