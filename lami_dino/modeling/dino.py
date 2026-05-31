@@ -17,7 +17,7 @@ import os
 import copy
 import math
 import json
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -150,6 +150,15 @@ class DINO(nn.Module):
         region_verifier_train_detach_region_features: bool = True,
         region_verifier_train_loss_type: str = "bce",
         region_verifier_ranking_margin: float = 0.0,
+        qwen_proposal_supervision_enabled: bool = False,
+        qwen_proposal_jsonl: Optional[str] = None,
+        qwen_proposal_topk_per_image: int = 100,
+        qwen_proposal_match_iou: float = 0.5,
+        qwen_proposal_positive_threshold: float = 0.6,
+        qwen_proposal_negative_threshold: float = 0.3,
+        qwen_proposal_rank_margin: float = 0.2,
+        qwen_proposal_max_rank_pairs: int = 1024,
+        qwen_proposal_use_sample_weight: bool = True,
     ):
         super().__init__()
         self.vlm_temperature = vlm_temperature
@@ -189,6 +198,29 @@ class DINO(nn.Module):
         self.region_verifier = None
         self.region_verifier_feature_mode = str(region_verifier_train_feature_mode)
         self.region_verifier_text_embedding = None
+        self.qwen_proposal_supervision_enabled = bool(qwen_proposal_supervision_enabled)
+        self.qwen_proposal_jsonl = qwen_proposal_jsonl
+        self.qwen_proposal_topk_per_image = int(qwen_proposal_topk_per_image)
+        self.qwen_proposal_match_iou = float(qwen_proposal_match_iou)
+        self.qwen_proposal_positive_threshold = float(qwen_proposal_positive_threshold)
+        self.qwen_proposal_negative_threshold = float(qwen_proposal_negative_threshold)
+        self.qwen_proposal_rank_margin = float(qwen_proposal_rank_margin)
+        self.qwen_proposal_max_rank_pairs = int(qwen_proposal_max_rank_pairs)
+        self.qwen_proposal_use_sample_weight = bool(qwen_proposal_use_sample_weight)
+        self.qwen_proposals_by_image: Dict[int, List[Dict[str, Any]]] = {}
+        self.qwen_proposals_by_file: Dict[str, List[Dict[str, Any]]] = {}
+        if self.qwen_proposal_supervision_enabled:
+            if not self.qwen_proposal_jsonl:
+                raise ValueError("qwen_proposal_jsonl is required when Qwen proposal supervision is enabled.")
+            self.qwen_proposals_by_image, self.qwen_proposals_by_file = self._load_qwen_proposal_supervision(
+                self.qwen_proposal_jsonl
+            )
+            num_qwen_images = len(self.qwen_proposals_by_image)
+            num_qwen_rows = sum(len(rows) for rows in self.qwen_proposals_by_image.values())
+            logger_rpsa.warning(
+                f"[QwenProposal] loaded {num_qwen_rows} train rows for {num_qwen_images} images "
+                f"from {self.qwen_proposal_jsonl}"
+            )
         if dn_label_embed_source not in {"query", "classifier"}:
             raise ValueError(
                 "dn_label_embed_source must be 'query' or 'classifier', "
@@ -631,6 +663,74 @@ class DINO(nn.Module):
         union = area1[:, None] + area2[None, :] - inter
         return torch.where(union > 0, inter / union.clamp(min=1e-6), torch.zeros_like(inter))
 
+    @staticmethod
+    def _load_qwen_proposal_supervision(path: str) -> Tuple[Dict[int, List[Dict[str, Any]]], Dict[str, List[Dict[str, Any]]]]:
+        proposals_by_image: Dict[int, List[Dict[str, Any]]] = {}
+        proposals_by_file: Dict[str, List[Dict[str, Any]]] = {}
+        path_obj = os.fspath(path)
+        if not os.path.exists(path_obj):
+            raise FileNotFoundError(f"Qwen proposal supervision JSONL not found: {path_obj}")
+
+        with open(path_obj, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                if row.get("split") not in (None, "train"):
+                    continue
+                bbox = row.get("bbox")
+                category_idx = row.get("category_idx")
+                if not isinstance(bbox, list) or len(bbox) != 4 or category_idx is None:
+                    continue
+                item = {
+                    "bbox": [float(value) for value in bbox],
+                    "category_idx": int(category_idx),
+                    "soft_label": float(row.get("soft_label", row.get("vlm_score", 0.0))),
+                    "sample_weight": float(row.get("sample_weight", 1.0)),
+                    "candidate_rank": int(row.get("candidate_rank", row.get("proposal_idx", 0))),
+                }
+                image_id = row.get("image_id")
+                if image_id is not None:
+                    proposals_by_image.setdefault(int(image_id), []).append(item)
+                file_name = row.get("file_name")
+                if file_name:
+                    proposals_by_file.setdefault(os.path.basename(str(file_name)), []).append(item)
+
+        def _sort_key(item: Dict[str, Any]) -> Tuple[int, float]:
+            return int(item.get("candidate_rank", 0)), -float(item.get("sample_weight", 1.0))
+
+        for rows in proposals_by_image.values():
+            rows.sort(key=_sort_key)
+        for rows in proposals_by_file.values():
+            rows.sort(key=_sort_key)
+        return proposals_by_image, proposals_by_file
+
+    def _qwen_rows_for_input(self, batched_input: Dict[str, Any]) -> List[Dict[str, Any]]:
+        image_id = batched_input.get("image_id")
+        if image_id is not None:
+            rows = self.qwen_proposals_by_image.get(int(image_id), [])
+            if rows:
+                return rows
+        file_name = batched_input.get("file_name")
+        if file_name:
+            return self.qwen_proposals_by_file.get(os.path.basename(str(file_name)), [])
+        return []
+
+    @staticmethod
+    def _qwen_bbox_xywh_to_cxcywh(
+        boxes_xywh: torch.Tensor,
+        *,
+        width: float,
+        height: float,
+    ) -> torch.Tensor:
+        boxes_xyxy = boxes_xywh.clone()
+        boxes_xyxy[:, 2] = boxes_xyxy[:, 0] + boxes_xyxy[:, 2]
+        boxes_xyxy[:, 3] = boxes_xyxy[:, 1] + boxes_xyxy[:, 3]
+        scale = boxes_xyxy.new_tensor([width, height, width, height]).clamp(min=1.0)
+        boxes_xyxy = (boxes_xyxy / scale).clamp(min=0.0, max=1.0)
+        return box_xyxy_to_cxcywh(boxes_xyxy)
+
     def _sample_wrong_phrase_labels(
         self,
         *,
@@ -677,6 +777,113 @@ class DINO(nn.Module):
         detector_scores.append(detector_score.reshape(()))
         labels.append(region_feat.new_tensor(label))
         group_ids.append(group_id)
+
+    def compute_qwen_proposal_supervision_loss(
+        self,
+        output,
+        batched_inputs,
+    ) -> Dict[str, torch.Tensor]:
+        pred_logits = output["pred_logits"]
+        pred_boxes = output["pred_boxes"]
+        zero = pred_logits.sum() * 0.0
+        if not self.qwen_proposal_supervision_enabled:
+            return {"loss_qwen_soft": zero, "loss_qwen_rank": zero}
+
+        device = pred_logits.device
+        dtype = pred_logits.dtype
+        num_classes = pred_logits.shape[-1]
+        soft_losses: List[torch.Tensor] = []
+        rank_losses: List[torch.Tensor] = []
+        num_rows = 0
+        num_matched = 0
+        rank_pair_count = 0
+        iou_sum = 0.0
+
+        for batch_idx, batched_input in enumerate(batched_inputs):
+            rows = self._qwen_rows_for_input(batched_input)
+            if not rows:
+                continue
+            if self.qwen_proposal_topk_per_image > 0:
+                rows = rows[: self.qwen_proposal_topk_per_image]
+
+            width = float(batched_input.get("width", 0) or 0)
+            height = float(batched_input.get("height", 0) or 0)
+            if width <= 0 or height <= 0:
+                continue
+
+            boxes_xywh = torch.as_tensor([row["bbox"] for row in rows], device=device, dtype=dtype)
+            category_idx = torch.as_tensor([row["category_idx"] for row in rows], device=device, dtype=torch.long)
+            qwen_scores = torch.as_tensor([row["soft_label"] for row in rows], device=device, dtype=dtype).clamp(
+                min=0.0, max=1.0
+            )
+            sample_weights = torch.as_tensor(
+                [row.get("sample_weight", 1.0) for row in rows],
+                device=device,
+                dtype=dtype,
+            ).clamp(min=0.0)
+
+            valid_category = (category_idx >= 0) & (category_idx < num_classes)
+            if not valid_category.any():
+                continue
+            boxes_xywh = boxes_xywh[valid_category]
+            category_idx = category_idx[valid_category]
+            qwen_scores = qwen_scores[valid_category]
+            sample_weights = sample_weights[valid_category]
+            num_rows += int(category_idx.numel())
+
+            teacher_boxes = self._qwen_bbox_xywh_to_cxcywh(boxes_xywh, width=width, height=height)
+            ious = self._pairwise_iou_cxcywh(pred_boxes[batch_idx].detach(), teacher_boxes)
+            best_iou, best_query = ious.max(dim=0)
+            keep = best_iou >= self.qwen_proposal_match_iou
+            if not keep.any():
+                continue
+
+            best_iou = best_iou[keep]
+            best_query = best_query[keep]
+            category_idx = category_idx[keep]
+            qwen_scores = qwen_scores[keep]
+            sample_weights = sample_weights[keep]
+            if not self.qwen_proposal_use_sample_weight:
+                sample_weights = torch.ones_like(sample_weights)
+
+            matched_logits = pred_logits[batch_idx, best_query, category_idx]
+            bce = F.binary_cross_entropy_with_logits(matched_logits, qwen_scores, reduction="none")
+            weight_sum = sample_weights.sum().clamp(min=1e-6)
+            soft_losses.append((bce * sample_weights).sum() / weight_sum)
+
+            num_matched += int(keep.sum().item())
+            iou_sum += float(best_iou.sum().detach().item())
+
+            for phrase_idx in torch.unique(category_idx).tolist():
+                in_phrase = category_idx == int(phrase_idx)
+                pos_logits = matched_logits[in_phrase & (qwen_scores >= self.qwen_proposal_positive_threshold)]
+                neg_logits = matched_logits[in_phrase & (qwen_scores <= self.qwen_proposal_negative_threshold)]
+                if pos_logits.numel() == 0 or neg_logits.numel() == 0:
+                    continue
+                margin = matched_logits.new_tensor(self.qwen_proposal_rank_margin)
+                rank_matrix = F.softplus(margin - (pos_logits[:, None] - neg_logits[None, :])).reshape(-1)
+                if self.qwen_proposal_max_rank_pairs > 0 and rank_matrix.numel() > self.qwen_proposal_max_rank_pairs:
+                    keep_rank = torch.randperm(rank_matrix.numel(), device=device)[: self.qwen_proposal_max_rank_pairs]
+                    rank_matrix = rank_matrix[keep_rank]
+                rank_pair_count += int(rank_matrix.numel())
+                rank_losses.append(rank_matrix.mean())
+
+        loss_soft = torch.stack(soft_losses).mean() if soft_losses else zero
+        loss_rank = torch.stack(rank_losses).mean() if rank_losses else zero
+
+        try:
+            storage = get_event_storage()
+            storage.put_scalar("qwen_proposal_num_rows", float(num_rows), smoothing_hint=False)
+            storage.put_scalar("qwen_proposal_num_matched", float(num_matched), smoothing_hint=False)
+            match_rate = float(num_matched) / float(max(1, num_rows))
+            storage.put_scalar("qwen_proposal_match_rate", match_rate, smoothing_hint=False)
+            if num_matched > 0:
+                storage.put_scalar("qwen_proposal_mean_iou", iou_sum / float(num_matched), smoothing_hint=False)
+            storage.put_scalar("qwen_proposal_rank_pairs", float(rank_pair_count), smoothing_hint=False)
+        except AssertionError:
+            pass
+
+        return {"loss_qwen_soft": loss_soft, "loss_qwen_rank": loss_rank}
 
     def compute_region_verifier_training_loss(
         self,
@@ -1296,6 +1503,13 @@ class DINO(nn.Module):
 
         if self.training:
             loss_dict = self.criterion(output, targets, dn_meta)
+            if self.qwen_proposal_supervision_enabled:
+                loss_dict.update(
+                    self.compute_qwen_proposal_supervision_loss(
+                        output,
+                        batched_inputs,
+                    )
+                )
             if self.region_verifier_train_enabled:
                 loss_dict["loss_region_verifier"] = self.compute_region_verifier_training_loss(
                     output,

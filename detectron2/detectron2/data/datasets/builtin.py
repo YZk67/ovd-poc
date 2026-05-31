@@ -60,6 +60,8 @@ _PREDEFINED_SPLITS_COCO["d3"] = {
     "d3_intra_full": (_D3_IMAGE_ROOT, os.getenv("D3_INTRA_FULL_JSON", "d3/annotations/d3_intra_full.json")),
     "d3_intra_pres": (_D3_IMAGE_ROOT, os.getenv("D3_INTRA_PRES_JSON", "d3/annotations/d3_intra_pres.json")),
     "d3_intra_abs": (_D3_IMAGE_ROOT, os.getenv("D3_INTRA_ABS_JSON", "d3/annotations/d3_intra_abs.json")),
+    "d3_strict_train": (_D3_IMAGE_ROOT, os.getenv("D3_STRICT_TRAIN_JSON", "d3/annotations/d3_strict_train.json")),
+    "d3_strict_val": (_D3_IMAGE_ROOT, os.getenv("D3_STRICT_VAL_JSON", "d3/annotations/d3_strict_val.json")),
 }
 
 _PREDEFINED_SPLITS_COCO["coco_zeroshot"] = {
