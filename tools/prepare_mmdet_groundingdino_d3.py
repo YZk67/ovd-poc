@@ -62,6 +62,26 @@ def _make_test_cfg(args: argparse.Namespace) -> str:
     return f"dict({', '.join(items)})"
 
 
+def _make_model_train_cfg() -> str:
+    return """dict(
+        assigner=dict(
+            type='HungarianAssigner',
+            match_costs=[
+                dict(type='BinaryFocalLossCost', weight=2.0),
+                dict(type='BBoxL1Cost', weight=5.0, box_format='xywh'),
+                dict(type='IoUCost', iou_mode='giou', weight=2.0),
+            ],
+        )
+    )"""
+
+
+def _make_bbox_head_cfg(args: argparse.Namespace, is_train: bool) -> str:
+    items = [f"num_classes={args.text_token_classes}"]
+    if is_train:
+        items.append("loss_iou=dict(type='GIoULoss', loss_weight=2.0)")
+    return f"dict({', '.join(items)})"
+
+
 def _quote_tuple(values: tuple[str, ...]) -> str:
     return "(" + ", ".join(_quote(value) for value in values) + ("," if len(values) == 1 else "") + ")"
 
@@ -71,6 +91,8 @@ def _make_config(args: argparse.Namespace, num_classes: int) -> str:
     lang_model_name = args.bert_path or "bert-base-uncased"
     test_cfg = _make_test_cfg(args)
     is_train = args.train_ann_file is not None
+    bbox_head_cfg = _make_bbox_head_cfg(args, is_train)
+    model_train_cfg = _make_model_train_cfg() if is_train else "None"
     use_plugin_dataset = is_train or args.use_subset_dataset
     val_ann_file = args.val_ann_file or args.d3_ann_file
     eval_ann_ref = "d3_val_ann_file" if is_train else "d3_ann_file"
@@ -106,7 +128,8 @@ model = dict(
     # GroundingDINO predicts over text-token positions, not dataset category ids.
     # Keep the OpenMMLab default text-token classification width; D3's 422
     # phrases are supplied through DODDataset text/positive maps.
-    bbox_head=dict(num_classes={args.text_token_classes}),
+    bbox_head={bbox_head_cfg},
+    train_cfg={model_train_cfg},
     test_cfg={test_cfg},
 )
 
