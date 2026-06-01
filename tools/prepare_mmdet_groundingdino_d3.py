@@ -216,7 +216,7 @@ optim_wrapper = {'''dict(
     optimizer=dict(type='AdamW', lr=''' + str(args.train_lr) + ''', weight_decay=''' + str(args.weight_decay) + '''),
     clip_grad=dict(max_norm=0.1, norm_type=2),
 )''' if is_train else 'None'}
-param_scheduler = []
+param_scheduler = {'[]' if is_train else 'None'}
 
 custom_hooks = {'''[
     dict(
