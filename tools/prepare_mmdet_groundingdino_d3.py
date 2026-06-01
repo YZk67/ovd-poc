@@ -114,7 +114,11 @@ test_dataloader = dict(
 val_dataloader = test_dataloader
 
 test_evaluator = dict(
-    type='CocoMetric',
+    # DODDataset returns image-local phrase labels at prediction time. The DOD
+    # metric maps those local labels back to global D3 sent_ids before COCO eval.
+    # Plain CocoMetric will silently evaluate the wrong category ids and can
+    # produce near-zero AP even when boxes are reasonable.
+    type='DODCocoMetric',
     ann_file=d3_ann_file,
     metric='bbox',
     format_only=False,

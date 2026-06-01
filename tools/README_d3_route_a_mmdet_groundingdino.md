@@ -29,6 +29,12 @@ GroundingDINO note: `bbox_head.num_classes` is the text-token classification
 width, not the D3 phrase count. Keep it at the OpenMMLab default `256`; the
 422 D3 phrases enter through `DODDataset` text/positive maps.
 
+Evaluator note: D3 must use `DODCocoMetric`, not plain `CocoMetric`.
+`DODDataset` predicts labels as image-local phrase indices, and the DOD metric
+maps them back to global D3 sentence ids before COCO-style bbox evaluation.
+Plain `CocoMetric` evaluates the wrong category ids and can produce invalid
+near-zero AP.
+
 ## Setup
 
 On AutoDL, keep MMDetection outside this repo:
@@ -70,7 +76,7 @@ export MMDET_DIR=/root/autodl-tmp/mmdetection
 export APE_DIR=/root/autodl-tmp/LaMI-DETR-output/d3_ape_b_full
 export D3_IMAGE_ROOT=/root/autodl-tmp/APE_datasets/D3/d3_images
 export D3_PKL_ROOT=/root/autodl-tmp/APE_datasets/D3/d3_pkl
-export D3_INTRA_FULL_JSON=/root/autodl-tmp/LaMI-DETR/dataset/d3/annotations/d3_intra_full.json
+export D3_INTRA_FULL_JSON=/root/autodl-tmp/dataset/d3/annotations/d3_intra_full.json
 
 python tools/prepare_mmdet_groundingdino_d3.py \
   --mmdet-root "$MMDET_DIR" \
