@@ -36,6 +36,8 @@ Plain `CocoMetric` evaluates the wrong category ids and can produce invalid
 near-zero AP. `DODCocoMetric` also has a smaller constructor than
 `CocoMetric`; do not pass `metric='bbox'` or `format_only=False`. The generated
 config uses `_delete_=True` so those keys do not leak in from the base config.
+Keep `sent_ids` in `PackDetInputs.meta_keys`; the metric uses it to map predicted
+image-local phrase labels back to global D3 sentence ids.
 
 ## Setup
 

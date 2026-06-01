@@ -91,6 +91,7 @@ test_pipeline = [
             'text',
             'custom_entities',
             'tokens_positive',
+            'sent_ids',
         ),
     ),
 ]
