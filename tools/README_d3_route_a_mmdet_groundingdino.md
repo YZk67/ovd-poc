@@ -29,6 +29,12 @@ GroundingDINO note: `bbox_head.num_classes` is the text-token classification
 width, not the D3 phrase count. Keep it at the OpenMMLab default `256`; the
 422 D3 phrases enter through `DODDataset` text/positive maps.
 
+Inference-mode note: OpenMMLab reports two D3 modes. `concat` is the default and
+concatenates all image-local sub-sentences into one prompt. `parallel` runs
+sub-sentences in a loop. The generated parallel config sets
+`model.test_cfg.chunked_size=1`, which exercises GroundingDINO's chunked-text
+prediction path.
+
 Evaluator note: D3 must use `DODCocoMetric`, not plain `CocoMetric`.
 `DODDataset` predicts labels as image-local phrase indices, and the DOD metric
 maps them back to global D3 sentence ids before COCO-style bbox evaluation.
@@ -88,13 +94,34 @@ python tools/prepare_mmdet_groundingdino_d3.py \
   --d3-image-root "$D3_IMAGE_ROOT" \
   --d3-pkl-root "$D3_PKL_ROOT" \
   --output-dir "$APE_DIR/route_a_mmdet_gdino_b_d3_full" \
-  --work-dir "$APE_DIR/route_a_mmdet_gdino_b_d3_full/work_dir"
+  --work-dir "$APE_DIR/route_a_mmdet_gdino_b_d3_full/work_dir" \
+  --inference-mode concat
 ```
 
 Then run the generated evaluator:
 
 ```bash
 bash "$APE_DIR/route_a_mmdet_gdino_b_d3_full/run_eval.sh"
+```
+
+To reproduce the stronger official parallel baseline, generate a separate
+output directory:
+
+```bash
+python tools/prepare_mmdet_groundingdino_d3.py \
+  --mmdet-root "$MMDET_DIR" \
+  --d3-ann-file "$D3_INTRA_FULL_JSON" \
+  --d3-image-root "$D3_IMAGE_ROOT" \
+  --d3-pkl-root "$D3_PKL_ROOT" \
+  --output-dir "$APE_DIR/route_a_mmdet_gdino_b_d3_full_parallel" \
+  --work-dir "$APE_DIR/route_a_mmdet_gdino_b_d3_full_parallel/work_dir" \
+  --bert-path /root/autodl-tmp/huggingface_models/bert-base-uncased \
+  --inference-mode parallel
+
+grep -n "chunked_size\\|DODCocoMetric\\|sent_ids" \
+  "$APE_DIR/route_a_mmdet_gdino_b_d3_full_parallel/grounding_dino_swin-b_d3_dod_eval.py"
+
+bash "$APE_DIR/route_a_mmdet_gdino_b_d3_full_parallel/run_eval.sh"
 ```
 
 If this does not land near the OpenMMLab D3 reference range, fix the environment
