@@ -64,6 +64,7 @@ def _make_test_cfg(args: argparse.Namespace) -> str:
 
 def _make_model_train_cfg() -> str:
     return """dict(
+        _delete_=True,
         assigner=dict(
             type='HungarianAssigner',
             match_costs=[
