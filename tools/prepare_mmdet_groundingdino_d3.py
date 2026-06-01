@@ -114,6 +114,7 @@ test_dataloader = dict(
 val_dataloader = test_dataloader
 
 test_evaluator = dict(
+    _delete_=True,
     # DODDataset returns image-local phrase labels at prediction time. The DOD
     # metric maps those local labels back to global D3 sent_ids before COCO eval.
     # Plain CocoMetric will silently evaluate the wrong category ids and can
