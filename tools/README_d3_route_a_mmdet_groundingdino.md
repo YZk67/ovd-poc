@@ -127,19 +127,101 @@ bash "$APE_DIR/route_a_mmdet_gdino_b_d3_full_parallel/run_eval.sh"
 If this does not land near the OpenMMLab D3 reference range, fix the environment
 or D3 paths before touching model code.
 
-## Adapter Step After Baseline
+For strict-split method development, also generate a matched strict-val
+parallel baseline:
+
+```bash
+export STRICT_DIR="$APE_DIR/strict_d3_splits_seed42"
+export STRICT_BASE="$APE_DIR/route_a_mmdet_gdino_b_d3_strict_val_parallel"
+
+python tools/prepare_mmdet_groundingdino_d3.py \
+  --mmdet-root "$MMDET_DIR" \
+  --d3-ann-file "$STRICT_DIR/d3_strict_val_annotations.json" \
+  --d3-image-root "$D3_IMAGE_ROOT" \
+  --d3-pkl-root "$D3_PKL_ROOT" \
+  --output-dir "$STRICT_BASE" \
+  --work-dir "$STRICT_BASE/work_dir" \
+  --bert-path /root/autodl-tmp/huggingface_models/bert-base-uncased \
+  --inference-mode parallel \
+  --use-subset-dataset
+
+bash "$STRICT_BASE/run_eval.sh"
+```
+
+## Adapter Training Step
+
+The first Route-A method step is a conservative description-conditioned query
+adapter on the GroundingDINO-B platform. It keeps the official checkpoint and
+freezes the visual backbone, BERT, neck, decoder, and box heads. The trainable
+surface is:
+
+```text
+text_query_adapter
+dn_query_generator.label_embedding
+```
+
+`text_query_adapter` is a zero-initialized residual MLP applied to projected
+text features before GroundingDINO's multimodal encoder. Because it is
+zero-initialized, the starting point is the reproduced `25.0` parallel baseline.
+
+Generate a strict train/val adapter config:
+
+```bash
+export STRICT_DIR="$APE_DIR/strict_d3_splits_seed42"
+export ADAPT_OUT="$APE_DIR/route_a_mmdet_gdino_b_d3_strict_text_adapter"
+
+python tools/prepare_mmdet_groundingdino_d3.py \
+  --mmdet-root "$MMDET_DIR" \
+  --d3-ann-file "$STRICT_DIR/d3_strict_val_annotations.json" \
+  --train-ann-file "$STRICT_DIR/d3_strict_train_annotations.json" \
+  --val-ann-file "$STRICT_DIR/d3_strict_val_annotations.json" \
+  --d3-image-root "$D3_IMAGE_ROOT" \
+  --d3-pkl-root "$D3_PKL_ROOT" \
+  --output-dir "$ADAPT_OUT" \
+  --work-dir "$ADAPT_OUT/work_dir" \
+  --bert-path /root/autodl-tmp/huggingface_models/bert-base-uncased \
+  --inference-mode parallel \
+  --max-iter 1000 \
+  --val-interval 500 \
+  --checkpoint-interval 500 \
+  --train-lr 0.0001
+
+grep -n "GroundingDINOTextQueryAdapter\|text_query_adapter\|TrainableParamFreezeHook\|chunked_size" \
+  "$ADAPT_OUT/grounding_dino_swin-b_d3_dod_adapter_train.py"
+```
+
+Run a short smoke first by replacing `--max-iter 1000` with `--max-iter 20`
+and `--val-interval 20`. Once that passes:
+
+```bash
+bash "$ADAPT_OUT/run_train.sh"
+```
+
+Evaluate the saved adapter checkpoint on strict val:
+
+```bash
+cd "$MMDET_DIR"
+export PYTHONPATH=/root/LaMI-DETR:${PYTHONPATH:-}
+
+python tools/test.py \
+  "$ADAPT_OUT/grounding_dino_swin-b_d3_dod_adapter_train.py" \
+  "$ADAPT_OUT/work_dir/iter_1000.pth" \
+  --work-dir "$ADAPT_OUT/eval_iter1000"
+```
+
+This strict split run is for method development and should beat the matched
+strict GroundingDINO-B parallel baseline before running larger final comparisons.
+
+## Adapter Roadmap
 
 After baseline reproduction, patch MMDetection rather than this ConvNeXt-L repo:
 
-1. Add a small text/query adapter in the GroundingDINO path that maps phrase text
-   features into the query-selection / decoder-conditioning space.
-2. Freeze backbone, BERT, image neck, and box regression at first. Train only the
-   adapter, matching the stable ConvNeXt-L result where `content_adapter` avoids
-   full-detector drift.
-3. Add alias-mean and alias-random description conditioning as the first
+1. Train the zero-initialized text/query adapter above and confirm it does not
+   regress the `25.0` parallel baseline.
+2. Add alias-mean and alias-random description conditioning as the first
    ablation. Keep the baseline prompt source and only change the adapter/DN
    training mechanism.
-4. Add wrong-phrase same-region negatives after the adapter is stable.
+3. Add wrong-phrase same-region negatives after the adapter is stable.
 
 Do not use APE-B, OWLv2, or post-hoc proposal stacking as the main Route A claim.
 Those can remain appendix or upper-bound experiments.
