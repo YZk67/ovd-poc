@@ -206,7 +206,7 @@ test_evaluator = dict(
 )
 val_evaluator = test_evaluator
 
-train_cfg = {f"dict(type='IterBasedTrainLoop', max_iters={args.max_iter}, val_interval={args.val_interval})" if is_train else 'None'}
+train_cfg = {f"dict(_delete_=True, type='IterBasedTrainLoop', max_iters={args.max_iter}, val_interval={args.val_interval})" if is_train else 'None'}
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 
