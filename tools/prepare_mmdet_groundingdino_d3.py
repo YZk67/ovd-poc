@@ -120,8 +120,6 @@ test_evaluator = dict(
     # produce near-zero AP even when boxes are reasonable.
     type='DODCocoMetric',
     ann_file=d3_ann_file,
-    metric='bbox',
-    format_only=False,
 )
 val_evaluator = test_evaluator
 

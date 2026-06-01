@@ -33,7 +33,8 @@ Evaluator note: D3 must use `DODCocoMetric`, not plain `CocoMetric`.
 `DODDataset` predicts labels as image-local phrase indices, and the DOD metric
 maps them back to global D3 sentence ids before COCO-style bbox evaluation.
 Plain `CocoMetric` evaluates the wrong category ids and can produce invalid
-near-zero AP.
+near-zero AP. `DODCocoMetric` also has a smaller constructor than
+`CocoMetric`; do not pass `metric='bbox'` or `format_only=False`.
 
 ## Setup
 
