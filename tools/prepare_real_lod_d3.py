@@ -233,7 +233,7 @@ custom_hooks = {'''[
 ]''' if is_train else '[]'}
 
 default_hooks = dict(
-    checkpoint=dict(type='CheckpointHook', by_epoch=False, interval={args.checkpoint_interval}, max_keep_ckpts=3),
+    checkpoint=dict(_delete_=True, type='CheckpointHook', by_epoch=False, interval={args.checkpoint_interval}, max_keep_ckpts=3),
     logger=dict(type='LoggerHook', interval={args.log_interval}),
 )
 log_processor = dict(type='LogProcessor', window_size=50, by_epoch=False)
