@@ -48,44 +48,8 @@ class ResidualTextQueryAdapter(nn.Module):
 if RealModel is not None:
 
     @MODELS.register_module()
-    class RealModelTextQueryAdapter(RealModel):
-        """Real-Model with a small description-conditioned text/query adapter."""
-
-        def __init__(
-            self, *args, text_query_adapter: Optional[dict] = None, **kwargs
-        ) -> None:
-            self.text_query_adapter_cfg = dict(text_query_adapter or {})
-            super().__init__(*args, **kwargs)
-
-        def _init_layers(self) -> None:
-            super()._init_layers()
-            cfg = {
-                "embed_dims": self.embed_dims,
-                **self.text_query_adapter_cfg,
-            }
-            self.text_query_adapter = ResidualTextQueryAdapter(**cfg)
-
-        def forward_encoder(
-            self,
-            feat: Tensor,
-            feat_mask: Tensor,
-            feat_pos: Tensor,
-            spatial_shapes: Tensor,
-            level_start_index: Tensor,
-            valid_ratios: Tensor,
-            text_dict: dict,
-        ) -> dict:
-            text_dict = dict(text_dict)
-            text_dict["embedded"] = self.text_query_adapter(text_dict["embedded"])
-            return super().forward_encoder(
-                feat=feat,
-                feat_mask=feat_mask,
-                feat_pos=feat_pos,
-                spatial_shapes=spatial_shapes,
-                level_start_index=level_start_index,
-                valid_ratios=valid_ratios,
-                text_dict=text_dict,
-            )
+    class RealModelD3PromptWrapper(RealModel):
+        """Real-Model training wrapper for D3 list prompts without adapters."""
 
         @staticmethod
         def _prompt_key(text_prompt):
@@ -162,5 +126,46 @@ if RealModel is not None:
                 **head_inputs_dict, batch_data_samples=batch_data_samples
             )
 
+    @MODELS.register_module()
+    class RealModelTextQueryAdapter(RealModelD3PromptWrapper):
+        """Real-Model with a small description-conditioned text/query adapter."""
+
+        def __init__(
+            self, *args, text_query_adapter: Optional[dict] = None, **kwargs
+        ) -> None:
+            self.text_query_adapter_cfg = dict(text_query_adapter or {})
+            super().__init__(*args, **kwargs)
+
+        def _init_layers(self) -> None:
+            super()._init_layers()
+            cfg = {
+                "embed_dims": self.embed_dims,
+                **self.text_query_adapter_cfg,
+            }
+            self.text_query_adapter = ResidualTextQueryAdapter(**cfg)
+
+        def forward_encoder(
+            self,
+            feat: Tensor,
+            feat_mask: Tensor,
+            feat_pos: Tensor,
+            spatial_shapes: Tensor,
+            level_start_index: Tensor,
+            valid_ratios: Tensor,
+            text_dict: dict,
+        ) -> dict:
+            text_dict = dict(text_dict)
+            text_dict["embedded"] = self.text_query_adapter(text_dict["embedded"])
+            return super().forward_encoder(
+                feat=feat,
+                feat_mask=feat_mask,
+                feat_pos=feat_pos,
+                spatial_shapes=spatial_shapes,
+                level_start_index=level_start_index,
+                valid_ratios=valid_ratios,
+                text_dict=text_dict,
+            )
+
 else:  # pragma: no cover - keeps local imports usable without Real-LOD installed.
+    RealModelD3PromptWrapper = None
     RealModelTextQueryAdapter = None
