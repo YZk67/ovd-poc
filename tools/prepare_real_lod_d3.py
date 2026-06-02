@@ -110,6 +110,7 @@ def _make_config(args: argparse.Namespace) -> str:
 _base_ = {_quote(base_config)}
 
 {custom_imports}\
+auto_scale_lr = dict(enable=False)
 lang_model_name = {_quote(lang_model_name)}
 {load_from}
 
