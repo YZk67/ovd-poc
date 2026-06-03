@@ -42,47 +42,8 @@ class ResidualTextQueryAdapter(nn.Module):
 
 
 @MODELS.register_module()
-class GroundingDINOTextQueryAdapter(GroundingDINO):
-    """GroundingDINO with a small description-conditioned text/query adapter.
-
-    The adapter is applied after BERT features are projected to detector hidden
-    size and before the multimodal encoder, so it affects language-guided query
-    selection and the cross-modal decoder without changing the visual backbone.
-    """
-
-    def __init__(self, *args, text_query_adapter: Optional[dict] = None, **kwargs) -> None:
-        self.text_query_adapter_cfg = dict(text_query_adapter or {})
-        super().__init__(*args, **kwargs)
-
-    def _init_layers(self) -> None:
-        super()._init_layers()
-        cfg = {
-            "embed_dims": self.embed_dims,
-            **self.text_query_adapter_cfg,
-        }
-        self.text_query_adapter = ResidualTextQueryAdapter(**cfg)
-
-    def forward_encoder(
-        self,
-        feat: Tensor,
-        feat_mask: Tensor,
-        feat_pos: Tensor,
-        spatial_shapes: Tensor,
-        level_start_index: Tensor,
-        valid_ratios: Tensor,
-        text_dict: dict,
-    ) -> dict:
-        text_dict = dict(text_dict)
-        text_dict["embedded"] = self.text_query_adapter(text_dict["embedded"])
-        return super().forward_encoder(
-            feat=feat,
-            feat_mask=feat_mask,
-            feat_pos=feat_pos,
-            spatial_shapes=spatial_shapes,
-            level_start_index=level_start_index,
-            valid_ratios=valid_ratios,
-            text_dict=text_dict,
-        )
+class GroundingDINOD3PromptWrapper(GroundingDINO):
+    """GroundingDINO with D3 list-prompt training support and no adapter."""
 
     @staticmethod
     def _prompt_key(text_prompt):
@@ -153,4 +114,48 @@ class GroundingDINOTextQueryAdapter(GroundingDINO):
         )
         return self.bbox_head.loss(
             **head_inputs_dict, batch_data_samples=batch_data_samples
+        )
+
+
+@MODELS.register_module()
+class GroundingDINOTextQueryAdapter(GroundingDINOD3PromptWrapper):
+    """GroundingDINO with a small description-conditioned text/query adapter.
+
+    The adapter is applied after BERT features are projected to detector hidden
+    size and before the multimodal encoder, so it affects language-guided query
+    selection and the cross-modal decoder without changing the visual backbone.
+    """
+
+    def __init__(self, *args, text_query_adapter: Optional[dict] = None, **kwargs) -> None:
+        self.text_query_adapter_cfg = dict(text_query_adapter or {})
+        super().__init__(*args, **kwargs)
+
+    def _init_layers(self) -> None:
+        super()._init_layers()
+        cfg = {
+            "embed_dims": self.embed_dims,
+            **self.text_query_adapter_cfg,
+        }
+        self.text_query_adapter = ResidualTextQueryAdapter(**cfg)
+
+    def forward_encoder(
+        self,
+        feat: Tensor,
+        feat_mask: Tensor,
+        feat_pos: Tensor,
+        spatial_shapes: Tensor,
+        level_start_index: Tensor,
+        valid_ratios: Tensor,
+        text_dict: dict,
+    ) -> dict:
+        text_dict = dict(text_dict)
+        text_dict["embedded"] = self.text_query_adapter(text_dict["embedded"])
+        return super().forward_encoder(
+            feat=feat,
+            feat_mask=feat_mask,
+            feat_pos=feat_pos,
+            spatial_shapes=spatial_shapes,
+            level_start_index=level_start_index,
+            valid_ratios=valid_ratios,
+            text_dict=text_dict,
         )
