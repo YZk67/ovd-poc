@@ -455,9 +455,11 @@ if RealModel is not None:
         def __init__(self, *args, negative_dn: Optional[dict] = None, **kwargs) -> None:
             self.negative_dn_cfg = dict(negative_dn or {})
             super().__init__(*args, **kwargs)
+            self._wrap_negative_dn_generator()
 
-        def _init_layers(self) -> None:
-            super()._init_layers()
+        def _wrap_negative_dn_generator(self) -> None:
+            if isinstance(self.dn_query_generator, InImageWrongPhraseCdnQueryGenerator):
+                return
             self.dn_query_generator = InImageWrongPhraseCdnQueryGenerator(
                 self.dn_query_generator,
                 **self.negative_dn_cfg,
