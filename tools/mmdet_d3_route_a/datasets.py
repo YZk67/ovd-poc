@@ -39,8 +39,16 @@ class D3SubsetDODDataset(DODDataset):
             img_info = self.d3.load_imgs(img_id)[0]
             group_ids = self.d3.get_group_ids(img_ids=[img_id])
             sent_ids = self.d3.get_sent_ids(group_ids=group_ids)
+            sent_id_to_group_id = {}
+            for group_id in group_ids:
+                group_sent_ids = self.d3.get_sent_ids(group_ids=[group_id])
+                for sent_id in group_sent_ids:
+                    sent_id_to_group_id[int(sent_id)] = int(group_id)
             sent_list = self.d3.load_sents(sent_ids=sent_ids)
             sent_ids_array = np.asarray([int(sent_id) for sent_id in sent_ids])
+            sent_group_ids_array = np.asarray(
+                [sent_id_to_group_id.get(int(sent_id), -1) for sent_id in sent_ids]
+            )
             sent_id_to_local = {int(sent_id): idx for idx, sent_id in enumerate(sent_ids_array.tolist())}
 
             ann_ids = coco.get_ann_ids(img_ids=[img_id])
@@ -73,6 +81,7 @@ class D3SubsetDODDataset(DODDataset):
                     "width": img_info["width"],
                     "text": [sent["raw_sent"] for sent in sent_list],
                     "sent_ids": sent_ids_array,
+                    "sent_group_ids": sent_group_ids_array,
                     "custom_entities": True,
                     "instances": instances,
                 }

@@ -141,10 +141,52 @@ python tools/prepare_real_lod_d3.py \
 bash "$REAL_ADAPT_OUT/run_train.sh"
 ```
 
+## E: Text Adapter + Alias-Aware Wrong-Phrase DN
+
+After the DN-label-only control stays at the `34.1` baseline, run E with the
+same schedule as the text-adapter run. This keeps the text adapter trainable,
+but replaces the denoising negative half with near-same-region boxes paired with
+wrong D3 phrases from a different image-local group when available.
+
+```bash
+export REAL_NEGDN_OUT="$APE_DIR/route_a_real_lod_real_model_b_d3_full_text_negdn_lr1e4_750"
+
+python tools/prepare_real_lod_d3.py \
+  --real-lod-root "$REAL_LOD_DIR" \
+  --d3-ann-file "$D3_FULL_JSON" \
+  --train-ann-file "$D3_FULL_JSON" \
+  --val-ann-file "$D3_FULL_JSON" \
+  --d3-image-root "$D3_IMAGE_ROOT" \
+  --d3-pkl-root "$D3_PKL_ROOT" \
+  --output-dir "$REAL_NEGDN_OUT" \
+  --work-dir "$REAL_NEGDN_OUT/work_dir" \
+  --checkpoint "$REAL_MODEL_B_CKPT" \
+  --bert-path /root/autodl-tmp/huggingface_models/bert-base-uncased \
+  --inference-mode parallel \
+  --max-iter 750 \
+  --val-interval 250 \
+  --checkpoint-interval 250 \
+  --train-lr 0.0001 \
+  --adapter-mode text_negdn
+
+grep -n "RealModelTextQueryAdapterNegDN\|negative_dn\|sent_group_ids\|trainable_prefixes\|auto_scale_lr\|optimizer=dict" \
+  "$REAL_NEGDN_OUT/real_model_swin-b_d3_adapter_train.py"
+
+bash "$REAL_NEGDN_OUT/run_train.sh"
+```
+
+Interpret E against B and C, not only against the public baseline:
+
+```text
+A: Real-Model checkpoint eval
+B: text adapter + stock DN
+C: DN-label-only control
+E: text adapter + alias-aware wrong-phrase DN
+```
+
 The paper-relevant result is not `28.0` vs `34.1`. It is:
 
 ```text
 Real-Model-B official checkpoint
 Real-Model-B + our detector-internal adapter
 ```
-
