@@ -103,6 +103,19 @@ def _group_rows(groups: Mapping[int, Mapping[str, Any]], group_ids: Sequence[int
     return rows
 
 
+def _category_rows(
+    category_ids: Sequence[int],
+    category_name_by_id: Mapping[int, str],
+) -> List[Dict[str, Any]]:
+    return [
+        {
+            "category_id": int(category_id),
+            "name": str(category_name_by_id.get(int(category_id), "")),
+        }
+        for category_id in sorted(category_ids)
+    ]
+
+
 def _image_rows(
     groups: Mapping[int, Mapping[str, Any]],
     image_info_by_id: Mapping[int, Mapping[str, Any]],
@@ -147,6 +160,28 @@ def _annotation_count(annotation: Mapping[str, Any], image_rows: Sequence[Mappin
     return sum(1 for ann in annotation.get("annotations", []) if int(ann["image_id"]) in image_ids)
 
 
+def _prompt_texts_for_groups(
+    groups: Mapping[int, Mapping[str, Any]],
+    sentences: Mapping[int, Mapping[str, Any]],
+    group_ids: Sequence[int],
+) -> Set[str]:
+    texts: Set[str] = set()
+    for group_id in group_ids:
+        for sent_id in groups[int(group_id)].get("pos_sent_id", []):
+            sent = sentences.get(int(sent_id))
+            if sent is not None:
+                texts.add(str(sent["raw_sent"]))
+    return texts
+
+
+def _category_ids_with_texts(
+    category_ids: Set[int],
+    category_name_by_id: Mapping[int, str],
+    texts: Set[str],
+) -> Set[int]:
+    return {category_id for category_id in category_ids if category_name_by_id.get(category_id, "") in texts}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--annotation", type=Path, required=True, help="D3 COCO annotation JSON.")
@@ -161,9 +196,12 @@ def main() -> None:
 
     annotation = _load_json(args.annotation)
     groups_raw = _load_pickle(args.pkl_root / "groups.pkl")
+    sentences_raw = _load_pickle(args.pkl_root / "sentences.pkl")
     groups = {int(group_id): group for group_id, group in groups_raw.items()}
+    sentences = {int(sent_id): sent for sent_id, sent in sentences_raw.items()}
 
     image_info_by_id = {int(item["id"]): item for item in annotation.get("images", [])}
+    category_name_by_id = {int(item["id"]): str(item["name"]) for item in annotation.get("categories", [])}
     annotation_image_ids = set(image_info_by_id)
     available_group_ids = [
         int(group_id)
@@ -202,6 +240,7 @@ def main() -> None:
     counts: Dict[str, Dict[str, int]] = {}
     shard_counts: Dict[str, int] = {}
     category_ids_by_split: Dict[str, Set[int]] = {}
+    prompt_texts_by_split: Dict[str, Set[str]] = {}
     for split_name, group_ids in group_ids_by_split.items():
         group_rows = _group_rows(groups, group_ids)
         image_rows = image_rows_by_split[split_name]
@@ -212,10 +251,32 @@ def main() -> None:
         }
         shard_counts[split_name] = _write_shards(args.output_dir, split_name, image_rows, args.shard_size)
         category_ids_by_split[split_name] = _annotation_category_ids(annotation, image_rows)
+        prompt_texts_by_split[split_name] = _prompt_texts_for_groups(groups, sentences, group_ids)
 
     train_cats = category_ids_by_split["train"]
     val_cats = category_ids_by_split["val"]
     test_cats = category_ids_by_split["test"]
+    train_prompt_texts = prompt_texts_by_split["train"]
+    val_prompt_seen_cats = _category_ids_with_texts(val_cats, category_name_by_id, train_prompt_texts)
+    test_prompt_seen_cats = _category_ids_with_texts(test_cats, category_name_by_id, train_prompt_texts)
+    val_prompt_novel_cats = val_cats - val_prompt_seen_cats
+    test_prompt_novel_cats = test_cats - test_prompt_seen_cats
+    _write_jsonl(
+        args.output_dir / "val_prompt_seen_categories.jsonl",
+        _category_rows(sorted(val_prompt_seen_cats), category_name_by_id),
+    )
+    _write_jsonl(
+        args.output_dir / "val_prompt_novel_categories.jsonl",
+        _category_rows(sorted(val_prompt_novel_cats), category_name_by_id),
+    )
+    _write_jsonl(
+        args.output_dir / "test_prompt_seen_categories.jsonl",
+        _category_rows(sorted(test_prompt_seen_cats), category_name_by_id),
+    )
+    _write_jsonl(
+        args.output_dir / "test_prompt_novel_categories.jsonl",
+        _category_rows(sorted(test_prompt_novel_cats), category_name_by_id),
+    )
     scene_counts = {
         split_name: dict(Counter(str(groups[group_id].get("scene", "")) for group_id in group_ids))
         for split_name, group_ids in group_ids_by_split.items()
@@ -235,12 +296,27 @@ def main() -> None:
         "positive_phrase_counts": {
             split_name: len(category_ids) for split_name, category_ids in category_ids_by_split.items()
         },
+        "prompt_phrase_counts": {
+            split_name: len(prompt_texts) for split_name, prompt_texts in prompt_texts_by_split.items()
+        },
         "positive_phrase_overlap": {
             "train_val": len(train_cats & val_cats),
             "train_test": len(train_cats & test_cats),
             "val_test": len(val_cats & test_cats),
             "val_seen_in_train_ratio": len(train_cats & val_cats) / max(1, len(val_cats)),
             "test_seen_in_train_ratio": len(train_cats & test_cats) / max(1, len(test_cats)),
+        },
+        "prompt_level_phrase_overlap": {
+            "val_positive_seen_in_train_prompt": len(val_prompt_seen_cats),
+            "val_positive_prompt_novel": len(val_prompt_novel_cats),
+            "val_positive_seen_in_train_prompt_ratio": len(val_prompt_seen_cats) / max(1, len(val_cats)),
+            "test_positive_seen_in_train_prompt": len(test_prompt_seen_cats),
+            "test_positive_prompt_novel": len(test_prompt_novel_cats),
+            "test_positive_seen_in_train_prompt_ratio": len(test_prompt_seen_cats) / max(1, len(test_cats)),
+            "val_prompt_seen_categories_jsonl": str(args.output_dir / "val_prompt_seen_categories.jsonl"),
+            "val_prompt_novel_categories_jsonl": str(args.output_dir / "val_prompt_novel_categories.jsonl"),
+            "test_prompt_seen_categories_jsonl": str(args.output_dir / "test_prompt_seen_categories.jsonl"),
+            "test_prompt_novel_categories_jsonl": str(args.output_dir / "test_prompt_novel_categories.jsonl"),
         },
     }
     _write_json(args.output_dir / "summary.json", summary)

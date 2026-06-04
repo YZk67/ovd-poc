@@ -111,14 +111,17 @@ the split-val baseline full fine-tune `47.2 AP @500 / 48.9 AP @1000` and
 
 For a scenario-held-out Stage-2 protocol, split whole D3 groups from
 `groups.pkl`, then filter the COCO JSON by the resulting image ids. Because some
-D3 sentence ids appear in more than one group, record the printed
-`positive_phrase_overlap` summary with every split; group-held-out is not
-automatically phrase-id-held-out.
+D3 groups include borrowed outer sentences from other groups, record both the
+printed `positive_phrase_overlap` and `prompt_level_phrase_overlap` summaries
+with every split. The headline novel-description result should use the
+`val_prompt_novel` subset; the full group-held-out val is a scenario-adaptation
+auxiliary result.
 
 ```bash
 export D3_SPLIT_DIR=/root/autodl-tmp/dataset/d3/d3_splits/group_seed42_val20
 export D3_TRAIN_JSON="$D3_SPLIT_DIR/d3_train_annotations.json"
 export D3_VAL_JSON="$D3_SPLIT_DIR/d3_val_annotations.json"
+export D3_VAL_NOVEL_JSON="$D3_SPLIT_DIR/d3_val_prompt_novel_annotations.json"
 
 python tools/prepare_d3_group_splits.py \
   --annotation "$D3_FULL_JSON" \
@@ -137,11 +140,25 @@ python tools/filter_coco_annotations_by_image_ids.py \
   --annotation "$D3_FULL_JSON" \
   --image-id-jsonl "$D3_SPLIT_DIR/val.jsonl" \
   --output "$D3_VAL_JSON"
+
+python tools/filter_coco_annotations_by_category_ids.py \
+  --annotation "$D3_VAL_JSON" \
+  --category-id-jsonl "$D3_SPLIT_DIR/val_prompt_novel_categories.jsonl" \
+  --output "$D3_VAL_NOVEL_JSON"
 ```
 
 All D3 adaptation baselines and ablations must compare on the same held-out
-`$D3_VAL_JSON`. These numbers are D3 group-held-out adaptation results, not
-directly comparable to the Real-LOD zero-shot full-D3 `34.1 AP` reference.
+JSON. Report `$D3_VAL_NOVEL_JSON` as the clean novel-description subset and
+`$D3_VAL_JSON` as the full group-held-out scenario auxiliary. These numbers are
+not directly comparable to the Real-LOD zero-shot full-D3 `34.1 AP` reference.
+
+For `group_seed42_val20`, the positive side is clean but prompt exposure is not:
+
+```text
+positive_phrase_overlap.train_val = 0
+prompt_level_phrase_overlap.val_positive_seen_in_train_prompt = 50 / 84
+prompt_level_phrase_overlap.val_positive_prompt_novel = 34 / 84
+```
 
 ## Adapter Smoke
 
