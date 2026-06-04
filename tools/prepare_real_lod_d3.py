@@ -52,6 +52,25 @@ def _write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def _resolved_path(path: Path) -> Path:
+    return path.expanduser().resolve(strict=False)
+
+
+def _validate_train_val_split(args: argparse.Namespace) -> None:
+    if args.train_ann_file is None:
+        return
+    val_ann_file = args.val_ann_file or args.d3_ann_file
+    train_path = _resolved_path(args.train_ann_file)
+    val_path = _resolved_path(val_ann_file)
+    if train_path == val_path and not args.allow_train_val_same:
+        raise ValueError(
+            "Training annotation and validation annotation resolve to the same file: "
+            f"{train_path}. This is train-on-test for D3 adaptation. Pass a disjoint "
+            "--train-ann-file/--val-ann-file pair, or add --allow-train-val-same only "
+            "for an intentional smoke/debug run."
+        )
+
+
 def _make_test_cfg(args: argparse.Namespace) -> str:
     items = [f"max_per_img={args.max_per_img}"]
     if args.inference_mode == "parallel":
@@ -320,6 +339,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--train-ann-file", type=Path, default=None)
     parser.add_argument("--val-ann-file", type=Path, default=None)
+    parser.add_argument(
+        "--allow-train-val-same",
+        action="store_true",
+        help=(
+            "Allow training and validation annotations to be the same file. "
+            "Use only for intentional smoke/debug runs; paper-facing D3 adaptation "
+            "must use disjoint train/val annotations."
+        ),
+    )
     parser.add_argument("--use-subset-dataset", action="store_true")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=2)
@@ -367,6 +395,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    _validate_train_val_split(args)
     is_train = args.train_ann_file is not None
     config_name = "real_model_swin-b_d3_adapter_train.py" if is_train else "real_model_swin-b_d3_eval.py"
     run_name = "run_train.sh" if is_train else "run_eval.sh"

@@ -75,6 +75,74 @@ Real-Model-B D3 full parallel: about 34.1 AP
 
 Do not adapt the model until this baseline is reproduced.
 
+## Training Protocol Guard
+
+D3/D-cube is an evaluation benchmark, not an official training split. Any D3
+adaptation run must keep training and validation images disjoint. A protocol
+audit on 2026-06-04 found that the old Stage-2 full fine-tune commands passed
+`$D3_FULL_JSON` to `--d3-ann-file`, `--train-ann-file`, and `--val-ann-file`.
+The generated configs therefore used the same file for training and validation:
+
+```text
+d3_ann_file = .../d3_full_annotations.json
+d3_train_ann_file = .../d3_full_annotations.json
+d3_val_ann_file = .../d3_full_annotations.json
+```
+
+Those runs are train-on-test and are not paper-facing results. In particular,
+discard the old full-D3 Stage-2 full fine-tune numbers such as:
+
+```text
+baseline full-ft lr=1e-5: 40.1 AP @500, 41.9 AP @1000
+text_negdn full-ft lr=1e-5: 40.0 AP @500, 41.3 AP @1000
+```
+
+`tools/prepare_real_lod_d3.py` now refuses training configs whose resolved
+`--train-ann-file` and `--val-ann-file` are the same path. Use
+`--allow-train-val-same` only for an intentional smoke/debug run.
+
+An image-level random split is also not paper-facing for description-conditioned
+generalization. A follow-up audit on 2026-06-04 found that the deterministic
+`image_seed42_val20` split had 376 validation positive phrases, of which 374
+were already positive in train (`99.47%`). That split is useful only as an
+in-domain "new image, mostly old description" diagnostic. Treat numbers such as
+the split-val baseline full fine-tune `47.2 AP @500 / 48.9 AP @1000` and
+`text_negdn` `47.2 AP @500 / 47.3 AP @1000` as diagnostic, not paper-facing.
+
+For a scenario-held-out Stage-2 protocol, split whole D3 groups from
+`groups.pkl`, then filter the COCO JSON by the resulting image ids. Because some
+D3 sentence ids appear in more than one group, record the printed
+`positive_phrase_overlap` summary with every split; group-held-out is not
+automatically phrase-id-held-out.
+
+```bash
+export D3_SPLIT_DIR=/root/autodl-tmp/dataset/d3/d3_splits/group_seed42_val20
+export D3_TRAIN_JSON="$D3_SPLIT_DIR/d3_train_annotations.json"
+export D3_VAL_JSON="$D3_SPLIT_DIR/d3_val_annotations.json"
+
+python tools/prepare_d3_group_splits.py \
+  --annotation "$D3_FULL_JSON" \
+  --pkl-root "$D3_PKL_ROOT" \
+  --output-dir "$D3_SPLIT_DIR" \
+  --val-ratio 0.2 \
+  --test-ratio 0.0 \
+  --seed 42
+
+python tools/filter_coco_annotations_by_image_ids.py \
+  --annotation "$D3_FULL_JSON" \
+  --image-id-jsonl "$D3_SPLIT_DIR/train.jsonl" \
+  --output "$D3_TRAIN_JSON"
+
+python tools/filter_coco_annotations_by_image_ids.py \
+  --annotation "$D3_FULL_JSON" \
+  --image-id-jsonl "$D3_SPLIT_DIR/val.jsonl" \
+  --output "$D3_VAL_JSON"
+```
+
+All D3 adaptation baselines and ablations must compare on the same held-out
+`$D3_VAL_JSON`. These numbers are D3 group-held-out adaptation results, not
+directly comparable to the Real-LOD zero-shot full-D3 `34.1 AP` reference.
+
 ## Adapter Smoke
 
 Once the Real-Model baseline is stable, run a short adapter smoke. This uses the
@@ -95,8 +163,8 @@ export REAL_ADAPT_OUT="$APE_DIR/route_a_real_lod_real_model_b_d3_full_text_adapt
 python tools/prepare_real_lod_d3.py \
   --real-lod-root "$REAL_LOD_DIR" \
   --d3-ann-file "$D3_FULL_JSON" \
-  --train-ann-file "$D3_FULL_JSON" \
-  --val-ann-file "$D3_FULL_JSON" \
+  --train-ann-file "$D3_TRAIN_JSON" \
+  --val-ann-file "$D3_VAL_JSON" \
   --d3-image-root "$D3_IMAGE_ROOT" \
   --d3-pkl-root "$D3_PKL_ROOT" \
   --output-dir "$REAL_ADAPT_OUT" \
@@ -124,8 +192,8 @@ export REAL_ADAPT_OUT="$APE_DIR/route_a_real_lod_real_model_b_d3_full_text_adapt
 python tools/prepare_real_lod_d3.py \
   --real-lod-root "$REAL_LOD_DIR" \
   --d3-ann-file "$D3_FULL_JSON" \
-  --train-ann-file "$D3_FULL_JSON" \
-  --val-ann-file "$D3_FULL_JSON" \
+  --train-ann-file "$D3_TRAIN_JSON" \
+  --val-ann-file "$D3_VAL_JSON" \
   --d3-image-root "$D3_IMAGE_ROOT" \
   --d3-pkl-root "$D3_PKL_ROOT" \
   --output-dir "$REAL_ADAPT_OUT" \
@@ -154,8 +222,8 @@ export REAL_NEGDN_OUT="$APE_DIR/route_a_real_lod_real_model_b_d3_full_text_negdn
 python tools/prepare_real_lod_d3.py \
   --real-lod-root "$REAL_LOD_DIR" \
   --d3-ann-file "$D3_FULL_JSON" \
-  --train-ann-file "$D3_FULL_JSON" \
-  --val-ann-file "$D3_FULL_JSON" \
+  --train-ann-file "$D3_TRAIN_JSON" \
+  --val-ann-file "$D3_VAL_JSON" \
   --d3-image-root "$D3_IMAGE_ROOT" \
   --d3-pkl-root "$D3_PKL_ROOT" \
   --output-dir "$REAL_NEGDN_OUT" \
