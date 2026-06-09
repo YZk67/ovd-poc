@@ -151,6 +151,13 @@ All D3 adaptation baselines and ablations must compare on the same held-out
 JSON. Report `$D3_VAL_NOVEL_JSON` as the clean novel-description subset and
 `$D3_VAL_JSON` as the full group-held-out scenario auxiliary. These numbers are
 not directly comparable to the Real-LOD zero-shot full-D3 `34.1 AP` reference.
+When evaluating an adapter checkpoint outside the training loop, pass the same
+`--adapter-mode` used for training. If the eval log reports
+`unexpected key in source state_dict: text_query_adapter.*`, the generated eval
+model did not instantiate the adapter and that number is not an adapter result.
+For the `text_negdn` runs, the eval preparation command must include
+`--adapter-mode text_negdn` and the same adapter hyperparameters used at train
+time.
 
 For `group_seed42_val20`, the positive side is clean but prompt exposure is not:
 

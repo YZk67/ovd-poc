@@ -92,11 +92,18 @@ def _make_model_train_cfg() -> str:
     )"""
 
 
+def _effective_adapter_mode(args: argparse.Namespace, is_train: bool) -> str:
+    if args.adapter_mode is not None:
+        return args.adapter_mode
+    return "text" if is_train else "none"
+
+
 def _make_config(args: argparse.Namespace) -> str:
     base_config = Path(args.real_lod_root) / args.base_config
     lang_model_name = args.bert_path or "bert-base-uncased"
     test_cfg = _make_test_cfg(args)
     is_train = args.train_ann_file is not None
+    adapter_mode = _effective_adapter_mode(args, is_train)
     dataset_type = "D3SubsetDODDataset" if is_train or args.use_subset_dataset else "DODDataset"
     val_ann_file = args.val_ann_file or args.d3_ann_file
     model_train_cfg = _make_model_train_cfg() if is_train else "None"
@@ -107,7 +114,7 @@ def _make_config(args: argparse.Namespace) -> str:
     )
     default_trainable_prefixes = (
         TEXT_ADAPTER_TRAINABLE_PREFIXES
-        if args.adapter_mode in {"text", "text_negdn"}
+        if adapter_mode in {"text", "text_negdn"}
         else DN_ONLY_TRAINABLE_PREFIXES
     )
     trainable_prefixes = tuple(args.trainable_prefix or default_trainable_prefixes)
@@ -134,16 +141,16 @@ def _make_config(args: argparse.Namespace) -> str:
         "    imports=['tools.mmdet_d3_route_a', 'tools.real_lod_route_a'],\n"
         "    allow_failed_imports=False,\n"
         ")\n\n"
-        if is_train or args.use_subset_dataset
+        if is_train or args.use_subset_dataset or adapter_mode in {"text", "text_negdn"}
         else ""
     )
-    if is_train and args.adapter_mode == "text":
+    if adapter_mode == "text":
         model_type = (
             "    type='RealModelTextQueryAdapter',\n"
             f"    text_query_adapter=dict(bottleneck_dim={args.adapter_bottleneck_dim}, "
             f"dropout={args.adapter_dropout}, init_scale={args.adapter_init_scale}),\n"
         )
-    elif is_train and args.adapter_mode == "text_negdn":
+    elif adapter_mode == "text_negdn":
         model_type = (
             "    type='RealModelTextQueryAdapterNegDN',\n"
             f"    text_query_adapter=dict(bottleneck_dim={args.adapter_bottleneck_dim}, "
@@ -377,10 +384,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--adapter-mode",
         choices=("text", "none", "text_negdn"),
-        default="text",
+        default=None,
         help=(
+            "Defaults to 'text' for training and 'none' for eval. "
             "'none' runs the DN-label-only control; 'text_negdn' adds "
-            "in-image wrong-phrase DN negatives on top of the text adapter."
+            "in-image wrong-phrase DN negatives on top of the text adapter. "
+            "When evaluating an adapter checkpoint, pass the same adapter mode "
+            "used for training so adapter weights are instantiated and loaded."
         ),
     )
     parser.add_argument("--adapter-bottleneck-dim", type=int, default=64)
@@ -397,6 +407,7 @@ def main() -> None:
     args = parse_args()
     _validate_train_val_split(args)
     is_train = args.train_ann_file is not None
+    adapter_mode = _effective_adapter_mode(args, is_train)
     config_name = "real_model_swin-b_d3_adapter_train.py" if is_train else "real_model_swin-b_d3_eval.py"
     run_name = "run_train.sh" if is_train else "run_eval.sh"
     config_path = args.output_dir / config_name
@@ -418,6 +429,7 @@ def main() -> None:
         "config": str(config_path.resolve()),
         "run_script": str(run_path.resolve()),
         "train_mode": is_train,
+        "effective_adapter_mode": adapter_mode,
         "args": {key: _jsonable(value) for key, value in vars(args).items()},
         "expected_reference": {
             "source": "Real-LOD / Real-Model D3 full reported result",
