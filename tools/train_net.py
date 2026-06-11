@@ -387,7 +387,9 @@ def main(args):
 
 
 if __name__ == "__main__":
-    args = default_argument_parser().parse_args()
+    parser = default_argument_parser()
+    parser.add_argument("--ddebug", action="store_true", help="Run a tiny debug configuration.")
+    args = parser.parse_args()
     launch(
         main,
         args.num_gpus,
