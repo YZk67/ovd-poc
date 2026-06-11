@@ -388,7 +388,8 @@ def main(args):
 
 if __name__ == "__main__":
     parser = default_argument_parser()
-    parser.add_argument("--ddebug", action="store_true", help="Run a tiny debug configuration.")
+    if "--ddebug" not in parser._option_string_actions:
+        parser.add_argument("--ddebug", action="store_true", help="Run a tiny debug configuration.")
     args = parser.parse_args()
     launch(
         main,
