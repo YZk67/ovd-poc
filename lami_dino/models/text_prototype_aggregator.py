@@ -103,7 +103,14 @@ class TextPrototypeAggregator(nn.Module):
         values = self.value_proj(text_feats)
 
         logits = torch.einsum("kh,cnh->ckn", self.prototype_queries, keys)
-        logits = logits / math.sqrt(self.key_proj.out_features)
+        # NOTE: this used to also divide by sqrt(key_proj.out_features). Combined
+        # with `/ self.tau` below that meant dividing by sqrt(256) * 0.07 = 1.12,
+        # i.e. no temperature scaling at all -- the "sharper attention" tau=0.07
+        # was cancelled out by the sqrt(d) term. Attention over the N phrases came
+        # out near-uniform, so all K prototypes collapsed onto the same mean-of-
+        # values vector (1 - pairwise cos ~ 2e-5 at init) and the task loss, which
+        # gives every prototype an identical gradient there, kept them there.
+        # tau is now the only temperature knob, as the constructor claims.
         attn = F.softmax(logits / self.tau, dim=-1)
 
         prototypes_clean = torch.einsum("ckn,cnd->ckd", attn, values)
