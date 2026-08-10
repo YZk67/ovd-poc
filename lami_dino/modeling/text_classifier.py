@@ -33,6 +33,7 @@ class TextClassifier(nn.Module):
         tpa_dropout: float = 0.1,
         tpa_tau: float = 0.1,
         tpa_log_interval: int = 200,
+        tpa_warmup_steps: Optional[int] = None,
     ) -> None:
         super().__init__()
 
@@ -70,6 +71,11 @@ class TextClassifier(nn.Module):
             self.register_buffer("train_text_feats", train_feats, persistent=False)
             self.register_buffer("eval_text_feats", eval_feats, persistent=False)
 
+            tpa_kwargs = {}
+            if tpa_warmup_steps is not None:
+                # Otherwise the aggregator falls back to a default sized for the
+                # 12ep LVIS schedule, which over-suppresses APR on shorter runs.
+                tpa_kwargs["warmup_steps"] = int(tpa_warmup_steps)
             self.tpa = TextPrototypeAggregator(
                 dim=train_feats.shape[-1],
                 num_prototypes=tpa_num_prototypes,
@@ -77,6 +83,7 @@ class TextClassifier(nn.Module):
                 dropout=tpa_dropout,
                 tau=tpa_tau,
                 log_interval=tpa_log_interval,
+                **tpa_kwargs,
             )
             self.num_prototypes = tpa_num_prototypes
             self._cached_eval = None

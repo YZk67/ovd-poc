@@ -123,6 +123,9 @@ model.classifier.tpa_hidden_dim = 256
 model.classifier.tpa_dropout = 0.1
 model.classifier.tpa_tau = 0.07  # Optimal temperature for attention aggregation (τ ≈ 0.05–0.1 recommended) 0.1 is original
 model.classifier.tpa_log_interval = 200
+# Derive the APR warmup from this run's schedule rather than the aggregator's
+# built-in default, which is sized for max_iter=85200 and would be 4.6% here.
+model.classifier.tpa_warmup_steps = int(train.max_iter * 0.05)
 
 # Query initialization: Soft-attention aggregation parameters for multi-prototype query initialization
 model.use_soft_attention = True  # Enable soft-attention aggregation in query initialization

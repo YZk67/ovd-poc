@@ -7,9 +7,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# 假设 total_iters = cfg.train.max_iter = 85200
-warmup_ratio = 0.05  # 5% 标准档
-warmup_steps = int(85200 * warmup_ratio)  # ≈ 4300
+# APR ramps its regularizer strengths in over the first WARMUP_RATIO of training.
+# The default below assumes the 12ep LVIS schedule (max_iter=85200); any run with
+# a different max_iter should pass warmup_steps explicitly, otherwise a shorter
+# schedule spends a disproportionate share of its training with APR suppressed
+# (e.g. the 14200-iter quick ablations would keep it damped for the first 30%).
+WARMUP_RATIO = 0.05
+DEFAULT_MAX_ITER = 85200
+DEFAULT_WARMUP_STEPS = int(DEFAULT_MAX_ITER * WARMUP_RATIO)  # ≈ 4260
 
 
 def _is_main_process() -> bool:
@@ -36,7 +41,7 @@ class TextPrototypeAggregator(nn.Module):
         *,
         lambda_orth: float = 0.10,     # ↑ from 0.08 → 0.10
         lambda_div: float = 0.03,      # ↑ from 0.02 → 0.03
-        warmup_steps: int = warmup_steps,      # new: smooth ramp-up
+        warmup_steps: int = DEFAULT_WARMUP_STEPS,  # set from train.max_iter * WARMUP_RATIO
         log_interval: int = 200,
     ) -> None:
         super().__init__()
@@ -59,7 +64,9 @@ class TextPrototypeAggregator(nn.Module):
         self.register_buffer("_eye_buffer", torch.eye(num_prototypes), persistent=False)
         self._logger = logging.getLogger("lami_dino.tpa")
         self.log_interval = int(log_interval)
-        self._step = 0
+        # Persistent so that resuming from a checkpoint continues the APR warmup
+        # instead of restarting it from zero and re-suppressing the regularizer.
+        self.register_buffer("_step", torch.zeros((), dtype=torch.long), persistent=True)
 
         # caches
         self.last_loss_terms: Dict[str, float] = {}
@@ -86,7 +93,7 @@ class TextPrototypeAggregator(nn.Module):
         if self.warmup_steps <= 0:
             return self.lambda_orth_base, self.lambda_div_base
 
-        progress = min(1.0, (self._step + 1) / float(self.warmup_steps))
+        progress = min(1.0, (int(self._step) + 1) / float(self.warmup_steps))
         # cosine warm-up: 0 → 1
         factor = 0.5 * (1.0 - math.cos(math.pi * progress))
         lam_orth = self.lambda_orth_base * factor
@@ -125,6 +132,12 @@ class TextPrototypeAggregator(nn.Module):
             apr_value = apr_loss.detach()
         else:
             apr_value = self._update_metrics_no_grad(prototypes_clean.detach(), logits.detach())
+
+        # Only training iterations advance the warmup clock. Counting eval forwards
+        # too would fast-forward the schedule by however many validation passes have
+        # run, which is not what "5% of training" is supposed to mean.
+        if self.training:
+            self._step += 1
 
         self._maybe_log(apr_value)
         return prototypes, apr_loss
@@ -177,16 +190,16 @@ class TextPrototypeAggregator(nn.Module):
 
     # === logging ===
     def _maybe_log(self, apr_value):
-        self._step += 1
-        if (not self._logger) or (self.training and self._step % self.log_interval != 0):
+        step = int(self._step)
+        if (not self._logger) or (self.training and step % self.log_interval != 0):
             return
         if not _is_main_process():
             return
-        monitor = monitor_prototype_metrics(self._last_prototypes, self._last_logits, step=self._step)
+        monitor = monitor_prototype_metrics(self._last_prototypes, self._last_logits, step=step)
         if monitor:
             self.last_monitor_terms.update(monitor)
         msg = (
-            f"[TPA] step={self._step:06d} "
+            f"[TPA] step={step:06d} "
             f"orth_off={monitor.get('orth_off_mse', 0):.4f} "
             f"diag_mse={monitor.get('diag_mse', 0):.4f} "
             f"usage_entropy={monitor.get('usage_entropy', 0):.4f} "

@@ -76,3 +76,82 @@ def test_tau_controls_attention_sharpness():
         return -(attn * attn.clamp_min(1e-9).log()).sum(-1).mean()
 
     assert entropy_at(0.01) < entropy_at(1.0)
+
+
+def _make_tpa(**kwargs):
+    kwargs.setdefault("dim", 16)
+    kwargs.setdefault("num_prototypes", 3)
+    kwargs.setdefault("hidden_dim", 32)
+    kwargs.setdefault("dropout", 0.0)
+    return TextPrototypeAggregator(**kwargs)
+
+
+def test_warmup_clock_ignores_eval_forwards():
+    """Only training iterations may advance the APR warmup.
+
+    Counting eval forwards fast-forwards the schedule by however many validation
+    passes have run, so "ramp in over the first 5% of training" silently becomes
+    something else entirely.
+    """
+    tpa = _make_tpa(warmup_steps=100)
+    text_feats = torch.randn(4, 6, 16)
+
+    tpa.train()
+    for _ in range(3):
+        tpa(text_feats)
+    assert int(tpa._step) == 3
+
+    tpa.eval()
+    with torch.no_grad():
+        for _ in range(10):
+            tpa(text_feats, with_loss=False)
+    assert int(tpa._step) == 3, "eval forwards must not advance the warmup clock"
+
+
+def test_warmup_state_survives_checkpoint_roundtrip():
+    """_step must be a persistent buffer, or resuming restarts the warmup at 0
+    and re-suppresses the regularizer for another full warmup window."""
+    tpa = _make_tpa(warmup_steps=100)
+    text_feats = torch.randn(4, 6, 16)
+    tpa.train()
+    for _ in range(25):
+        tpa(text_feats)
+
+    assert "_step" in tpa.state_dict(), "_step must be saved in the state dict"
+
+    restored = _make_tpa(warmup_steps=100)
+    restored.load_state_dict(tpa.state_dict())
+    assert int(restored._step) == int(tpa._step) == 25
+
+    lam_before = tpa._effective_lambdas()
+    lam_after = restored._effective_lambdas()
+    assert lam_before == lam_after
+
+
+def test_warmup_ramps_lambdas_from_zero_to_base():
+    lambda_orth, lambda_div = 0.10, 0.03
+    tpa = _make_tpa(warmup_steps=100, lambda_orth=lambda_orth, lambda_div=lambda_div)
+    text_feats = torch.randn(4, 6, 16)
+    tpa.train()
+
+    start_orth, start_div = tpa._effective_lambdas()
+    assert start_orth < lambda_orth and start_div < lambda_div
+
+    for _ in range(120):
+        tpa(text_feats)
+
+    end_orth, end_div = tpa._effective_lambdas()
+    assert end_orth == lambda_orth and end_div == lambda_div
+
+
+def test_warmup_steps_is_configurable():
+    """A run with a different max_iter must be able to size its own warmup."""
+    short = _make_tpa(warmup_steps=10)
+    long = _make_tpa(warmup_steps=10_000)
+    text_feats = torch.randn(4, 6, 16)
+    for tpa in (short, long):
+        tpa.train()
+        for _ in range(20):
+            tpa(text_feats)
+
+    assert short._effective_lambdas()[0] > long._effective_lambdas()[0]
