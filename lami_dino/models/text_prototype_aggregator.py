@@ -215,8 +215,14 @@ class TextPrototypeAggregator(nn.Module):
 
     # === logging ===
     def _maybe_log(self, apr_value):
+        # Training-only. The old guard `self.training and step % interval` never
+        # returned early in eval mode, so every eval forward emitted a [TPA] log
+        # line -- thousands per validation pass. The monitors describe the same
+        # weights in eval as in training, so nothing is lost.
+        if not self.training:
+            return
         step = int(self._step)
-        if (not self._logger) or (self.training and step % self.log_interval != 0):
+        if (not self._logger) or step % self.log_interval != 0:
             return
         if not _is_main_process():
             return
@@ -276,7 +282,11 @@ def compute_prototype_similarity(prototypes):
     if K < 2:
         return float("nan"), float(K)
     off = (G.sum(dim=(-2, -1)) - G.diagonal(dim1=-2, dim2=-1).sum(-1)) / (K * K - K)
-    svals = torch.linalg.svdvals(P.float())
+    # Singular values of P via eigvalsh of the K x K gram: sqrt(eig(P P^T)) equals
+    # svdvals(P), but eigvalsh exists on the older torch of the training env
+    # (torch.linalg.svdvals only appeared in 1.10) and works on a smaller matrix.
+    evals = torch.linalg.eigvalsh(G.float()).clamp_min(0.0)
+    svals = evals.sqrt()
     frac = svals / svals.sum(dim=-1, keepdim=True).clamp_min(1e-12)
     eff_rank = torch.exp(-(frac * frac.clamp_min(1e-12).log()).sum(dim=-1))
     return float(off.mean().item()), float(eff_rank.mean().item())

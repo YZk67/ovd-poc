@@ -165,6 +165,10 @@ class Trainer(SimpleTrainer):
         _write_metrics calls .detach() on every value (these are plain floats) and
         sums them all into total_loss, where a NaN diagnostic would abort training.
         """
+        if not comm.is_main_process():
+            # get_monitor_dict recomputes when its cache is empty, and only the
+            # main process ever fills the cache; skip the wasted work elsewhere.
+            return
         model = self.model.module if hasattr(self.model, "module") else self.model
         try:
             tpa = getattr(model.transformer.decoder.class_embed[0], "tpa", None)
