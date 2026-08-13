@@ -13,6 +13,7 @@ To add more complicated training logic, you can easily add other configs
 in the config file and implement a new train_net.py to handle them.
 """
 import logging
+import math
 import os
 import sys
 import time
@@ -38,6 +39,7 @@ from detectron2.engine import (
 from detectron2.engine.defaults import create_ddp_model
 from detectron2.evaluation import inference_on_dataset, print_csv_format
 from detectron2.utils import comm
+from detectron2.utils.events import get_event_storage
 
 # ==== Added by ChatGPT ====
 import torch.distributed as dist
@@ -148,11 +150,33 @@ class Trainer(SimpleTrainer):
             
             self.tpa_grad_printed = True  # ✅ 确保只打印一次
         
-        if hasattr(self.model, "transformer") and hasattr(self.model.transformer, "text_proto_bank"):
-            monitor_dict = self.model.transformer.text_proto_bank.aggregator.get_monitor_dict()
-            loss_dict.update(monitor_dict)
-
         self._write_metrics(loss_dict, data_time)
+        self._write_tpa_metrics()
+
+    def _write_tpa_metrics(self):
+        """Record TPA diagnostics, including the ones that detect collapse.
+
+        This used to read `self.model.transformer.text_proto_bank`, which never
+        exists -- nothing instantiates TextPrototypeBank, and under DDP `self.model`
+        has no `.transformer` either -- so it never fired and the collapse ran a
+        full ablation without ever reaching metrics.json.
+
+        These go straight to EventStorage rather than into loss_dict, because
+        _write_metrics calls .detach() on every value (these are plain floats) and
+        sums them all into total_loss, where a NaN diagnostic would abort training.
+        """
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        try:
+            tpa = getattr(model.transformer.decoder.class_embed[0], "tpa", None)
+        except (AttributeError, IndexError):
+            return
+        if tpa is None:
+            return
+        storage = get_event_storage()
+        for key, value in tpa.get_monitor_dict().items():
+            value = float(value)
+            if math.isfinite(value):
+                storage.put_scalar(f"tpa/{key}", value, smoothing_hint=False)
 
     def clip_grads(self, params):
         params = list(filter(lambda p: p.requires_grad and p.grad is not None, params))

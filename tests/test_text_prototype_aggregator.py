@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 
 from lami_dino.models import TextPrototypeAggregator
+from lami_dino.models.text_prototype_aggregator import compute_prototype_similarity
 
 
 def _pairwise_cos(prototypes):
@@ -155,3 +156,52 @@ def test_warmup_steps_is_configurable():
             tpa(text_feats)
 
     assert short._effective_lambdas()[0] > long._effective_lambdas()[0]
+
+
+def test_diversity_term_is_off_by_default():
+    """lambda_div defaults to 0: the usage-entropy term pushes prototypes together
+    in one direction and earns nothing in the other. See _diversity_term."""
+    tpa = _make_tpa(warmup_steps=0)
+    assert tpa.lambda_div_base == 0.0
+    assert tpa.lambda_orth_base > 0.0
+
+
+def test_usage_entropy_is_blind_to_collapse():
+    """The reason the collapse went unnoticed: identical prototypes are 'used'
+    perfectly evenly, so usage entropy reports its healthiest possible value.
+    Any collapse alarm has to come from the similarity metrics instead."""
+    C, K, N = 8, 4, 6
+    collapsed_logits = torch.zeros(C, K, N)  # k-independent => identical prototypes
+    tpa = _make_tpa(num_prototypes=K, warmup_steps=0)
+
+    assert tpa._diversity_term(collapsed_logits) > 0.99, (
+        "usage entropy is expected to look perfect under collapse"
+    )
+
+    collapsed = torch.randn(C, 1, 16).expand(C, K, 16).contiguous()
+    cos, rank = compute_prototype_similarity(collapsed)
+    assert cos > 0.999 and rank < 1.01, "similarity metrics must flag the collapse"
+
+
+def test_prototype_similarity_separates_collapsed_from_distinct():
+    C, K, D = 8, 4, 16
+    collapsed = torch.randn(C, 1, D).expand(C, K, D).contiguous()
+    distinct = torch.eye(K, D).unsqueeze(0).expand(C, K, D).contiguous()
+
+    cos_c, rank_c = compute_prototype_similarity(collapsed)
+    cos_d, rank_d = compute_prototype_similarity(distinct)
+
+    assert cos_c > 0.999 and rank_c < 1.01
+    assert abs(cos_d) < 1e-5 and rank_d > K - 0.01
+
+
+def test_monitor_dict_exposes_collapse_metrics():
+    tpa = _make_tpa(warmup_steps=0)
+    tpa.eval()
+    with torch.no_grad():
+        tpa(torch.randn(8, 6, 16), with_loss=False)
+
+    monitor = tpa.get_monitor_dict()
+    for key in ("proto_pairwise_cos", "proto_effective_rank", "usage_entropy"):
+        assert key in monitor, f"{key} missing from the monitor dict"
+        assert isinstance(monitor[key], float)

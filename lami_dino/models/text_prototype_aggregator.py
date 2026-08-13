@@ -40,7 +40,10 @@ class TextPrototypeAggregator(nn.Module):
         tau: float = 0.07,             # ↓ from 0.1 → 0.07 (sharper attention)
         *,
         lambda_orth: float = 0.10,     # ↑ from 0.08 → 0.10
-        lambda_div: float = 0.03,      # ↑ from 0.02 → 0.03
+        # 0 by design, not by omission -- see _diversity_term for the measurements.
+        # The usage-entropy term pushes prototypes together in one direction and
+        # earns nothing in the other; orthogonality already targets what we want.
+        lambda_div: float = 0.0,       # was 0.03
         warmup_steps: int = DEFAULT_WARMUP_STEPS,  # set from train.max_iter * WARMUP_RATIO
         log_interval: int = 200,
     ) -> None:
@@ -162,6 +165,28 @@ class TextPrototypeAggregator(nn.Module):
 
     # === diversity term ===
     def _diversity_term(self, logits: torch.Tensor) -> torch.Tensor:
+        """Normalized entropy of how evenly the N phrases spread over the K prototypes.
+
+        DO NOT "fix" this into `1.0 - entropy.mean()`. It looks like a missing
+        inversion -- a regularizer usually wants balanced expert usage -- but for
+        this architecture balanced usage and distinct prototypes are opposites:
+
+            logits[c,k,n] independent of k
+              => votes are uniform over k        => entropy is at its maximum
+              => softmax over n is equal for all k => the K prototypes are identical
+
+        So driving this entropy up drives the prototypes together. Measured on the
+        real LVIS bank with the orthogonality term disabled, 600 steps of this term
+        alone: maximizing entropy moved pairwise cosine 0.9489 -> 0.9943 (collapse),
+        minimizing it moved 0.9489 -> 0.9019. The branch that "corrected" the sign
+        was the one making collapse worse.
+
+        Neither direction earns its place: with orthogonality enabled, effective
+        rank came out 4.791 using orthogonality alone, 4.782 with the inverted sign
+        and 4.738 with this one. lambda_div therefore defaults to 0 and this stays
+        as a diagnostic. Prototype dissimilarity is what we actually want, and
+        _orthogonality_term already measures exactly that.
+        """
         C, K, N = logits.shape
         w = torch.softmax(logits, dim=1)
         votes = w.sum(dim=-1)
@@ -200,6 +225,9 @@ class TextPrototypeAggregator(nn.Module):
             self.last_monitor_terms.update(monitor)
         msg = (
             f"[TPA] step={step:06d} "
+            # proto_cos/eff_rank first: usage_entropy reads healthy under collapse.
+            f"proto_cos={monitor.get('proto_pairwise_cos', 0):.4f} "
+            f"eff_rank={monitor.get('proto_effective_rank', 0):.3f} "
             f"orth_off={monitor.get('orth_off_mse', 0):.4f} "
             f"diag_mse={monitor.get('diag_mse', 0):.4f} "
             f"usage_entropy={monitor.get('usage_entropy', 0):.4f} "
@@ -215,13 +243,43 @@ class TextPrototypeAggregator(nn.Module):
             with torch.no_grad():
                 off_mse, diag_mse = compute_prototype_orthogonality(self._last_prototypes)
                 usage = compute_usage_entropy(self._last_logits)
+                cos, rank = compute_prototype_similarity(self._last_prototypes)
             self.last_monitor_terms = {
                 "orth_off_mse": off_mse,
                 "diag_mse": diag_mse,
                 "usage_entropy": usage,
+                # The two that actually detect collapse. usage_entropy reads 0.9999
+                # when every prototype is the same vector -- they are all used
+                # equally precisely because they are indistinguishable -- so it must
+                # not be read as a health signal on its own.
+                "proto_pairwise_cos": cos,
+                "proto_effective_rank": rank,
             }
         out.update(self.last_monitor_terms)
         return out
+
+
+@torch.no_grad()
+def compute_prototype_similarity(prototypes):
+    """Return (mean pairwise cosine, mean effective rank) over the K prototypes.
+
+    Effective rank is exp(entropy of the normalized singular values): 1.0 means the
+    K prototypes span a single direction, K means they are mutually independent.
+    Reference points measured on the real LVIS bank: a collapsed aggregator sits at
+    cosine 0.99996 / rank 1.05, which is where the shipped checkpoints were.
+    """
+    if prototypes is None:
+        return float("nan"), float("nan")
+    P = F.normalize(prototypes, dim=-1)
+    G = torch.einsum("ckd,cmd->ckm", P, P)
+    K = G.size(-1)
+    if K < 2:
+        return float("nan"), float(K)
+    off = (G.sum(dim=(-2, -1)) - G.diagonal(dim1=-2, dim2=-1).sum(-1)) / (K * K - K)
+    svals = torch.linalg.svdvals(P.float())
+    frac = svals / svals.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    eff_rank = torch.exp(-(frac * frac.clamp_min(1e-12).log()).sum(dim=-1))
+    return float(off.mean().item()), float(eff_rank.mean().item())
 
 
 @torch.no_grad()
@@ -252,11 +310,24 @@ def compute_usage_entropy(logits):
 
 
 def monitor_prototype_metrics(prototypes, logits, step=0, prefix="[TPA]"):
+    """Single source of truth for the diagnostics, so every caller sees the same set.
+
+    get_monitor_dict only recomputes when its cache is empty, so any metric missing
+    here silently never reaches metrics.json once _maybe_log has populated it.
+    """
     off_mse, diag_mse = compute_prototype_orthogonality(prototypes)
     usage_entropy = compute_usage_entropy(logits)
+    proto_cos, proto_rank = compute_prototype_similarity(prototypes)
     if step % 200 == 0 and _is_main_process():
-        print(f"{prefix} step={step:06d} | orth_off={off_mse:.4f} | diag_mse={diag_mse:.4f} | usage_entropy={usage_entropy:.4f}")
-    return {"orth_off_mse": off_mse, "diag_mse": diag_mse, "usage_entropy": usage_entropy}
+        print(f"{prefix} step={step:06d} | proto_cos={proto_cos:.4f} | eff_rank={proto_rank:.3f} "
+              f"| orth_off={off_mse:.4f} | diag_mse={diag_mse:.4f} | usage_entropy={usage_entropy:.4f}")
+    return {
+        "orth_off_mse": off_mse,
+        "diag_mse": diag_mse,
+        "usage_entropy": usage_entropy,
+        "proto_pairwise_cos": proto_cos,
+        "proto_effective_rank": proto_rank,
+    }
 
 
 class TextPrototypeBank(nn.Module):
