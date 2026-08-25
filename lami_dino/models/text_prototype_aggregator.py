@@ -156,6 +156,15 @@ class TextPrototypeAggregator(nn.Module):
 
     # === orthogonality term ===
     def _orthogonality_term(self, prototypes: torch.Tensor) -> torch.Tensor:
+        # K=1 has no off-diagonal to penalise: the mask zeroes the numerator and
+        # (K*K - K) zeroes the denominator, so the term evaluates to 0/0 = NaN and
+        # poisons the total loss. Single-prototype runs are the no-op control for
+        # the collapse fix, so they have to survive this path.
+        # Multiplied by zero rather than a fresh constant so the term keeps a
+        # grad_fn: callers add it straight into the loss dict, and a graph-less
+        # entry there breaks anything that backwards the APR term on its own.
+        if prototypes.size(-2) < 2:
+            return prototypes.sum() * 0.0
         P = F.normalize(prototypes, dim=-1)
         G = torch.einsum("ckd,cmd->ckm", P, P)
         K = G.size(-1)
@@ -188,6 +197,10 @@ class TextPrototypeAggregator(nn.Module):
         _orthogonality_term already measures exactly that.
         """
         C, K, N = logits.shape
+        # Normalising by log(K) divides by zero at K=1 (where the entropy is
+        # identically 0 anyway, since there is only one prototype to spread over).
+        if K < 2:
+            return logits.sum() * 0.0
         w = torch.softmax(logits, dim=1)
         votes = w.sum(dim=-1)
         p = votes / (votes.sum(dim=1, keepdim=True) + 1e-8)

@@ -205,3 +205,32 @@ def test_monitor_dict_exposes_collapse_metrics():
     for key in ("proto_pairwise_cos", "proto_effective_rank", "usage_entropy"):
         assert key in monitor, f"{key} missing from the monitor dict"
         assert isinstance(monitor[key], float)
+
+
+def test_single_prototype_apr_loss_is_finite():
+    """K=1 is the no-op control for the collapse fix, so it must not NaN.
+
+    Both APR terms normalise by a quantity that vanishes at K=1 -- the
+    orthogonality term divides by (K*K - K) after masking its numerator to zero,
+    and the diversity term divides by log(K). Each evaluated to 0/0, and since
+    lambda_div=0 does not rescue a NaN (0.0 * nan is nan), the whole apr_loss
+    came back nan and would have poisoned the total loss within a few steps.
+    """
+    torch.manual_seed(0)
+    text_feats = torch.randn(9, 6, 32)
+
+    tpa = TextPrototypeAggregator(dim=32, num_prototypes=1, hidden_dim=16, warmup_steps=10)
+    tpa.train()
+    for _ in range(3):
+        prototypes, apr_loss = tpa(text_feats)
+
+    assert prototypes.shape == (9, 1, 32)
+    assert torch.isfinite(apr_loss), f"apr_loss must be finite at K=1, got {apr_loss}"
+    assert torch.isfinite(torch.tensor(tpa.last_loss_terms["loss_orth"]))
+    assert torch.isfinite(torch.tensor(tpa.last_loss_terms["loss_div"]))
+
+    # Still has a grad_fn: callers put it straight into the loss dict.
+    (apr_loss + prototypes.sum()).backward()
+    for name, param in tpa.named_parameters():
+        if param.grad is not None:
+            assert torch.isfinite(param.grad).all(), f"non-finite grad on {name}"
