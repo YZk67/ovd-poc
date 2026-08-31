@@ -86,7 +86,27 @@ base_lr = 1e-4
 optimizer.lr = base_lr
 optimizer.betas = (0.9, 0.999)
 optimizer.weight_decay = 1e-4
-optimizer.params.lr_factor_func = lambda module_name: 0.1 if "backbone" in module_name else 1
+# TPA is ~0.8M parameters sitting behind the whole detector, and at the shared
+# 1e-4 it barely moves: in a controlled run on the real LVIS prompt bank, the
+# prototypes' effective rank reached 2.46 at lr 1e-3 but only 1.50 at 1e-4 --
+# after task structure, this is the single largest lever on whether the K
+# prototypes separate at all. The backbone and detector keep their own rates, so
+# this only speeds up the text-side module.
+# lr_factor_func receives the full parameter path (detectron2/solver/build.py:231),
+# e.g. "transformer.decoder.class_embed.6.tpa.prototype_queries".
+# Not CLI-overridable (it is a callable, not a config scalar) -- edit this to sweep.
+tpa_lr_multiplier = 10.0
+
+
+def _lr_factor(param_name: str) -> float:
+    if "backbone" in param_name:
+        return 0.1
+    if ".tpa." in param_name:
+        return tpa_lr_multiplier
+    return 1.0
+
+
+optimizer.params.lr_factor_func = _lr_factor
 
 # modify dataloader config
 # Start with conservative setting, can be increased if stable
