@@ -209,7 +209,7 @@ def main():
     print(f"{'box features (mean)':24s}{r8s.mean():8.3f}")
     print(f"{'box features (p10/p90)':24s}{np.percentile(r8s, 10):8.3f} / {np.percentile(r8s, 90):.3f}")
     print(f"{'text bank, 8 prompts':24s}{bank_rank:8.3f}   <- reference (max possible 8.0)")
-    print(f"\nk=5 vs k=1 cosine gain: {gains.mean():.4f}   isotropic null: {nulls.mean():.4f}")
+    print(f"\nk=5 vs k=1 cosine gain: {gains.mean():.4f}   matched 1-mode null: {nulls.mean():.4f}")
     print(f"gain above null:        {gains.mean() - nulls.mean():+.4f}")
     print("\nGain at or below the null => 5 prototypes buy nothing over 1 for these\n"
           "features, and no aggregation/temperature/regulariser change can fix that.")
