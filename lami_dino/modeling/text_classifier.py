@@ -34,6 +34,7 @@ class TextClassifier(nn.Module):
         tpa_dropout: float = 0.1,
         tpa_tau: float = 0.004375,
         tpa_cls_tau: float = 0.07,
+        tpa_diversity_barrier_eps: float = 1e-4,
         tpa_log_interval: int = 200,
         tpa_warmup_steps: Optional[int] = None,
     ) -> None:
@@ -87,6 +88,7 @@ class TextClassifier(nn.Module):
                 hidden_dim=tpa_hidden_dim,
                 dropout=tpa_dropout,
                 tau=tpa_tau,
+                diversity_barrier_eps=tpa_diversity_barrier_eps,
                 log_interval=tpa_log_interval,
                 **tpa_kwargs,
             )

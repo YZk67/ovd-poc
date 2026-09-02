@@ -12,6 +12,8 @@ change one item mid-run and compare the resulting checkpoint with another row.
   norms (`norm1`/`norm2`/`norm3`) trainable at 0.1x LR.
 - Optimizer: AdamW, base LR `1e-4`, weight decay `1e-4`, betas `(0.9, 0.999)`.
 - TPA LR: 10x base LR (`1e-3`). This must be disclosed in the paper.
+- Gradient clipping: norm 0.5, applied separately to TPA parameters and to the
+  remaining detector parameters.
 - Hardware/batch: 4 GPUs, total batch size 16, AMP enabled.
 - Schedule: 12 epochs, 7,100 iterations/epoch, 85,200 total iterations.
 - Seed: 42. Dataset: `lvis_v1_train_norare`; federated focal loss over 100
@@ -25,9 +27,11 @@ change one item mid-run and compare the resulting checkpoint with another row.
 - Eq. (2): calibrated log-mean-exp, `tau_cls=0.07`, shared scale `s=50`.
 - Eqs. (3)-(4): top-R soft category fusion with `R=3`, `tau_s=1.0`,
   `tau_q=0.15`, and stop-gradient on the encoder seed.
-- Eq. (5): 5 prototypes; directional diversity weight 0.10 and usage-balance
-  weight 0.03, cosine warm-up over the first 5% of training. Global APR weight
-  is 1.0.
+- Revised Eq. (5): 5 prototypes; the directional term is the cosine log barrier
+  `-log(1-(1-eps)cos^2)` with `eps=1e-4` and weight 0.10. Usage-balance weight
+  is 0.03, both terms use cosine warm-up over the first 5% of training, and the
+  global APR weight is 1.0. The manuscript equation must be updated from the
+  failed squared-cosine form before submission.
 - Eq. (6): 8 visual centers, `tau_r=0.06`, soft-k-means sigma 1.0. RPSA uses
   the top 1,024 distinct valid encoder tokens, excludes padding, and applies the
   stricter of fixed background threshold 0.05 and per-image 60th percentile.

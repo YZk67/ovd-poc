@@ -68,6 +68,7 @@ class Trainer(SimpleTrainer):
         optimizer,
         amp=False,
         clip_grad_params=None,
+        separate_tpa_grad_clip=False,
         grad_scaler=None,
     ):
         super().__init__(model=model, data_loader=dataloader, optimizer=optimizer)
@@ -89,6 +90,7 @@ class Trainer(SimpleTrainer):
 
         # gradient clip hyper-params
         self.clip_grad_params = clip_grad_params
+        self.separate_tpa_grad_clip = bool(separate_tpa_grad_clip)
         
         self._last_tpa_grad_norm_pre_clip = float("nan")
         self._last_tpa_grad_norm_post_clip = float("nan")
@@ -133,7 +135,7 @@ class Trainer(SimpleTrainer):
             self.grad_scaler.unscale_(self.optimizer)
             self._capture_tpa_optimization_metrics(before_clip=True)
             if self.clip_grad_params is not None:
-                self.clip_grads(self.model.parameters())
+                self.clip_model_grads()
             self._capture_tpa_optimization_metrics(before_clip=False)
             self.grad_scaler.step(self.optimizer)
             self.grad_scaler.update()
@@ -141,7 +143,7 @@ class Trainer(SimpleTrainer):
             losses.backward()
             self._capture_tpa_optimization_metrics(before_clip=True)
             if self.clip_grad_params is not None:
-                self.clip_grads(self.model.parameters())
+                self.clip_model_grads()
             self._capture_tpa_optimization_metrics(before_clip=False)
             self.optimizer.step()
 
@@ -259,6 +261,29 @@ class Trainer(SimpleTrainer):
                 parameters=params,
                 **self.clip_grad_params,
             )
+
+    def clip_model_grads(self):
+        """Clip TPA and detector gradients independently when configured.
+
+        The collapse diagnostic measured a 16--42 TPA gradient norm inside a
+        0.5 global clipping budget. A stronger anti-collapse barrier would
+        otherwise shrink every detector gradient along with the TPA. The split
+        preserves the declared max norm for each parameter block.
+        """
+        tpa = self._get_tpa()
+        if not self.separate_tpa_grad_clip or tpa is None:
+            return self.clip_grads(self.model.parameters())
+
+        tpa_parameters = list(tpa.parameters())
+        tpa_ids = {id(parameter) for parameter in tpa_parameters}
+        detector_parameters = [
+            parameter
+            for parameter in self.model.parameters()
+            if id(parameter) not in tpa_ids
+        ]
+        detector_norm = self.clip_grads(detector_parameters)
+        tpa_norm = self.clip_grads(tpa_parameters)
+        return detector_norm, tpa_norm
 
 
 def do_test(cfg, model):
@@ -409,6 +434,7 @@ def do_train(args, cfg):
         optimizer=optim,
         amp=cfg.train.amp.enabled,
         clip_grad_params=cfg.train.clip_grad.params if cfg.train.clip_grad.enabled else None,
+        separate_tpa_grad_clip=getattr(cfg.train, "separate_tpa_grad_clip", False),
     )
 
     checkpointer = DetectionCheckpointer(

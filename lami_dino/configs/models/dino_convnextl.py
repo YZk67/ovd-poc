@@ -138,6 +138,8 @@ model = L(DINO)(
         tpa_tau=0.004375,
         # Eq. (2) smooth-max temperature; distinct from prompt-slot tau above.
         tpa_cls_tau=0.07,
+        # APR diversity log-barrier numerical ceiling near |cosine|=1.
+        tpa_diversity_barrier_eps=1e-4,
         tpa_log_interval=200,
     ),
     query_path="dataset/metadata/coco_clip_convnextl_a+cname.npy",

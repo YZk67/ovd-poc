@@ -210,6 +210,32 @@ def test_prototype_similarity_separates_collapsed_from_distinct():
     assert abs(cos_d) < 1e-5 and rank_d > K - 0.01
 
 
+def test_diversity_barrier_has_strong_gradient_near_collapse():
+    """The revised APR must not inherit squared cosine's flat collapse point."""
+    torch.manual_seed(7)
+    classes, prototypes, dim = 4, 5, 16
+    base = F.normalize(torch.randn(classes, 1, dim), dim=-1)
+    raw = (base + 1e-3 * torch.randn(classes, prototypes, dim)).requires_grad_()
+    normalized = F.normalize(raw, dim=-1)
+    gram = torch.einsum("ckd,cmd->ckm", normalized, normalized)
+    off_mask = ~torch.eye(prototypes, dtype=torch.bool)
+    old_squared_cosine = gram[:, off_mask].square().mean()
+
+    tpa = _make_tpa(num_prototypes=prototypes, warmup_steps=0)
+    barrier = tpa._orthogonality_term(raw)
+    old_grad = torch.autograd.grad(old_squared_cosine, raw, retain_graph=True)[0]
+    barrier_grad = torch.autograd.grad(barrier, raw)[0]
+
+    assert torch.isfinite(barrier)
+    assert barrier_grad.norm() > 100.0 * old_grad.norm()
+
+
+def test_diversity_barrier_is_zero_for_orthogonal_prototypes():
+    tpa = _make_tpa(num_prototypes=3, warmup_steps=0)
+    prototypes = torch.eye(3, 16).unsqueeze(0).expand(4, -1, -1).contiguous()
+    torch.testing.assert_close(tpa._orthogonality_term(prototypes), torch.tensor(0.0))
+
+
 def test_monitor_dict_exposes_collapse_metrics():
     tpa = _make_tpa(warmup_steps=0)
     tpa.eval()
@@ -240,11 +266,9 @@ def test_monitor_dict_is_invalidated_by_each_forward():
 def test_single_prototype_apr_loss_is_finite():
     """K=1 is the no-op control for the collapse fix, so it must not NaN.
 
-    Both APR terms normalise by a quantity that vanishes at K=1 -- the
-    orthogonality term divides by (K*K - K) after masking its numerator to zero,
-    and the diversity term divides by log(K). Each evaluated to 0/0, and since
-    lambda_div=0 does not rescue a NaN (0.0 * nan is nan), the whole apr_loss
-    came back nan and would have poisoned the total loss within a few steps.
+    Both APR terms historically normalized by quantities that vanished at K=1.
+    The no-op control must continue to return a graph-connected finite zero
+    after replacing squared cosine with the diversity barrier.
     """
     torch.manual_seed(0)
     text_feats = torch.randn(9, 6, 32)

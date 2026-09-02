@@ -44,6 +44,7 @@ class TextPrototypeAggregator(nn.Module):
         # lambda_div is Eq. (5)'s prototype-usage balance weight.
         lambda_orth: float = 0.10,
         lambda_div: float = 0.03,
+        diversity_barrier_eps: float = 1e-4,
         warmup_steps: int = DEFAULT_WARMUP_STEPS,  # set from train.max_iter * WARMUP_RATIO
         log_interval: int = 200,
     ) -> None:
@@ -59,6 +60,9 @@ class TextPrototypeAggregator(nn.Module):
         self.attention_scale = math.sqrt(hidden_dim) * self.tau
         self.lambda_orth_base = float(lambda_orth)
         self.lambda_div_base = float(lambda_div)
+        if not 0.0 < diversity_barrier_eps < 1.0:
+            raise ValueError("diversity_barrier_eps must be within (0, 1)")
+        self.diversity_barrier_eps = float(diversity_barrier_eps)
         self.warmup_steps = int(warmup_steps)
 
         # projections
@@ -68,7 +72,6 @@ class TextPrototypeAggregator(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         # buffers
-        self.register_buffer("_eye_buffer", torch.eye(num_prototypes), persistent=False)
         self._logger = logging.getLogger("lami_dino.tpa")
         self.log_interval = int(log_interval)
         # Persistent so that resuming from a checkpoint continues the APR warmup
@@ -154,23 +157,30 @@ class TextPrototypeAggregator(nn.Module):
         self._store_loss_terms(loss_orth, loss_balance, apr_loss, lam_orth, lam_balance)
         return apr_loss
 
-    # === orthogonality term ===
+    # === adaptive directional-diversity barrier ===
     def _orthogonality_term(self, prototypes: torch.Tensor) -> torch.Tensor:
-        # K=1 has no off-diagonal to penalise: the mask zeroes the numerator and
-        # (K*K - K) zeroes the denominator, so the term evaluates to 0/0 = NaN and
-        # poisons the total loss. Single-prototype runs are the no-op control for
-        # the collapse fix, so they have to survive this path.
-        # Multiplied by zero rather than a fresh constant so the term keeps a
-        # grad_fn: callers add it straight into the loss dict, and a graph-less
-        # entry there breaks anything that backwards the APR term on its own.
+        """Log barrier against parallel or anti-parallel prototype directions.
+
+        The previous mean squared cosine has the right minimum but a vanishing
+        gradient as normalized vectors become parallel. Consequently, detector
+        gradients could drive all slots into that bad stationary point. This
+        barrier has the same optimum at zero cosine while its slope increases as
+        |cosine| approaches one:
+
+            -log(1 - (1-eps) * cosine^2).
+
+        K=1 remains the no-op control and returns a graph-connected zero.
+        """
         if prototypes.size(-2) < 2:
             return prototypes.sum() * 0.0
         P = F.normalize(prototypes, dim=-1)
         G = torch.einsum("ckd,cmd->ckm", P, P)
         K = G.size(-1)
-        I = self._eye_buffer[:K, :K].to(G.device)
-        off_mask = (1.0 - torch.eye(K, device=G.device))
-        return ((G - I) ** 2 * off_mask).sum(dim=(-2, -1)).mean() / (K * K - K)
+        off_mask = ~torch.eye(K, device=G.device, dtype=torch.bool)
+        cosine_sq = G[:, off_mask].square()
+        return -torch.log1p(
+            -(1.0 - self.diversity_barrier_eps) * cosine_sq
+        ).mean()
 
     # === prototype usage balance term ===
     def _balance_term(self, logits: torch.Tensor) -> torch.Tensor:

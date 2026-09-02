@@ -64,6 +64,10 @@ train.checkpointer.period = iterations_per_epoch
 train.clip_grad.enabled = True
 train.clip_grad.params.max_norm = 0.5
 train.clip_grad.params.norm_type = 2
+# The revised APR barrier can have a deliberately large gradient near collapse.
+# Give TPA and the remaining detector separate 0.5-norm clipping budgets so
+# this corrective signal cannot suppress every detector parameter update.
+train.separate_tpa_grad_clip = True
 
 train.sync_batchnorm = True
 
@@ -145,6 +149,7 @@ model.classifier.tpa_dropout = 0.1
 # equation's explicit scaled-dot-product form.
 model.classifier.tpa_tau = 0.004375
 model.classifier.tpa_cls_tau = 0.07  # Eq. (2) temperature-controlled log-mean-exp
+model.classifier.tpa_diversity_barrier_eps = 1e-4
 model.classifier.tpa_log_interval = 200
 # Derive APR warm-up explicitly from the run schedule so short ablations can
 # preserve the same 5% ratio when max_iter is overridden.
