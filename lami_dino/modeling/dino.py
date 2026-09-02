@@ -624,7 +624,6 @@ class DINO(nn.Module):
                     )
 
                 loss_dict["loss_rpsa"] = rpsa_loss_value
-                stats = getattr(dec_encoder, "rpsa_stats", None)
 
                 storage = None
                 try:
@@ -649,21 +648,6 @@ class DINO(nn.Module):
 
                 if storage is not None:
                     storage.put_scalar("loss_rpsa_scale", float(schedule_scale), smoothing_hint=False)
-                    if isinstance(stats, dict):
-                        if "rpsa_bg_ratio" in stats:
-                            storage.put_scalar("loss_rpsa_bg_ratio", float(stats["rpsa_bg_ratio"]), smoothing_hint=False)
-                        if "rpsa_valid_clusters" in stats:
-                            storage.put_scalar("loss_rpsa_valid_clusters", float(stats["rpsa_valid_clusters"]), smoothing_hint=False)
-                        if "rpsa_active" in stats:
-                            storage.put_scalar("loss_rpsa_active", float(stats["rpsa_active"]), smoothing_hint=False)
-                        if "rpsa_empty_image_ratio" in stats:
-                            storage.put_scalar("loss_rpsa_empty_image_ratio", float(stats["rpsa_empty_image_ratio"]), smoothing_hint=False)
-                        if "rpsa_tokens" in stats:
-                            storage.put_scalar("loss_rpsa_tokens", float(stats["rpsa_tokens"]), smoothing_hint=False)
-                        if "rpsa_center_orth_mse" in stats:
-                            storage.put_scalar("rpsa_center_orth_mse", float(stats["rpsa_center_orth_mse"]), smoothing_hint=False)
-                        if "rpsa_pi_entropy" in stats:
-                            storage.put_scalar("rpsa_pi_entropy", float(stats["rpsa_pi_entropy"]), smoothing_hint=False)
 
             # === 3️⃣ FedLoss、主损失加权保持一致 ===
             weight_dict = self.criterion.weight_dict

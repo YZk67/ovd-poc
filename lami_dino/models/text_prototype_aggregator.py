@@ -124,6 +124,10 @@ class TextPrototypeAggregator(nn.Module):
 
         self._last_logits = logits.detach()
         self._last_prototypes = prototypes_clean.detach()
+        # Diagnostics must describe this forward. Keeping the previous dict made
+        # metrics.json repeat stale rank/cosine values until log_interval happened
+        # to refresh the cache.
+        self.last_monitor_terms = {}
 
         apr_loss = None
         if with_loss:

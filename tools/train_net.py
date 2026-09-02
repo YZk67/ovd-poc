@@ -90,8 +90,9 @@ class Trainer(SimpleTrainer):
         # gradient clip hyper-params
         self.clip_grad_params = clip_grad_params
         
-        # Flag to print TPA gradient info only once
-        self.tpa_grad_printed = False
+        self._last_tpa_grad_norm_pre_clip = float("nan")
+        self._last_tpa_grad_norm_post_clip = float("nan")
+        self._last_tpa_lr = float("nan")
 
     def run_step(self):
         """
@@ -127,36 +128,60 @@ class Trainer(SimpleTrainer):
 
         if self.amp:
             self.grad_scaler.scale(losses).backward()
+            # Unscale before both diagnostics and clipping. GradScaler.step()
+            # accepts an optimizer that has already been unscaled.
+            self.grad_scaler.unscale_(self.optimizer)
+            self._capture_tpa_optimization_metrics(before_clip=True)
             if self.clip_grad_params is not None:
-                self.grad_scaler.unscale_(self.optimizer)
                 self.clip_grads(self.model.parameters())
+            self._capture_tpa_optimization_metrics(before_clip=False)
             self.grad_scaler.step(self.optimizer)
             self.grad_scaler.update()
         else:
             losses.backward()
+            self._capture_tpa_optimization_metrics(before_clip=True)
             if self.clip_grad_params is not None:
                 self.clip_grads(self.model.parameters())
+            self._capture_tpa_optimization_metrics(before_clip=False)
             self.optimizer.step()
 
-        # === 只打印一次 TPA 梯度信息 ===
-        if not self.tpa_grad_printed:
-            # Get the underlying model (unwrap DDP if needed)
-            model = self.model.module if hasattr(self.model, 'module') else self.model
-            logger.info(f"use_soft_attention: {model.transformer.use_soft_attention}")
-            logger.info(f"soft_attention_tau: {model.transformer.soft_attention_tau}")
-            
-            # 检查 TPA 参数的梯度
-            if hasattr(model.transformer.decoder.class_embed[0], 'tpa'):
-                logger.info("TPA parameters gradient status:")
-                for n, p in model.transformer.decoder.class_embed[0].tpa.named_parameters():
-                    logger.info(f"  {n}: grad={'Yes' if p.grad is not None else 'No'}")
-            else:
-                logger.info("TPA not found in class_embed[0]")
-            
-            self.tpa_grad_printed = True  # ✅ 确保只打印一次
-        
         self._write_metrics(loss_dict, data_time)
         self._write_tpa_metrics()
+
+    def _get_tpa(self):
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        try:
+            return getattr(model.transformer.decoder.class_embed[0], "tpa", None)
+        except (AttributeError, IndexError):
+            return None
+
+    def _capture_tpa_optimization_metrics(self, *, before_clip):
+        """Measure the actual synchronized TPA gradient, not just grad presence."""
+        tpa = self._get_tpa()
+        if tpa is None:
+            return
+        parameters = list(tpa.parameters())
+        grad_norms = [
+            parameter.grad.detach().float().norm(2)
+            for parameter in parameters
+            if parameter.grad is not None
+        ]
+        grad_norm = (
+            torch.stack(grad_norms).norm(2).item()
+            if grad_norms
+            else float("nan")
+        )
+        if before_clip:
+            self._last_tpa_grad_norm_pre_clip = grad_norm
+            tpa_param_ids = {id(parameter) for parameter in parameters}
+            tpa_lrs = {
+                float(group["lr"])
+                for group in self.optimizer.param_groups
+                if any(id(parameter) in tpa_param_ids for parameter in group["params"])
+            }
+            self._last_tpa_lr = min(tpa_lrs) if tpa_lrs else float("nan")
+        else:
+            self._last_tpa_grad_norm_post_clip = grad_norm
 
     def _write_tpa_metrics(self):
         """Record TPA diagnostics, including the ones that detect collapse.
@@ -170,20 +195,50 @@ class Trainer(SimpleTrainer):
         _write_metrics calls .detach() on every value (these are plain floats) and
         sums them all into total_loss, where a NaN diagnostic would abort training.
         """
-        if not comm.is_main_process():
-            # get_monitor_dict recomputes when its cache is empty, and only the
-            # main process ever fills the cache; skip the wasted work elsewhere.
-            return
         model = self.model.module if hasattr(self.model, "module") else self.model
-        try:
-            tpa = getattr(model.transformer.decoder.class_embed[0], "tpa", None)
-        except (AttributeError, IndexError):
-            return
-        if tpa is None:
+        tpa = self._get_tpa()
+
+        # Losses are reduced by SimpleTrainer, but these diagnostics used to be
+        # written directly inside DINO.forward and therefore described only the
+        # local rank. Reduce them explicitly so active=0 cannot coexist with a
+        # non-zero globally reduced RPSA loss in metrics.json.
+        rpsa_metric_names = {
+            "rpsa_bg_ratio": "loss_rpsa_bg_ratio",
+            "rpsa_valid_clusters": "loss_rpsa_valid_clusters",
+            "rpsa_active": "loss_rpsa_active",
+            "rpsa_empty_image_ratio": "loss_rpsa_empty_image_ratio",
+            "rpsa_tokens": "loss_rpsa_tokens",
+            "rpsa_center_orth_mse": "rpsa_center_orth_mse",
+            "rpsa_pi_entropy": "rpsa_pi_entropy",
+        }
+        rpsa_stats = getattr(model.transformer, "rpsa_last_stats", {})
+        device = next(model.parameters()).device
+        rpsa_to_reduce = {
+            key: torch.as_tensor(rpsa_stats[key], device=device, dtype=torch.float32).reshape(())
+            for key in rpsa_metric_names
+            if key in rpsa_stats
+        }
+        reduced_rpsa = comm.reduce_dict(rpsa_to_reduce, average=True) if rpsa_to_reduce else {}
+
+        if not comm.is_main_process():
             return
         storage = get_event_storage()
+        for key, value in reduced_rpsa.items():
+            value = float(value)
+            if math.isfinite(value):
+                storage.put_scalar(rpsa_metric_names[key], value, smoothing_hint=False)
+
+        if tpa is None:
+            return
         for key, value in tpa.get_monitor_dict().items():
             value = float(value)
+            if math.isfinite(value):
+                storage.put_scalar(f"tpa/{key}", value, smoothing_hint=False)
+        for key, value in {
+            "grad_norm_pre_clip": self._last_tpa_grad_norm_pre_clip,
+            "grad_norm_post_clip": self._last_tpa_grad_norm_post_clip,
+            "lr": self._last_tpa_lr,
+        }.items():
             if math.isfinite(value):
                 storage.put_scalar(f"tpa/{key}", value, smoothing_hint=False)
 

@@ -243,11 +243,12 @@ model.transformer.rpsa_warmup_init_scale = 0.0
 model.transformer.rpsa_warmup_power = 1.0
 
 # ========================= APR weight tune =========================
-# was 1.0 (inherited from dino_convnextl.py). The TPA already applies internal
-# λ_orth=0.10 and λ_div=0.03 with cosine warmup; multiplying by 1.0 again pushes
-# the regularizer to the same magnitude as loss_class and crowds out the main
-# task. 0.1 keeps the regularizer present without dominating.
-model.criterion.weight_dict["loss_apr"] = 0.1
+# Keep the base model's outer weight of 1.0. The TPA already applies the Eq. (5)
+# coefficients internally (λ_div=0.10 and λ_bal=0.03), so the raw APR term is
+# only about 0.1 versus a roughly 35-point total detector loss in the 500-step
+# CLIP-only smoke run. An additional 0.1 multiplier reduced its contribution to
+# about 0.01 and the measured prototype rank regressed from 1.568 to 1.519.
+model.criterion.weight_dict["loss_apr"] = 1.0
 
 
 # Enable Automatic Mixed Precision (AMP) for faster training

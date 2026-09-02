@@ -222,6 +222,21 @@ def test_monitor_dict_exposes_collapse_metrics():
         assert isinstance(monitor[key], float)
 
 
+def test_monitor_dict_is_invalidated_by_each_forward():
+    tpa = _make_tpa(warmup_steps=0)
+    tpa.eval()
+    with torch.no_grad():
+        tpa(torch.randn(8, 6, 16), with_loss=False)
+        first = tpa.get_monitor_dict()
+        assert tpa.last_monitor_terms
+
+        tpa(torch.randn(8, 6, 16), with_loss=False)
+        assert not tpa.last_monitor_terms
+        second = tpa.get_monitor_dict()
+
+    assert first["proto_pairwise_cos"] != second["proto_pairwise_cos"]
+
+
 def test_single_prototype_apr_loss_is_finite():
     """K=1 is the no-op control for the collapse fix, so it must not NaN.
 

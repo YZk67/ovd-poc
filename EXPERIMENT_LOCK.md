@@ -27,7 +27,7 @@ change one item mid-run and compare the resulting checkpoint with another row.
   `tau_q=0.15`, and stop-gradient on the encoder seed.
 - Eq. (5): 5 prototypes; directional diversity weight 0.10 and usage-balance
   weight 0.03, cosine warm-up over the first 5% of training. Global APR weight
-  is 0.1.
+  is 1.0.
 - Eq. (6): 8 visual centers, `tau_r=0.06`, soft-k-means sigma 1.0. RPSA uses
   the top 1,024 distinct valid encoder tokens, excludes padding, and applies the
   stricter of fixed background threshold 0.05 and per-image 60th percentile.
@@ -46,9 +46,10 @@ change one item mid-run and compare the resulting checkpoint with another row.
    An empty filtered set for an individual batch is an observable zero-loss skip
    (`loss_rpsa_active=0`); shape errors and non-finite values remain fail-fast.
 4. Record `tpa/proto_pairwise_cos`, `tpa/proto_effective_rank`,
+   `tpa/grad_norm_pre_clip`, `tpa/grad_norm_post_clip`, `tpa/lr`,
    `query_fusion/category_max_weight`, `query_fusion/prototype_max_weight`,
    `loss_rpsa_bg_ratio`, `loss_rpsa_valid_clusters`, `loss_rpsa_active`, and
-   `loss_rpsa_empty_image_ratio`.
+   `loss_rpsa_empty_image_ratio`. RPSA diagnostics are averaged across ranks.
 5. Every ablation uses a distinct stable output directory and the same seed,
    initialization, batch size, and iteration budget.
 

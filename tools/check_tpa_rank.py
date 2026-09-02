@@ -8,7 +8,7 @@ prototype_queries on shape mismatch and measure random weights instead.
 Replays the ORIGINAL forward, sqrt(d) division included, because the question is
 what the prototypes were under the code that trained this checkpoint.
 
-    python check_kp.py <ckpt.pth> <lvis_claude_prompts_convnextl.npy> [tau]
+    python tools/check_tpa_rank.py <ckpt.pth> <prompt_bank.npy> [tau_p]
 """
 import math
 import sys
@@ -23,15 +23,20 @@ hits = sorted(k for k in sd if k.endswith("tpa.key_proj.weight"))
 if not hits:
     sys.exit(f"[!] no TPA weights in {sys.argv[1]} -- was this run trained with use_tpa=True?")
 pre = hits[0][: -len("key_proj.weight")]
-tau = float(sys.argv[3]) if len(sys.argv) > 3 else 0.07
+tau = float(sys.argv[3]) if len(sys.argv) > 3 else 0.004375
 
 T = torch.from_numpy(np.load(sys.argv[2])).float()
 q = sd[pre + "prototype_queries"].float()
 kw, kb = sd[pre + "key_proj.weight"].float(), sd[pre + "key_proj.bias"].float()
 vw, vb = sd[pre + "value_proj.weight"].float(), sd[pre + "value_proj.bias"].float()
 
-logits = torch.einsum("kh,cnh->ckn", q, F.linear(T, kw, kb)) / math.sqrt(kw.shape[0])
-P = torch.einsum("ckn,cnd->ckd", torch.softmax(logits / tau, dim=-1), F.linear(T, vw, vb))
+attention_scale = math.sqrt(kw.shape[0]) * tau
+logits = torch.einsum("kh,cnh->ckn", q, F.linear(T, kw, kb))
+P = torch.einsum(
+    "ckn,cnd->ckd",
+    torch.softmax(logits / attention_scale, dim=-1),
+    F.linear(T, vw, vb),
+)
 
 Pn = F.normalize(P, dim=-1)
 G = torch.einsum("ckd,cmd->ckm", Pn, Pn)
@@ -44,4 +49,4 @@ sv = torch.linalg.eigvalsh(G.float()).clamp_min(0.0).sqrt()
 fr = sv / sv.sum(-1, keepdim=True).clamp_min(1e-12)
 rank = torch.exp(-(fr * fr.clamp_min(1e-12).log()).sum(-1))
 print(f"Kp={Kp}  tau={tau}  pairwise_cos={off.mean():.5f}  eff_rank={rank.mean():.4f}  "
-      f"(collapsed ~1.0, ceiling {T.shape[1]})")
+      f"(collapsed ~1.0, ceiling {min(Kp, T.shape[1], P.shape[-1])})")
