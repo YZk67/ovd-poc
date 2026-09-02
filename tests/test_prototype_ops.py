@@ -3,8 +3,36 @@ import torch.nn.functional as F
 
 from lami_dino.prototype_ops import (
     calibrated_logmeanexp_similarity,
+    prototype_task_view,
     soft_category_prototype_fusion,
 )
+
+
+def test_prototype_stabilization_blocks_only_task_gradient():
+    prototypes = torch.randn(3, 5, 8, requires_grad=True)
+
+    forming = prototype_task_view(
+        prototypes,
+        iteration=9,
+        stabilization_steps=10,
+        training=True,
+    )
+    joint = prototype_task_view(
+        prototypes,
+        iteration=10,
+        stabilization_steps=10,
+        training=True,
+    )
+    evaluating = prototype_task_view(
+        prototypes,
+        iteration=0,
+        stabilization_steps=10,
+        training=False,
+    )
+
+    assert not forming.requires_grad
+    assert joint is prototypes
+    assert evaluating is prototypes
 
 
 def test_logmeanexp_is_invariant_to_duplicate_prototypes():

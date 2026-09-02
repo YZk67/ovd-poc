@@ -151,9 +151,9 @@ model.classifier.tpa_tau = 0.004375
 model.classifier.tpa_cls_tau = 0.07  # Eq. (2) temperature-controlled log-mean-exp
 model.classifier.tpa_diversity_barrier_eps = 1e-4
 model.classifier.tpa_log_interval = 200
-# Derive APR warm-up explicitly from the run schedule so short ablations can
-# preserve the same 5% ratio when max_iter is overridden.
-model.classifier.tpa_warmup_steps = int(train.max_iter * 0.05)
+# Let the barrier reach full strength while task gradients are still detached.
+model.classifier.tpa_warmup_steps = 100
+model.tpa_stabilization_steps = 500
 
 # Query initialization: Soft-attention aggregation parameters for multi-prototype query initialization
 model.use_soft_attention = True  # Enable soft-attention aggregation in query initialization

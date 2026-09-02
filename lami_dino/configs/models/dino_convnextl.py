@@ -165,6 +165,7 @@ model = L(DINO)(
     # their most compatible prototypes into the initial decoder query.
     soft_category_topk=3,
     soft_category_tau=1.0,
+    tpa_stabilization_steps=0,
 )
 
 # set aux loss weight dict

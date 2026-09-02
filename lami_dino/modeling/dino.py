@@ -34,6 +34,7 @@ from detectron2.structures import Boxes, ImageList, Instances
 from detectron2.utils.logger import setup_logger
 from detectron2.utils.events import get_event_storage
 from lami_dino.checkpoint_init import load_trusted_torch_file
+from lami_dino.prototype_ops import prototype_task_view
 
 logger_rpsa = setup_logger()  # 用于RPSA日志输出
 
@@ -106,6 +107,7 @@ class DINO(nn.Module):
         soft_attention_tau: float = 0.1,
         soft_category_topk: int = 3,
         soft_category_tau: float = 1.0,
+        tpa_stabilization_steps: int = 0,
     ):
         super().__init__()
         self.vlm_temperature = vlm_temperature
@@ -120,6 +122,10 @@ class DINO(nn.Module):
             raise ValueError(f"soft_category_tau must be positive, got {soft_category_tau}")
         self.soft_category_topk = int(soft_category_topk)
         self.soft_category_tau = float(soft_category_tau)
+        if tpa_stabilization_steps < 0:
+            raise ValueError("tpa_stabilization_steps must be non-negative")
+        self.tpa_stabilization_steps = int(tpa_stabilization_steps)
+        self.tpa_stabilizing = False
         # define backbone and position embedding module
         self.backbone = backbone
         self.position_embedding = position_embedding
@@ -500,13 +506,29 @@ class DINO(nn.Module):
                 else:
                     shared_prototypes = cached
                 shared_apr_loss = None
+
+            current_iter = 0
+            if self.training:
+                try:
+                    current_iter = get_event_storage().iter
+                except AssertionError:
+                    pass
+            self.tpa_stabilizing = bool(
+                self.training and current_iter < self.tpa_stabilization_steps
+            )
+            task_prototypes = prototype_task_view(
+                shared_prototypes,
+                iteration=current_iter,
+                stabilization_steps=self.tpa_stabilization_steps,
+                training=self.training,
+            )
             # Broadcast to every class_embed copy so they reuse the same prototype tensor.
             for ce in self.transformer.decoder.class_embed:
-                ce.set_external_prototypes(shared_prototypes, shared_apr_loss)
+                ce.set_external_prototypes(task_prototypes, shared_apr_loss)
 
             # Project to decoder dim for query init
-            proto_ckd = self.content_layer(shared_prototypes.view(-1, shared_prototypes.size(-1))).view(
-                shared_prototypes.size(0), shared_prototypes.size(1), -1
+            proto_ckd = self.content_layer(task_prototypes.view(-1, task_prototypes.size(-1))).view(
+                task_prototypes.size(0), task_prototypes.size(1), -1
             )
             proto_ckd = F.normalize(proto_ckd, p=2, dim=-1)
             raw_content_query_embeds = proto_ckd  # [C,K,embed_dim]

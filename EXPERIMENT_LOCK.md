@@ -29,9 +29,11 @@ change one item mid-run and compare the resulting checkpoint with another row.
   `tau_q=0.15`, and stop-gradient on the encoder seed.
 - Revised Eq. (5): 5 prototypes; the directional term is the cosine log barrier
   `-log(1-(1-eps)cos^2)` with `eps=1e-4` and weight 0.10. Usage-balance weight
-  is 0.03, both terms use cosine warm-up over the first 5% of training, and the
-  global APR weight is 1.0. The manuscript equation must be updated from the
-  failed squared-cosine form before submission.
+  is 0.03, both terms use a 100-step cosine warm-up, and the global APR weight
+  is 1.0. During the first 500 steps, task consumers receive detached prototype
+  tensors while APR continues to update TPA; joint end-to-end gradients start
+  at step 500. The manuscript must disclose this stabilization phase and update
+  the equation from the failed squared-cosine form before submission.
 - Eq. (6): 8 visual centers, `tau_r=0.06`, soft-k-means sigma 1.0. RPSA uses
   the top 1,024 distinct valid encoder tokens, excludes padding, and applies the
   stricter of fixed background threshold 0.05 and per-image 60th percentile.

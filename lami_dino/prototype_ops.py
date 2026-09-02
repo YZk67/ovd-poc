@@ -14,6 +14,27 @@ import torch
 import torch.nn.functional as F
 
 
+def prototype_task_view(
+    prototypes: torch.Tensor,
+    *,
+    iteration: int,
+    stabilization_steps: int,
+    training: bool,
+) -> torch.Tensor:
+    """Detach task consumers during the APR-only prototype formation phase.
+
+    APR is computed from the original ``prototypes`` tensor before this view is
+    created, so TPA continues to receive its diversity/balance gradient. Only
+    detector classification and query-fusion gradients are blocked until the
+    prototype set has formed distinct directions.
+    """
+    if stabilization_steps < 0:
+        raise ValueError("stabilization_steps must be non-negative")
+    if training and int(iteration) < int(stabilization_steps):
+        return prototypes.detach()
+    return prototypes
+
+
 def calibrated_logmeanexp_similarity(
     features: torch.Tensor,
     prototypes: torch.Tensor,
