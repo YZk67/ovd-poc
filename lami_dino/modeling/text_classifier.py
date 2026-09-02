@@ -6,6 +6,7 @@ from detectron2.layers import ShapeSpec
 from typing import Optional
 
 from lami_dino.models import TextPrototypeAggregator
+from lami_dino.prototype_ops import calibrated_logmeanexp_similarity
 
 
 class TextClassifier(nn.Module):
@@ -31,7 +32,8 @@ class TextClassifier(nn.Module):
         tpa_num_prototypes: int = 4,
         tpa_hidden_dim: int = 256,
         tpa_dropout: float = 0.1,
-        tpa_tau: float = 0.1,
+        tpa_tau: float = 0.004375,
+        tpa_cls_tau: float = 0.07,
         tpa_log_interval: int = 200,
         tpa_warmup_steps: Optional[int] = None,
     ) -> None:
@@ -50,6 +52,9 @@ class TextClassifier(nn.Module):
 
         self.use_tpa = use_tpa
         self.num_classes = num_classes
+        if tpa_cls_tau <= 0:
+            raise ValueError(f"tpa_cls_tau must be positive, got {tpa_cls_tau}")
+        self.tpa_cls_tau = float(tpa_cls_tau)
 
         if self.use_tpa:
             train_feats = self._load_text_embeddings(text_embed_path or zs_weight_path)
@@ -218,15 +223,26 @@ class TextClassifier(nn.Module):
         if self.norm_weight:
             prototypes = F.normalize(prototypes, p=2, dim=-1)
 
-        features = self._normalize_features(x)
-        logits = torch.einsum("bqd,ckd->bqck", features, prototypes)
-        logits = torch.logsumexp(logits, dim=-1)
+        # Paper Eq. (2): s * tau * log(mean_k exp(cos(z, p_k) / tau)).
+        # Do not use _normalize_features here: that helper applies the scale
+        # before aggregation, whereas Eq. (2) applies a shared scale after the
+        # temperature-controlled log-mean-exp.  The 1/K term is essential for
+        # a fair K=1 vs K>1 comparison and makes duplicate prototype sets
+        # prediction-invariant.
+        features = F.normalize(x, p=2, dim=-1) if self.norm_weight else x
+        logit_scale = self.norm_temperature if self.norm_weight else 1.0
+        logits = calibrated_logmeanexp_similarity(
+            features,
+            prototypes,
+            temperature=self.tpa_cls_tau,
+            logit_scale=logit_scale,
+        )
 
         if additional_class is not None:
             additional = additional_class.to(device=features.device, dtype=features.dtype)
             if self.norm_weight:
                 additional = F.normalize(additional, p=2, dim=-1)
-            additional_logits = torch.einsum("bqd,nd->bqn", features, additional)
+            additional_logits = logit_scale * torch.einsum("bqd,nd->bqn", features, additional)
             logits = torch.cat([logits, additional_logits], dim=-1)
 
         if self.use_bias:

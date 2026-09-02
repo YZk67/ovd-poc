@@ -55,6 +55,7 @@ model.cluster_fed_loss = False
 
 # ── train: eval-only mode ────────────────────────────────────────────────────
 train.init_checkpoint          = "/root/autodl-tmp/model_final.pth"
+train.init_checkpoint_scope    = "full"
 train.eval_period              = 999999999   # never mid-run
 train.checkpointer.period      = 999999999   # never save
 train.output_dir               = "/root/autodl-tmp/transfer_lvis_to_coco"

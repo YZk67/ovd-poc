@@ -143,7 +143,10 @@ CUDA_VISIBLE_DEVICES=1 python tools/train_net.py --config-file lami_dino/configs
 ##  🥳 Training
 OV-LVIS 
 ```bash
-python tools/train_net.py --config-file lami_dino/configs/dino_convnext_large_4scale_12ep_lvis.py --num-gpus 8 train.init_checkpoint=pretrained_models/clip_convnext_large_trans.pth
+python tools/preflight_instructdet.py --hash
+CUDA_VISIBLE_DEVICES=0,1,2,3 python tools/train_net.py \
+  --config-file lami_dino/configs/dino_convnext_large_4scale_12ep_lvis.py \
+  --num-gpus 4
 ```
 Zero-shot LVIS 
 ```bash
@@ -177,4 +180,3 @@ CUDA_VISIBLE_DEVICES=1 python tools/train_net.py --config-file lami_dino/configs
 ## 💖 Acknowledgement
 <span id="acknowledgement"></span>
 LaMI-DETR is built based on [detectron2](https://github.com/facebookresearch/detectron2) and [detrex](https://github.com/IDEA-Research/detrex), thanks to all the contributors!
-

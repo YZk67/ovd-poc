@@ -33,6 +33,7 @@ from detectron2.modeling import detector_postprocess
 from detectron2.structures import Boxes, ImageList, Instances
 from detectron2.utils.logger import setup_logger
 from detectron2.utils.events import get_event_storage
+from lami_dino.checkpoint_init import load_trusted_torch_file
 
 logger_rpsa = setup_logger()  # 用于RPSA日志输出
 
@@ -103,6 +104,8 @@ class DINO(nn.Module):
         clip_head_path=None,
         use_soft_attention: bool = True,
         soft_attention_tau: float = 0.1,
+        soft_category_topk: int = 3,
+        soft_category_tau: float = 1.0,
     ):
         super().__init__()
         self.vlm_temperature = vlm_temperature
@@ -111,6 +114,12 @@ class DINO(nn.Module):
         self.novel_scale = novel_scale
         self.use_soft_attention = use_soft_attention
         self.soft_attention_tau = soft_attention_tau
+        if soft_category_topk < 1:
+            raise ValueError(f"soft_category_topk must be >= 1, got {soft_category_topk}")
+        if soft_category_tau <= 0:
+            raise ValueError(f"soft_category_tau must be positive, got {soft_category_tau}")
+        self.soft_category_topk = int(soft_category_topk)
+        self.soft_category_tau = float(soft_category_tau)
         # define backbone and position embedding module
         self.backbone = backbone
         self.position_embedding = position_embedding
@@ -235,7 +244,10 @@ class DINO(nn.Module):
 
         self.score_ensemble = score_ensemble
         if self.score_ensemble:
-            clip_head = torch.load(clip_head_path)
+            # This file contains serialized nn.Modules rather than only tensor
+            # weights. PyTorch >=2.6 defaults to weights_only=True, which rejects
+            # that trusted legacy format unless the intent is explicit.
+            clip_head = load_trusted_torch_file(clip_head_path)
             self.identical, self.thead = clip_head[0]
             self.head = clip_head[1]
 
@@ -467,9 +479,27 @@ class DINO(nn.Module):
             text_feats = text_classifier._maybe_move_text_feats(training=self.training)
             if content_inds is not None:
                 text_feats = text_feats[content_inds]
-            # [C,K,D_text]
-            with_loss = self.training
-            shared_prototypes, shared_apr_loss = text_classifier.tpa(text_feats, with_loss=with_loss)
+            # [C,K,D_text]. At inference Eq. (7) says the category bank is
+            # computed once and cached; do not rerun TPA for every image.
+            if self.training:
+                shared_prototypes, shared_apr_loss = text_classifier.tpa(
+                    text_feats, with_loss=True
+                )
+            else:
+                cached = text_classifier._cached_eval
+                cache_valid = (
+                    cached is not None
+                    and cached.device == text_feats.device
+                    and cached.shape[0] == text_feats.shape[0]
+                )
+                if not cache_valid:
+                    shared_prototypes, _ = text_classifier.tpa(
+                        text_feats, with_loss=False
+                    )
+                    text_classifier._cached_eval = shared_prototypes.detach()
+                else:
+                    shared_prototypes = cached
+                shared_apr_loss = None
             # Broadcast to every class_embed copy so they reuse the same prototype tensor.
             for ce in self.transformer.decoder.class_embed:
                 ce.set_external_prototypes(shared_prototypes, shared_apr_loss)
@@ -511,6 +541,8 @@ class DINO(nn.Module):
         if hasattr(self, 'use_soft_attention') and self.use_soft_attention and raw_content_query_embeds.ndim == 3:
             self.transformer.use_soft_attention = self.use_soft_attention
             self.transformer.soft_attention_tau = self.soft_attention_tau
+            self.transformer.soft_category_topk = self.soft_category_topk
+            self.transformer.soft_category_tau = self.soft_category_tau
 
         # feed into transformer
         (
@@ -580,58 +612,54 @@ class DINO(nn.Module):
                 loss_dict["loss_apr"] = apr_loss
 
             # === 2️⃣ 添加 RPSA 损失（Region–Prototype Semantic Alignment） ===
-            # RPSA 模块的损失在 transformer 内部计算，并暂存在 encoder分类器中
-            try:
+            # Formal runs must never continue silently without Eq. (6).
+            if getattr(self.transformer, "use_rpsa", False):
                 dec_encoder = self.transformer.decoder.class_embed[self.transformer.decoder.num_layers]
-                if hasattr(dec_encoder, "rpsa_loss"):
-                    rpsa_loss_value = dec_encoder.rpsa_loss
-                    if rpsa_loss_value is not None:
-                        loss_dict["loss_rpsa"] = rpsa_loss_value
-                        stats = getattr(dec_encoder, "rpsa_stats", None)
-                        if isinstance(stats, dict):
-                            if "rpsa_center_orth_mse" in stats:
-                                loss_dict["rpsa_center_orth_mse"] = stats["rpsa_center_orth_mse"]
-                            if "rpsa_pi_entropy" in stats:
-                                loss_dict["rpsa_pi_entropy"] = stats["rpsa_pi_entropy"]
+                rpsa_loss_value = getattr(dec_encoder, "rpsa_loss", None)
+                if rpsa_loss_value is None:
+                    raise RuntimeError("RPSA is enabled but no loss was produced")
+                if not torch.isfinite(rpsa_loss_value).all():
+                    raise FloatingPointError(
+                        f"RPSA produced a non-finite loss: {rpsa_loss_value.detach()}"
+                    )
 
-                        storage = None
-                        try:
-                            storage = get_event_storage()
-                            current_iter = storage.iter
-                        except AssertionError:
-                            current_iter = 0
+                loss_dict["loss_rpsa"] = rpsa_loss_value
+                stats = getattr(dec_encoder, "rpsa_stats", None)
 
-                        warmup_iters = getattr(self.transformer, "rpsa_warmup_iters", 0)
-                        warmup_start = getattr(self.transformer, "rpsa_warmup_start", 0)
-                        warmup_init = getattr(self.transformer, "rpsa_warmup_init_scale", 0.0)
-                        warmup_power = getattr(self.transformer, "rpsa_warmup_power", 1.0)
-                        schedule_scale = 1.0
-                        if warmup_iters > 0:
-                            if current_iter < warmup_start:
-                                schedule_scale = warmup_init
-                            elif current_iter < warmup_start + warmup_iters:
-                                progress = (current_iter - warmup_start) / float(max(warmup_iters, 1))
-                                schedule_scale = warmup_init + (progress ** warmup_power) * (1.0 - warmup_init)
+                storage = None
+                try:
+                    storage = get_event_storage()
+                    current_iter = storage.iter
+                except AssertionError:
+                    current_iter = 0
 
-                        loss_dict["loss_rpsa"] = loss_dict["loss_rpsa"] * schedule_scale
+                warmup_iters = getattr(self.transformer, "rpsa_warmup_iters", 0)
+                warmup_start = getattr(self.transformer, "rpsa_warmup_start", 0)
+                warmup_init = getattr(self.transformer, "rpsa_warmup_init_scale", 0.0)
+                warmup_power = getattr(self.transformer, "rpsa_warmup_power", 1.0)
+                schedule_scale = 1.0
+                if warmup_iters > 0:
+                    if current_iter < warmup_start:
+                        schedule_scale = warmup_init
+                    elif current_iter < warmup_start + warmup_iters:
+                        progress = (current_iter - warmup_start) / float(max(warmup_iters, 1))
+                        schedule_scale = warmup_init + (progress ** warmup_power) * (1.0 - warmup_init)
 
-                        if storage is not None:
-                            storage.put_scalar("loss_rpsa_scale", float(schedule_scale), smoothing_hint=False)
-                            if isinstance(stats, dict):
-                                if "rpsa_bg_ratio" in stats:
-                                    storage.put_scalar("loss_rpsa_bg_ratio", float(stats["rpsa_bg_ratio"]), smoothing_hint=False)
-                                if "rpsa_valid_clusters" in stats:
-                                    storage.put_scalar("loss_rpsa_valid_clusters", float(stats["rpsa_valid_clusters"]), smoothing_hint=False)
-                                if "rpsa_tokens" in stats:
-                                    storage.put_scalar("loss_rpsa_tokens", float(stats["rpsa_tokens"]), smoothing_hint=False)
-                    # else:
-                    #     logger_rpsa.warning("[RPSA] ⚠️ rpsa_loss is None - RPSA may not be computing loss")
-                # else:
-                #     logger_rpsa.warning(f"[RPSA] ⚠️ dec_encoder has no rpsa_loss attribute")
-            except Exception as e:
-                logger_rpsa.warning(f"[RPSA] ❌ Loss aggregation skipped: {e}")
-                import traceback
-                logger_rpsa.debug(f"[RPSA] Traceback: {traceback.format_exc()}")
+                loss_dict["loss_rpsa"] = loss_dict["loss_rpsa"] * schedule_scale
+
+                if storage is not None:
+                    storage.put_scalar("loss_rpsa_scale", float(schedule_scale), smoothing_hint=False)
+                    if isinstance(stats, dict):
+                        if "rpsa_bg_ratio" in stats:
+                            storage.put_scalar("loss_rpsa_bg_ratio", float(stats["rpsa_bg_ratio"]), smoothing_hint=False)
+                        if "rpsa_valid_clusters" in stats:
+                            storage.put_scalar("loss_rpsa_valid_clusters", float(stats["rpsa_valid_clusters"]), smoothing_hint=False)
+                        if "rpsa_tokens" in stats:
+                            storage.put_scalar("loss_rpsa_tokens", float(stats["rpsa_tokens"]), smoothing_hint=False)
+                        if "rpsa_center_orth_mse" in stats:
+                            storage.put_scalar("rpsa_center_orth_mse", float(stats["rpsa_center_orth_mse"]), smoothing_hint=False)
+                        if "rpsa_pi_entropy" in stats:
+                            storage.put_scalar("rpsa_pi_entropy", float(stats["rpsa_pi_entropy"]), smoothing_hint=False)
 
             # === 3️⃣ FedLoss、主损失加权保持一致 ===
             weight_dict = self.criterion.weight_dict

@@ -1,5 +1,9 @@
 from .text_prototype_aggregator import TextPrototypeAggregator, TextPrototypeBank
-from .rpsa import RPSAModule, build_token_class_mask_from_logits
+from .rpsa import (
+    RPSAModule,
+    build_token_class_mask_from_logits,
+    select_high_confidence_tokens,
+)
 
 
 __all__ = [
@@ -7,4 +11,5 @@ __all__ = [
     "TextPrototypeBank",
     "RPSAModule",
     "build_token_class_mask_from_logits",
+    "select_high_confidence_tokens",
 ]

@@ -1,0 +1,94 @@
+import torch
+import torch.nn.functional as F
+
+from lami_dino.prototype_ops import (
+    calibrated_logmeanexp_similarity,
+    soft_category_prototype_fusion,
+)
+
+
+def test_logmeanexp_is_invariant_to_duplicate_prototypes():
+    torch.manual_seed(0)
+    features = F.normalize(torch.randn(2, 7, 16), dim=-1)
+    single = F.normalize(torch.randn(5, 1, 16), dim=-1)
+    duplicated = single.expand(-1, 5, -1).contiguous()
+
+    logits_k1 = calibrated_logmeanexp_similarity(
+        features, single, temperature=0.07, logit_scale=50.0
+    )
+    logits_k5 = calibrated_logmeanexp_similarity(
+        features, duplicated, temperature=0.07, logit_scale=50.0
+    )
+
+    torch.testing.assert_close(logits_k1, logits_k5, atol=1e-5, rtol=1e-5)
+
+
+def test_logmeanexp_k1_reduces_to_scaled_cosine():
+    torch.manual_seed(1)
+    features = F.normalize(torch.randn(2, 3, 8), dim=-1)
+    prototypes = F.normalize(torch.randn(4, 1, 8), dim=-1)
+
+    actual = calibrated_logmeanexp_similarity(
+        features, prototypes, temperature=0.2, logit_scale=17.0
+    )
+    expected = 17.0 * torch.einsum("bqd,cd->bqc", features, prototypes[:, 0])
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_soft_fusion_keeps_top_r_categories_and_normalized_weights():
+    torch.manual_seed(2)
+    b, q, c, k, d = 2, 4, 6, 3, 8
+    regions = torch.randn(b, q, d)
+    logits = torch.randn(b, q, c)
+    prototypes = torch.randn(c, k, d)
+
+    fused, category_ids, gamma, alpha = soft_category_prototype_fusion(
+        regions,
+        logits,
+        prototypes,
+        category_topk=3,
+        category_temperature=1.0,
+        prototype_temperature=0.15,
+    )
+
+    assert fused.shape == (b, q, d)
+    assert category_ids.shape == (b, q, 3)
+    assert gamma.shape == (b, q, 3)
+    assert alpha.shape == (b, q, 3, k)
+    torch.testing.assert_close(gamma.sum(-1), torch.ones(b, q))
+    torch.testing.assert_close(alpha.sum(-1), torch.ones(b, q, 3))
+    torch.testing.assert_close(category_ids, logits.topk(3, dim=-1).indices)
+
+
+def test_soft_fusion_top1_identical_prototypes_reduces_to_that_direction():
+    torch.manual_seed(3)
+    b, q, c, k, d = 1, 5, 4, 5, 8
+    regions = torch.randn(b, q, d)
+    logits = torch.randn(b, q, c)
+    directions = F.normalize(torch.randn(c, d), dim=-1)
+    prototypes = directions[:, None, :].expand(c, k, d).contiguous()
+
+    fused, category_ids, _, _ = soft_category_prototype_fusion(
+        regions,
+        logits,
+        prototypes,
+        category_topk=1,
+        category_temperature=1.0,
+        prototype_temperature=0.15,
+    )
+
+    expected = directions[category_ids.squeeze(-1)]
+    torch.testing.assert_close(fused, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_prototype_ops_propagate_finite_gradients():
+    torch.manual_seed(4)
+    features = F.normalize(torch.randn(2, 3, 8), dim=-1).requires_grad_()
+    prototypes = F.normalize(torch.randn(5, 4, 8), dim=-1).requires_grad_()
+    logits = calibrated_logmeanexp_similarity(
+        features, prototypes, temperature=0.07, logit_scale=50.0
+    )
+    logits.square().mean().backward()
+
+    assert features.grad is not None and torch.isfinite(features.grad).all()
+    assert prototypes.grad is not None and torch.isfinite(prototypes.grad).all()

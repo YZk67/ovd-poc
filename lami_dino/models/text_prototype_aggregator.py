@@ -37,13 +37,13 @@ class TextPrototypeAggregator(nn.Module):
         num_prototypes: int = 5,       # ↑ from 4 → 5
         hidden_dim: int = 256,
         dropout: float = 0.05,         # ↓ from 0.1 → 0.05
-        tau: float = 0.07,             # ↓ from 0.1 → 0.07 (sharper attention)
+        tau: float = 0.004375,         # Eq. (1) tau_p; gives 0.07 scale at d_h=256
         *,
-        lambda_orth: float = 0.10,     # ↑ from 0.08 → 0.10
-        # 0 by design, not by omission -- see _diversity_term for the measurements.
-        # The usage-entropy term pushes prototypes together in one direction and
-        # earns nothing in the other; orthogonality already targets what we want.
-        lambda_div: float = 0.0,       # was 0.03
+        # Legacy parameter names are kept for checkpoint/config compatibility:
+        # lambda_orth is Eq. (5)'s directional-diversity weight, while
+        # lambda_div is Eq. (5)'s prototype-usage balance weight.
+        lambda_orth: float = 0.10,
+        lambda_div: float = 0.03,
         warmup_steps: int = DEFAULT_WARMUP_STEPS,  # set from train.max_iter * WARMUP_RATIO
         log_interval: int = 200,
     ) -> None:
@@ -53,6 +53,10 @@ class TextPrototypeAggregator(nn.Module):
 
         self.num_prototypes = num_prototypes
         self.tau = max(float(tau), 1e-6)
+        # Paper Eq. (1): attention logits are divided by sqrt(d_h) * tau_p.
+        # Keep the combined denominator explicit so prompt attention, APR usage,
+        # and diagnostics all use exactly the same assignment distribution.
+        self.attention_scale = math.sqrt(hidden_dim) * self.tau
         self.lambda_orth_base = float(lambda_orth)
         self.lambda_div_base = float(lambda_div)
         self.warmup_steps = int(warmup_steps)
@@ -113,15 +117,7 @@ class TextPrototypeAggregator(nn.Module):
         values = self.value_proj(text_feats)
 
         logits = torch.einsum("kh,cnh->ckn", self.prototype_queries, keys)
-        # NOTE: this used to also divide by sqrt(key_proj.out_features). Combined
-        # with `/ self.tau` below that meant dividing by sqrt(256) * 0.07 = 1.12,
-        # i.e. no temperature scaling at all -- the "sharper attention" tau=0.07
-        # was cancelled out by the sqrt(d) term. Attention over the N phrases came
-        # out near-uniform, so all K prototypes collapsed onto the same mean-of-
-        # values vector (1 - pairwise cos ~ 2e-5 at init) and the task loss, which
-        # gives every prototype an identical gradient there, kept them there.
-        # tau is now the only temperature knob, as the constructor claims.
-        attn = F.softmax(logits / self.tau, dim=-1)
+        attn = F.softmax(logits / self.attention_scale, dim=-1)
 
         prototypes_clean = torch.einsum("ckn,cnd->ckd", attn, values)
         prototypes = self.dropout(prototypes_clean)
@@ -148,10 +144,10 @@ class TextPrototypeAggregator(nn.Module):
     # === APR loss ===
     def compute_apr_loss(self, prototypes: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
         loss_orth = self._orthogonality_term(prototypes)
-        loss_div = self._diversity_term(logits)
-        lam_orth, lam_div = self._effective_lambdas()
-        apr_loss = lam_orth * loss_orth + lam_div * loss_div
-        self._store_loss_terms(loss_orth, loss_div, apr_loss, lam_orth, lam_div)
+        loss_balance = self._balance_term(logits)
+        lam_orth, lam_balance = self._effective_lambdas()
+        apr_loss = lam_orth * loss_orth + lam_balance * loss_balance
+        self._store_loss_terms(loss_orth, loss_balance, apr_loss, lam_orth, lam_balance)
         return apr_loss
 
     # === orthogonality term ===
@@ -172,58 +168,50 @@ class TextPrototypeAggregator(nn.Module):
         off_mask = (1.0 - torch.eye(K, device=G.device))
         return ((G - I) ** 2 * off_mask).sum(dim=(-2, -1)).mean() / (K * K - K)
 
-    # === diversity term ===
-    def _diversity_term(self, logits: torch.Tensor) -> torch.Tensor:
-        """Normalized entropy of how evenly the N phrases spread over the K prototypes.
+    # === prototype usage balance term ===
+    def _balance_term(self, logits: torch.Tensor) -> torch.Tensor:
+        """Eq. (5)'s KL divergence from prototype usage to a uniform prior.
 
-        DO NOT "fix" this into `1.0 - entropy.mean()`. It looks like a missing
-        inversion -- a regularizer usually wants balanced expert usage -- but for
-        this architecture balanced usage and distinct prototypes are opposites:
-
-            logits[c,k,n] independent of k
-              => votes are uniform over k        => entropy is at its maximum
-              => softmax over n is equal for all k => the K prototypes are identical
-
-        So driving this entropy up drives the prototypes together. Measured on the
-        real LVIS bank with the orthogonality term disabled, 600 steps of this term
-        alone: maximizing entropy moved pairwise cosine 0.9489 -> 0.9943 (collapse),
-        minimizing it moved 0.9489 -> 0.9019. The branch that "corrected" the sign
-        was the one making collapse worse.
-
-        Neither direction earns its place: with orthogonality enabled, effective
-        rank came out 4.791 using orthogonality alone, 4.782 with the inverted sign
-        and 4.738 with this one. lambda_div therefore defaults to 0 and this stays
-        as a diagnostic. Prototype dissimilarity is what we actually want, and
-        _orthogonality_term already measures exactly that.
+        ``logits[c,k,n]`` score how strongly slot k claims prompt n.  We first
+        normalize over slots for each prompt, average those assignments over the
+        prompt bank, and minimize KL(pi || Uniform).  Directional diversity is a
+        separate term: balanced usage alone is blind to identical slots, which is
+        why collapse monitoring must continue to use prototype cosine/effective
+        rank rather than usage entropy.
         """
         C, K, N = logits.shape
-        # Normalising by log(K) divides by zero at K=1 (where the entropy is
-        # identically 0 anyway, since there is only one prototype to spread over).
         if K < 2:
             return logits.sum() * 0.0
-        w = torch.softmax(logits, dim=1)
-        votes = w.sum(dim=-1)
-        p = votes / (votes.sum(dim=1, keepdim=True) + 1e-8)
-        entropy = -(p * (p.clamp_min(1e-8)).log()).sum(dim=1) / math.log(K)
-        return entropy.mean()
+        assignments = torch.softmax(logits / self.attention_scale, dim=1)
+        usage = assignments.mean(dim=-1)
+        usage = usage / usage.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        return (usage * (usage.clamp_min(1e-8).log() + math.log(K))).sum(dim=1).mean()
+
+    # Backward-compatible private name used by older diagnostics/tests.
+    def _diversity_term(self, logits: torch.Tensor) -> torch.Tensor:
+        return self._balance_term(logits)
 
     # === bookkeeping ===
-    def _store_loss_terms(self, loss_orth, loss_div, apr_loss, lam_orth, lam_div):
+    def _store_loss_terms(self, loss_orth, loss_balance, apr_loss, lam_orth, lam_balance):
         self.last_loss_terms = {
             "loss_orth": float(loss_orth.item()),
-            "loss_div": float(loss_div.item()),
+            # Keep legacy keys for existing metrics readers and add paper names.
+            "loss_div": float(loss_balance.item()),
+            "loss_prototype_diversity": float(loss_orth.item()),
+            "loss_balance": float(loss_balance.item()),
             "loss_apr": float(apr_loss.item()),
             "lambda_orth": float(lam_orth),
-            "lambda_div": float(lam_div),
+            "lambda_div": float(lam_balance),
+            "lambda_balance": float(lam_balance),
         }
 
     def _update_metrics_no_grad(self, prototypes, logits):
         with torch.no_grad():
             loss_orth = self._orthogonality_term(prototypes)
-            loss_div = self._diversity_term(logits)
-            lam_orth, lam_div = self._effective_lambdas()
-            apr_loss = lam_orth * loss_orth + lam_div * loss_div
-        self._store_loss_terms(loss_orth, loss_div, apr_loss, lam_orth, lam_div)
+            loss_balance = self._balance_term(logits)
+            lam_orth, lam_balance = self._effective_lambdas()
+            apr_loss = lam_orth * loss_orth + lam_balance * loss_balance
+        self._store_loss_terms(loss_orth, loss_balance, apr_loss, lam_orth, lam_balance)
         return apr_loss.detach()
 
     # === logging ===
@@ -239,7 +227,12 @@ class TextPrototypeAggregator(nn.Module):
             return
         if not _is_main_process():
             return
-        monitor = monitor_prototype_metrics(self._last_prototypes, self._last_logits, step=step)
+        monitor = monitor_prototype_metrics(
+            self._last_prototypes,
+            self._last_logits,
+            step=step,
+            attention_tau=self.attention_scale,
+        )
         if monitor:
             self.last_monitor_terms.update(monitor)
         msg = (
@@ -251,8 +244,8 @@ class TextPrototypeAggregator(nn.Module):
             f"diag_mse={monitor.get('diag_mse', 0):.4f} "
             f"usage_entropy={monitor.get('usage_entropy', 0):.4f} "
             f"apr={float(apr_value):.5f} "
-            f"(λ_orth={self.last_loss_terms.get('lambda_orth', 0):.3f}, "
-            f"λ_div={self.last_loss_terms.get('lambda_div', 0):.3f})"
+            f"(λ_proto_div={self.last_loss_terms.get('lambda_orth', 0):.3f}, "
+            f"λ_bal={self.last_loss_terms.get('lambda_balance', 0):.3f})"
         )
         self._logger.info(msg)
 
@@ -261,7 +254,7 @@ class TextPrototypeAggregator(nn.Module):
         if not self.last_monitor_terms and self._last_prototypes is not None:
             with torch.no_grad():
                 off_mse, diag_mse = compute_prototype_orthogonality(self._last_prototypes)
-                usage = compute_usage_entropy(self._last_logits)
+                usage = compute_usage_entropy(self._last_logits, tau=self.attention_scale)
                 cos, rank = compute_prototype_similarity(self._last_prototypes)
             self.last_monitor_terms = {
                 "orth_off_mse": off_mse,
@@ -321,25 +314,33 @@ def compute_prototype_orthogonality(prototypes):
 
 
 @torch.no_grad()
-def compute_usage_entropy(logits):
+def compute_usage_entropy(logits, tau=1.0):
     if logits is None:
         return float("nan")
     C, K, N = logits.shape
-    w = torch.softmax(logits, dim=1)
+    if K < 2:
+        return 0.0
+    w = torch.softmax(logits / tau, dim=1)
     votes = w.sum(dim=-1)
     p = votes / (votes.sum(dim=1, keepdim=True) + 1e-8)
     entropy = -(p * (p.clamp_min(1e-8)).log()).sum(dim=1) / math.log(K)
     return float(entropy.mean().item())
 
 
-def monitor_prototype_metrics(prototypes, logits, step=0, prefix="[TPA]"):
+def monitor_prototype_metrics(
+    prototypes,
+    logits,
+    step=0,
+    prefix="[TPA]",
+    attention_tau=1.0,
+):
     """Single source of truth for the diagnostics, so every caller sees the same set.
 
     get_monitor_dict only recomputes when its cache is empty, so any metric missing
     here silently never reaches metrics.json once _maybe_log has populated it.
     """
     off_mse, diag_mse = compute_prototype_orthogonality(prototypes)
-    usage_entropy = compute_usage_entropy(logits)
+    usage_entropy = compute_usage_entropy(logits, tau=attention_tau)
     proto_cos, proto_rank = compute_prototype_similarity(prototypes)
     if step % 200 == 0 and _is_main_process():
         print(f"{prefix} step={step:06d} | proto_cos={proto_cos:.4f} | eff_rank={proto_rank:.3f} "

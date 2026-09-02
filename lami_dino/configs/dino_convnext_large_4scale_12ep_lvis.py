@@ -1,6 +1,5 @@
 from detrex.config import get_config
 from .models.dino_convnextl import model
-from datetime import datetime
 
 # Remove 'language' key from model config as it's not a parameter for DINO.__init__()
 # The language config is only used for TextClassifier via ${..language.xxx} references
@@ -27,38 +26,37 @@ train = get_config("common/train.py").train
 # Set random seed for reproducibility
 train.seed = 42  # Fixed seed for fair comparison
 
-# modify training config
-# train.init_checkpoint = "clip_convnext_large_trans.pth"
-train.init_checkpoint = "./pretrained_models/lami_convnext_large_12ep_lvis/model_final.pth"
+# Paper-aligned initialization: restore only the CLIP ConvNeXt-L visual trunk.
+# The DINO detector, transformer, classification head, TPA, APR, and RPSA all
+# start fresh; tools/train_net.py enforces this scope even if a checkpoint file
+# unexpectedly contains additional detector tensors.
+train.init_checkpoint = "./pretrained_models/clip_convnext_large_trans.pth"
+train.init_checkpoint_scope = "backbone_only"
+# Match the LaMI ConvNeXt protocol precisely: the visual trunk stages are
+# frozen, while p1/p2/p3 output normalization layers remain trainable at the
+# declared 0.1x backbone learning rate. train_net.py validates this at startup.
+train.backbone_trainable_scope = "output_norm_only"
 
-# Add timestamp to output directory
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-# resume training from the last checkpoint
-train.output_dir = f"/root/lami_convnext_large_12ep_lvis_{timestamp}"
+# Keep the directory stable so ``--resume`` finds its ``last_checkpoint`` file.
+# Use a CLI override for each ablation, e.g. train.output_dir=output/..._k1.
+train.output_dir = "./output/instructdet_clip_convnext_large_12ep_lvis"
 
-# max training iterations
-# - Original COCO dataset: 113600 images
-# Calculation logic:
-# - LVIS dataset: 100,170 images
-# - Formula: total_iterations = (dataset_size / total_batch_size) * num_epochs
-# - Batch size 4: 100,170 ÷ 4 = 25,042.5 iter/epoch → 300,510 total (12 epochs) Single GPU A100
-# - Batch size 16: 100,170 ÷ 16 = 6,260 iter/epoch → 75,120 total (12 epochs)
-# - Batch size 32: 100,170 ÷ 32 = 3,130 iter/epoch → 37,560 total (12 epochs)
-# - Batch size 64: 100,170 ÷ 64 = 1,565 iter/epoch → 18,780 total (12 epochs)
-# - Standardized values: 7,100 (bs16), 3,550 (bs32), 1,775 (bs64)
-# - LR scheduler: use lr_multiplier_12ep_warmup for batch size 32
-train.max_iter = 92300 #85200 #85200  # Single GPU A100 4 epochs 12 epochs with batch size 32: 100170/32*12 -- 85200
+# The LVIS RepeatFactorTrainingSampler yields about 7,100 iterations per epoch
+# at total batch size 16. Keep max_iter identical to the 12-epoch scheduler's
+# endpoint; the previous 92,300 value silently added roughly one extra epoch.
+iterations_per_epoch = 7100
+train.max_iter = 12 * iterations_per_epoch
 
 # run evaluation every ~4 epochs (28400 ≈ 4 × 7100)
 # was 99999999 (never) — without intermediate eval there is no signal that the
 # auxiliary heads are actually helping until training finishes.
-train.eval_period = 28400
+train.eval_period = 4 * iterations_per_epoch
 
 # log training infomation every 20 iters
 train.log_period = 50
 
 # save checkpoint every 3130 iters
-train.checkpointer.period = 7100  # 1 epoch worth of iterations
+train.checkpointer.period = iterations_per_epoch
 
 # gradient clipping for training
 # was 0.1 — too tight once APR + RPSA are added on top of the DETR losses.
@@ -96,6 +94,7 @@ optimizer.weight_decay = 1e-4
 # e.g. "transformer.decoder.class_embed.6.tpa.prototype_queries".
 # Not CLI-overridable (it is a callable, not a config scalar) -- edit this to sweep.
 tpa_lr_multiplier = 10.0
+train.tpa_lr_multiplier = tpa_lr_multiplier  # persist in the resolved config
 
 
 def _lr_factor(param_name: str) -> float:
@@ -141,10 +140,14 @@ model.classifier.tpa_hidden_dim = 256
 # was 0.05 — bumped to 0.1 (the value PRIORITY_DECISION.md recommends) for stronger
 # prototype regularization and to discourage attention collapse onto a single prompt.
 model.classifier.tpa_dropout = 0.1
-model.classifier.tpa_tau = 0.07  # Optimal temperature for attention aggregation (τ ≈ 0.05–0.1 recommended) 0.1 is original
+# Paper Eq. (1): sqrt(256) * tau_p = 16 * 0.004375 = 0.07. This is
+# numerically identical to the validated no-sqrt/0.07 setup while restoring the
+# equation's explicit scaled-dot-product form.
+model.classifier.tpa_tau = 0.004375
+model.classifier.tpa_cls_tau = 0.07  # Eq. (2) temperature-controlled log-mean-exp
 model.classifier.tpa_log_interval = 200
-# Derive the APR warmup from this run's schedule rather than the aggregator's
-# built-in default, which is sized for max_iter=85200 and would be 4.6% here.
+# Derive APR warm-up explicitly from the run schedule so short ablations can
+# preserve the same 5% ratio when max_iter is overridden.
 model.classifier.tpa_warmup_steps = int(train.max_iter * 0.05)
 
 # Query initialization: Soft-attention aggregation parameters for multi-prototype query initialization
@@ -152,6 +155,8 @@ model.use_soft_attention = True  # Enable soft-attention aggregation in query in
 # was 0.08 — too sharp, caused soft-attention to behave like top-1 and waste the
 # extra prototypes. 0.15 keeps attention soft enough to actually mix prototypes.
 model.soft_attention_tau = 0.15
+model.soft_category_topk = 3  # Eq. (3): retain top-R category hypotheses
+model.soft_category_tau = 1.0
 
 
 # ========================= RPSA V1 =========================
@@ -216,7 +221,9 @@ model.transformer.rpsa_module.tau_align = 0.06
 model.transformer.rpsa_module.sigma = 1.0
 model.transformer.rpsa_module.bg_thresh = 0.05
 model.transformer.rpsa_module.bg_percentile = 0.60
-model.transformer.rpsa_module.subsample_tokens = 2048
+# Transformer-level top-M selection below already removes padding and retains
+# the highest-confidence valid tokens; do not subsample a second time.
+model.transformer.rpsa_module.subsample_tokens = 0
 model.transformer.rpsa_module.subsample_method = "confidence"
 # was False — letting π gradients flow back through the encoder pseudo-mask is
 # unstable when enc_outputs_class is still noisy. Detach for the first stable run;
@@ -225,7 +232,10 @@ model.transformer.rpsa_module.detach_pi = True
 model.transformer.rpsa_module.stop_grad_vision = False
 model.transformer.rpsa_module.stop_grad_text = False
 model.transformer.rpsa_token_topk = 1024
-model.transformer.rpsa_confidence_threshold = 0.3
+# Top-M itself provides high-confidence selection. A hard 0.3 softmax threshold
+# is too strict early in a 100-way federated classifier; thresholded mode is
+# supported but now fails fast instead of duplicating one fallback token.
+model.transformer.rpsa_confidence_threshold = 0.0
 # --- warm-up by iteration ---
 model.transformer.rpsa_warmup_start = 20000
 model.transformer.rpsa_warmup_iters = 8000

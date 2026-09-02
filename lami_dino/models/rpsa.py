@@ -15,15 +15,15 @@
 #
 
 from __future__ import annotations
+import logging
 import math
 from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from detectron2.utils.logger import setup_logger
 
-logger = setup_logger()
+logger = logging.getLogger("lami_dino.rpsa")
 
 
 # -------------------------------
@@ -142,6 +142,68 @@ def compute_pi_weights(assign_r: torch.Tensor,
     return pi.clamp_min(0.0)
 
 
+def select_high_confidence_tokens(
+    region_feats: torch.Tensor,
+    token_cls_mask: torch.Tensor,
+    *,
+    valid_mask: Optional[torch.Tensor] = None,
+    topk: int = 0,
+    confidence_threshold: float = 0.0,
+    min_tokens: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Select real encoder tokens without padding or duplicated fallbacks.
+
+    A previous implementation replaced every below-threshold position with the
+    same highest-confidence token in order to keep a fixed tensor shape. That
+    could duplicate one token hundreds of times and collapse soft k-means. Here
+    the common selection size is the minimum eligible count in the batch, so
+    every returned index is a distinct, valid token.
+    """
+
+    if region_feats.ndim != 3 or token_cls_mask.ndim != 3:
+        raise ValueError("region_feats and token_cls_mask must both be rank-3")
+    if region_feats.shape[:2] != token_cls_mask.shape[:2]:
+        raise ValueError("region_feats and token_cls_mask must share [B, N]")
+    if confidence_threshold < 0:
+        raise ValueError("confidence_threshold must be non-negative")
+    if min_tokens < 1:
+        raise ValueError("min_tokens must be at least one")
+
+    batch_size, num_tokens, feat_dim = region_feats.shape
+    if valid_mask is None:
+        valid_mask = torch.ones(
+            batch_size, num_tokens, dtype=torch.bool, device=region_feats.device
+        )
+    if valid_mask.shape != (batch_size, num_tokens):
+        raise ValueError(
+            f"valid_mask must have shape {(batch_size, num_tokens)}, got {valid_mask.shape}"
+        )
+    valid_mask = valid_mask.to(device=region_feats.device, dtype=torch.bool)
+
+    confidence = token_cls_mask.max(dim=-1).values
+    eligible = valid_mask & torch.isfinite(confidence)
+    if confidence_threshold > 0:
+        eligible = eligible & (confidence >= confidence_threshold)
+
+    eligible_counts = eligible.sum(dim=1)
+    common_count = int(eligible_counts.min().item())
+    requested = common_count if topk <= 0 else min(int(topk), common_count)
+    if requested < min_tokens:
+        raise ValueError(
+            "not enough distinct valid high-confidence tokens for RPSA: "
+            f"minimum eligible count={common_count}, required={min_tokens}, "
+            f"threshold={confidence_threshold}"
+        )
+
+    selection_scores = confidence.masked_fill(~eligible, float("-inf"))
+    indices = selection_scores.topk(requested, dim=1).indices
+    feat_indices = indices.unsqueeze(-1).expand(-1, -1, feat_dim)
+    mask_indices = indices.unsqueeze(-1).expand(-1, -1, token_cls_mask.size(-1))
+    selected_feats = torch.gather(region_feats, 1, feat_indices)
+    selected_cls_mask = torch.gather(token_cls_mask, 1, mask_indices)
+    return selected_feats, selected_cls_mask, indices
+
+
 # -------------------------------
 # Weighted InfoNCE
 # -------------------------------
@@ -177,19 +239,27 @@ def weighted_infoNCE(mu: torch.Tensor,
     pi_clamped = pi.clamp_min(0.0)
     # background mask uses the pre-normalized magnitude so tiny clusters remain filtered out
     pi_max_raw = pi_clamped.max(dim=-1).values
+    threshold = None
     if adaptive_bg is not None:
         # adaptive_bg: [B,1] or [B,K], compute mask per sample
-        thresh = adaptive_bg
-        if thresh.dim() == 2 and thresh.size(1) == 1:
-            thresh = thresh.expand_as(pi_max_raw)
-        elif thresh.dim() == 1:
-            thresh = thresh.view(-1, 1).expand_as(pi_max_raw)
-        bg_mask = pi_max_raw < thresh
-    elif bg_thresh is not None:
-        bg_mask = (pi_max_raw < bg_thresh)
-    else:
+        threshold = adaptive_bg
+        if threshold.dim() == 2 and threshold.size(1) == 1:
+            threshold = threshold.expand_as(pi_max_raw)
+        elif threshold.dim() == 1:
+            threshold = threshold.view(-1, 1).expand_as(pi_max_raw)
+        threshold = threshold.to(device=pi_max_raw.device, dtype=pi_max_raw.dtype)
+    if bg_thresh is not None:
+        fixed_threshold = pi_max_raw.new_tensor(float(bg_thresh))
+        threshold = (
+            fixed_threshold
+            if threshold is None
+            else torch.maximum(threshold, fixed_threshold)
+        )
+    if threshold is None:
         # Both bg_thresh and adaptive_bg are None: treat all clusters as valid (no background filtering)
         bg_mask = torch.zeros(B, K, dtype=torch.bool, device=pi_max_raw.device)
+    else:
+        bg_mask = pi_max_raw < threshold
     pi_tilde = (pi_clamped ** alpha_pi)
     pi_tilde = pi_tilde / (pi_tilde.sum(dim=-1, keepdim=True).clamp_min(1e-6))  # [B,K,C]
 
@@ -373,6 +443,10 @@ class RPSAModule(nn.Module):
                 bg_thresh=self.bg_thresh,
                 adaptive_bg=adaptive_thresh,
             )
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"non-finite RPSA loss: {loss.detach().item()}")
+            if float(stats["rpsa_valid_clusters"]) <= 0.0:
+                raise ValueError("RPSA background filtering removed every visual center")
         except RuntimeError as e:
             logger.error(f"[RPSA] Error in weighted_infoNCE: {e}, centers_mu.shape={centers_mu.shape}, t.shape={t.shape}, pi.shape={pi.shape}")
             raise

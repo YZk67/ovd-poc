@@ -48,6 +48,11 @@ from torch import nn
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 
+from lami_dino.checkpoint_init import (
+    load_backbone_only,
+    validate_backbone_trainable_scope,
+)
+
 logger = logging.getLogger("detrex")
 
 
@@ -182,6 +187,16 @@ class Trainer(SimpleTrainer):
             if math.isfinite(value):
                 storage.put_scalar(f"tpa/{key}", value, smoothing_hint=False)
 
+        # Query-fusion routing is part of the paper's language interface, not a
+        # hidden implementation detail.  Persist enough information to tell
+        # whether top-R fusion remains genuinely soft or degenerates to hard
+        # top-1 routing during a run.
+        fusion_stats = getattr(model.transformer, "last_query_fusion_stats", {})
+        for key, value in fusion_stats.items():
+            value = float(value)
+            if math.isfinite(value):
+                storage.put_scalar(f"query_fusion/{key}", value, smoothing_hint=False)
+
     def clip_grads(self, params):
         params = list(filter(lambda p: p.requires_grad and p.grad is not None, params))
         if len(params) > 0:
@@ -293,6 +308,7 @@ def do_train(args, cfg):
             train: other misc config defined in `configs/common/train.py`, including:
                 output_dir (str)
                 init_checkpoint (str)
+                init_checkpoint_scope (str): ``full`` or ``backbone_only``
                 amp.enabled (bool)
                 max_iter (int)
                 eval_period, log_period (int)
@@ -303,6 +319,16 @@ def do_train(args, cfg):
     model = instantiate(cfg.model)
     logger = logging.getLogger("detectron2")
     logger.info("Model:\n{}".format(model))
+    backbone_scope = getattr(cfg.train, "backbone_trainable_scope", "full")
+    trainable_backbone = validate_backbone_trainable_scope(
+        model.backbone, backbone_scope
+    )
+    logger.info(
+        "Validated backbone trainable scope %s (%d trainable tensors): %s",
+        backbone_scope,
+        len(trainable_backbone),
+        ", ".join(trainable_backbone) if trainable_backbone else "none",
+    )
     model.to(cfg.train.device)
 
     # ==== Added by ChatGPT ====
@@ -353,13 +379,41 @@ def do_train(args, cfg):
         ]
     )
 
-    # Robust checkpoint resuming with automatic detection
+    # Robust checkpoint resuming with automatic detection. A real resume always
+    # restores the full training state. For a fresh paper run, however, the
+    # configured CLIP checkpoint is restricted to the visual backbone so no
+    # LaMI/DINO detector weights can leak into the initialization.
     logger = logging.getLogger("detectron2")
-    
-    # Try to resume from checkpoint if available
-    checkpointer.resume_or_load(cfg.train.init_checkpoint, resume=args.resume)
-    
-    if args.resume and checkpointer.has_checkpoint():
+    resume_from_output = bool(args.resume and checkpointer.has_checkpoint())
+
+    if resume_from_output:
+        checkpointer.resume_or_load(cfg.train.init_checkpoint, resume=True)
+    else:
+        init_scope = getattr(cfg.train, "init_checkpoint_scope", "full")
+        if init_scope == "backbone_only":
+            unwrapped_model = model.module if hasattr(model, "module") else model
+            report = load_backbone_only(
+                unwrapped_model.backbone,
+                cfg.train.init_checkpoint,
+            )
+            logger.info(
+                "Loaded CLIP backbone only from %s: %d/%d tensors, %.2f%% "
+                "parameter coverage; ignored %d non-backbone/incompatible tensors",
+                report["checkpoint_path"],
+                report["loaded_tensor_count"],
+                report["target_tensor_count"],
+                100.0 * report["parameter_coverage"],
+                report["ignored_tensor_count"],
+            )
+        elif init_scope == "full":
+            checkpointer.resume_or_load(cfg.train.init_checkpoint, resume=False)
+        else:
+            raise ValueError(
+                "train.init_checkpoint_scope must be 'full' or 'backbone_only', "
+                f"got {init_scope!r}"
+            )
+
+    if resume_from_output:
         # The checkpoint stores the training iteration that just finished, thus we start
         # at the next iteration
         start_iter = trainer.iter + 1

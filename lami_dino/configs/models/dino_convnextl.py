@@ -133,7 +133,11 @@ model = L(DINO)(
         tpa_num_prototypes=5,
         tpa_hidden_dim=256,
         tpa_dropout=0.1,
-        tpa_tau=0.07,
+        # Eq. (1) divides by sqrt(d_h) * tau_p. With d_h=256 this keeps the
+        # effective attention denominator at 0.07: 16 * 0.004375 = 0.07.
+        tpa_tau=0.004375,
+        # Eq. (2) smooth-max temperature; distinct from prompt-slot tau above.
+        tpa_cls_tau=0.07,
         tpa_log_interval=200,
     ),
     query_path="dataset/metadata/coco_clip_convnextl_a+cname.npy",
@@ -155,6 +159,10 @@ model = L(DINO)(
     pixel_std=[58.395, 57.120, 57.375],
     device="cuda",
     clip_head_path='./pretrained_models/clip_convnext_large_head.pth',
+    # Eqs. (3)-(4): keep several plausible encoder categories before fusing
+    # their most compatible prototypes into the initial decoder query.
+    soft_category_topk=3,
+    soft_category_tau=1.0,
 )
 
 # set aux loss weight dict

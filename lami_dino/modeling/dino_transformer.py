@@ -30,7 +30,12 @@ from detrex.layers import (
     get_sine_pos_embed,
 )
 from detrex.utils import inverse_sigmoid
-from lami_dino.models.rpsa import RPSAModule, build_token_class_mask_from_logits
+from lami_dino.models.rpsa import (
+    RPSAModule,
+    build_token_class_mask_from_logits,
+    select_high_confidence_tokens,
+)
+from lami_dino.prototype_ops import soft_category_prototype_fusion
 from detectron2.utils.logger import setup_logger
 
 logger = setup_logger()  # 使用detectron2的logger，确保日志级别正确
@@ -260,6 +265,8 @@ class DINOTransformer(nn.Module):
         rpsa_warmup_iters: int = 0,
         rpsa_warmup_init_scale: float = 0.0,
         rpsa_warmup_power: float = 1.0,
+        soft_category_topk: int = 3,
+        soft_category_tau: float = 1.0,
     ):
         super(DINOTransformer, self).__init__()
         self.encoder = encoder
@@ -270,6 +277,13 @@ class DINOTransformer(nn.Module):
         self.embed_dim = self.encoder.embed_dim
         self.use_soft_attention = False
         self.soft_attention_tau = 0.07
+        if soft_category_topk < 1:
+            raise ValueError(f"soft_category_topk must be >= 1, got {soft_category_topk}")
+        if soft_category_tau <= 0:
+            raise ValueError(f"soft_category_tau must be positive, got {soft_category_tau}")
+        self.soft_category_topk = int(soft_category_topk)
+        self.soft_category_tau = float(soft_category_tau)
+        self.last_query_fusion_stats = {}
 
         self.level_embeds = nn.Parameter(torch.Tensor(self.num_feature_levels, self.embed_dim))
         # self.learnt_init_query = learnt_init_query
@@ -462,6 +476,14 @@ class DINOTransformer(nn.Module):
         enc_outputs_class = text_classifier(output_memory, content_inds=content_inds)
         apr_loss = getattr(text_classifier, "apr_loss", None)
 
+        # Never allow a failed/skipped iteration to reuse a previous loss tensor.
+        # Reusing it would either train without Eq. (6) or backward through a
+        # stale graph for a second time.
+        setattr(text_classifier, "rpsa_loss", None)
+        setattr(text_classifier, "rpsa_stats", None)
+        self.rpsa_last_loss = None
+        self.rpsa_last_stats = {}
+
         # === RPSA: compute alignment loss (non-breaking: stash on classifier/transformer) ===
         use_rpsa_flag = getattr(self, "use_rpsa", False)
         # logger.info(f"[RPSA] use_rpsa_flag: {use_rpsa_flag}")
@@ -472,30 +494,25 @@ class DINOTransformer(nn.Module):
                 # 1) token->class 软掩码（从 encoder 分类 logits 构造）
                 token_cls_mask_full = build_token_class_mask_from_logits(enc_outputs_class, topL=5).detach()  # [B,N,C]
 
-                # 2) 可选 token gating（Top-M / 阈值）以减少噪声
-                region_feats_for_rpsa = output_memory
-                token_cls_mask_for_rpsa = token_cls_mask_full
+                # 2) Select only real, valid encoder tokens. Padding and invalid
+                # proposals must never participate in visual clustering.
                 gate_topk = getattr(self, "rpsa_token_topk", 0)
                 gate_ratio = getattr(self, "rpsa_token_topk_ratio", 0.0)
                 gate_threshold = getattr(self, "rpsa_confidence_threshold", 0.0)
                 tokens_available = output_memory.shape[1]
                 if gate_ratio > 0.0:
                     gate_topk = max(gate_topk, int(tokens_available * gate_ratio))
-                if gate_topk > 0 and gate_topk < tokens_available:
-                    with torch.no_grad():
-                        cls_conf = torch.softmax(enc_outputs_class, dim=-1).max(dim=-1).values  # [B,N]
-                        topk_vals, topk_idx = cls_conf.topk(gate_topk, dim=1)
-                        if gate_threshold > 0.0:
-                            low_mask = topk_vals < gate_threshold
-                            if low_mask.any():
-                                fallback_idx = cls_conf.topk(1, dim=1).indices.expand(-1, gate_topk)
-                                topk_idx = torch.where(low_mask, fallback_idx, topk_idx)
-                    gather_feat_idx = topk_idx.unsqueeze(-1).expand(-1, -1, output_memory.size(-1))
-                    region_feats_for_rpsa = torch.gather(output_memory, 1, gather_feat_idx)
-                    gather_mask_idx = topk_idx.unsqueeze(-1).expand(-1, -1, token_cls_mask_full.size(-1))
-                    token_cls_mask_for_rpsa = torch.gather(token_cls_mask_full, 1, gather_mask_idx)
-                else:
-                    token_cls_mask_for_rpsa = token_cls_mask_full
+                valid_token_mask = (~mask_flatten) & torch.isfinite(output_proposals).all(dim=-1)
+                region_feats_for_rpsa, token_cls_mask_for_rpsa, _ = (
+                    select_high_confidence_tokens(
+                        output_memory,
+                        token_cls_mask_full,
+                        valid_mask=valid_token_mask,
+                        topk=gate_topk,
+                        confidence_threshold=gate_threshold,
+                        min_tokens=self.rpsa.K,
+                    )
+                )
 
                 # 3) 文本原型，保证形状为 [C,Kp,D]
                 #    这里沿用你当前变量 content_query_embeds（TPA/投影后的原型）
@@ -529,9 +546,10 @@ class DINOTransformer(nn.Module):
                 setattr(text_classifier, "rpsa_loss", loss_rpsa)
                 setattr(text_classifier, "rpsa_stats", rpsa_stats)
 
-            except (ValueError, RuntimeError) as e:
-                logger.warning(f"[RPSA] Skipped due to: {e}")
-                logger.warning(f"[RPSA] Shape details - output_memory: {output_memory.shape}, enc_outputs_class: {enc_outputs_class.shape}, content_query_embeds: {content_query_embeds.shape}")
+            except (ValueError, RuntimeError, FloatingPointError) as e:
+                logger.error(f"[RPSA] Failed: {e}")
+                logger.error(f"[RPSA] Shape details - output_memory: {output_memory.shape}, enc_outputs_class: {enc_outputs_class.shape}, content_query_embeds: {content_query_embeds.shape}")
+                raise RuntimeError("RPSA is enabled but its forward pass failed") from e
             except Exception as e:
                 logger.error(f"[RPSA] ❌ Unexpected error: {e}")
                 logger.error(f"[RPSA] Shape details - output_memory: {output_memory.shape}, enc_outputs_class: {enc_outputs_class.shape}, content_query_embeds: {content_query_embeds.shape}")
@@ -562,21 +580,32 @@ class DINOTransformer(nn.Module):
             output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, output_memory.shape[-1])
         )
 
-        # Check if we have multi-prototype embeddings and should use soft-attention
+        # Paper Eqs. (3)-(4): retain the top-R category hypotheses, then route
+        # within each category's prototypes.  The previous implementation took
+        # only max_labels and therefore hard-committed every proposal to one
+        # noisy encoder prediction before the decoder had a chance to refine it.
         if getattr(self, 'use_soft_attention', False) and content_query_embeds.ndim == 3:
-            # === Vectorized multi-prototype soft-attention aggregation ===
-            tau = getattr(self, 'soft_attention_tau', 0.07)
-            # Gather selected visual features and class ids
-            content_ids = torch.gather(max_labels, 1, topk_proposals)  # [B, topk]
-
-            # Prototypes per region: [B, topk, K, D]
-            proto_per_region = content_query_embeds[content_ids]
-            # Cosine similarities: [B, topk, K]
-            sim = torch.einsum('bqd,bqkd->bqk',
-                            F.normalize(target_unact, dim=-1),
-                            F.normalize(proto_per_region, dim=-1)) / tau
-            attn = F.softmax(sim, dim=-1)  # [B, topk, K]
-            content_query = torch.einsum('bqk,bqkd->bqd', attn, proto_per_region)  # [B, topk, D]
+            selected_class_logits = torch.gather(
+                enc_outputs_class,
+                1,
+                topk_proposals.unsqueeze(-1).expand(-1, -1, enc_outputs_class.size(-1)),
+            )
+            content_query, category_ids, category_weights, prototype_weights = (
+                soft_category_prototype_fusion(
+                    target_unact,
+                    selected_class_logits,
+                    content_query_embeds,
+                    category_topk=getattr(self, "soft_category_topk", 3),
+                    category_temperature=getattr(self, "soft_category_tau", 1.0),
+                    prototype_temperature=getattr(self, "soft_attention_tau", 0.07),
+                )
+            )
+            with torch.no_grad():
+                self.last_query_fusion_stats = {
+                    "category_topk": int(category_ids.size(-1)),
+                    "category_max_weight": float(category_weights.max(dim=-1).values.mean().item()),
+                    "prototype_max_weight": float(prototype_weights.max(dim=-1).values.mean().item()),
+                }
         elif content_query_embeds.ndim == 3:
             # === Mean aggregation fallback over K prototypes ===
             content_ids = torch.gather(max_labels, 1, topk_proposals)

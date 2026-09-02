@@ -61,6 +61,7 @@ model.cluster_fed_loss = False
 
 # ── train: eval-only ─────────────────────────────────────────────────────────
 train.init_checkpoint          = "/root/autodl-tmp/model_final.pth"
+train.init_checkpoint_scope    = "full"
 train.eval_period              = 999999999
 train.checkpointer.period      = 999999999
 train.output_dir               = "/root/autodl-tmp/transfer_lvis_to_obj365"

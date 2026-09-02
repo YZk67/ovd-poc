@@ -2,7 +2,10 @@ import torch
 import torch.nn.functional as F
 
 from lami_dino.models import TextPrototypeAggregator
-from lami_dino.models.text_prototype_aggregator import compute_prototype_similarity
+from lami_dino.models.text_prototype_aggregator import (
+    compute_prototype_similarity,
+    compute_usage_entropy,
+)
 
 
 def _pairwise_cos(prototypes):
@@ -28,12 +31,9 @@ def test_tpa_output_shape():
 def test_prototypes_are_distinct_at_init():
     """Guard against the degenerate init that made TPA equivalent to K=1.
 
-    The aggregator once divided the attention logits by both sqrt(hidden_dim)
-    and tau, which cancelled the temperature out. Attention over the phrases
-    came out near-uniform, every prototype landed on the same mean-of-values
-    vector (pairwise cosine > 0.9999), and because the task loss hands an
-    identical gradient to identical prototypes, training could never separate
-    them again. Diversity has to exist at init; nothing downstream creates it.
+    Eq. (1)'s sqrt(hidden_dim) factor requires tau_p to be calibrated jointly
+    with the hidden dimension. A denominator near 1 made attention almost
+    uniform and every prototype landed on the same mean-of-values vector.
     """
     torch.manual_seed(0)
     num_classes, num_phrases, dim, num_prototypes = 64, 12, 128, 5
@@ -45,7 +45,11 @@ def test_prototypes_are_distinct_at_init():
     text_feats = F.normalize(base + 0.58 * spread, p=2, dim=-1)
 
     tpa = TextPrototypeAggregator(
-        dim=dim, num_prototypes=num_prototypes, hidden_dim=256, dropout=0.0, tau=0.07
+        dim=dim,
+        num_prototypes=num_prototypes,
+        hidden_dim=256,
+        dropout=0.0,
+        tau=0.004375,
     )
     tpa.eval()
     with torch.no_grad():
@@ -57,12 +61,8 @@ def test_prototypes_are_distinct_at_init():
     )
 
 
-def test_tau_controls_attention_sharpness():
-    """tau must be the only temperature knob: lower tau => sharper attention.
-
-    If some other constant divides the logits, tau stops having a meaningful
-    effect, which is exactly how the collapse above went unnoticed.
-    """
+def test_eq1_scaled_temperature_controls_attention_sharpness():
+    """Eq. (1) uses sqrt(d_h) * tau_p and lower tau_p is sharper."""
     torch.manual_seed(0)
     text_feats = torch.randn(32, 12, 128)
 
@@ -73,10 +73,15 @@ def test_tau_controls_attention_sharpness():
         tpa.eval()
         with torch.no_grad():
             tpa(text_feats, with_loss=False)
-            attn = F.softmax(tpa._last_logits / tau, dim=-1)
+            attn = F.softmax(tpa._last_logits / tpa.attention_scale, dim=-1)
         return -(attn * attn.clamp_min(1e-9).log()).sum(-1).mean()
 
-    assert entropy_at(0.01) < entropy_at(1.0)
+    assert entropy_at(0.001) < entropy_at(0.1)
+
+
+def test_eq1_attention_scale_is_sqrt_hidden_dim_times_tau():
+    tpa = TextPrototypeAggregator(dim=16, hidden_dim=64, tau=0.0125)
+    assert tpa.attention_scale == 0.1
 
 
 def _make_tpa(**kwargs):
@@ -158,11 +163,10 @@ def test_warmup_steps_is_configurable():
     assert short._effective_lambdas()[0] > long._effective_lambdas()[0]
 
 
-def test_diversity_term_is_off_by_default():
-    """lambda_div defaults to 0: the usage-entropy term pushes prototypes together
-    in one direction and earns nothing in the other. See _diversity_term."""
+def test_both_paper_apr_terms_are_on_by_default():
+    """Eq. (5) includes directional diversity and usage balance."""
     tpa = _make_tpa(warmup_steps=0)
-    assert tpa.lambda_div_base == 0.0
+    assert tpa.lambda_div_base > 0.0
     assert tpa.lambda_orth_base > 0.0
 
 
@@ -174,13 +178,24 @@ def test_usage_entropy_is_blind_to_collapse():
     collapsed_logits = torch.zeros(C, K, N)  # k-independent => identical prototypes
     tpa = _make_tpa(num_prototypes=K, warmup_steps=0)
 
-    assert tpa._diversity_term(collapsed_logits) > 0.99, (
-        "usage entropy is expected to look perfect under collapse"
-    )
+    assert compute_usage_entropy(collapsed_logits, tau=tpa.attention_scale) > 0.99
+    assert tpa._balance_term(collapsed_logits).abs() < 1e-6
 
     collapsed = torch.randn(C, 1, 16).expand(C, K, 16).contiguous()
     cos, rank = compute_prototype_similarity(collapsed)
     assert cos > 0.999 and rank < 1.01, "similarity metrics must flag the collapse"
+
+
+def test_balance_term_is_kl_to_uniform_usage():
+    C, K, N = 4, 3, 6
+    tpa = _make_tpa(num_prototypes=K, warmup_steps=0)
+
+    uniform_logits = torch.zeros(C, K, N)
+    monopolized_logits = torch.full((C, K, N), -10.0)
+    monopolized_logits[:, 0] = 10.0
+
+    assert tpa._balance_term(uniform_logits).abs() < 1e-6
+    assert tpa._balance_term(monopolized_logits) > 0.9 * torch.log(torch.tensor(float(K)))
 
 
 def test_prototype_similarity_separates_collapsed_from_distinct():
