@@ -68,6 +68,9 @@ train.clip_grad.params.norm_type = 2
 # Give TPA and the remaining detector separate 0.5-norm clipping budgets so
 # this corrective signal cannot suppress every detector parameter update.
 train.separate_tpa_grad_clip = True
+# Preserve the full detector learning signal into TPA, but remove its component
+# only when it directly opposes APR and would increase prototype collapse.
+train.tpa_conflict_projection = True
 
 train.sync_batchnorm = True
 
@@ -154,9 +157,8 @@ model.classifier.tpa_log_interval = 200
 # Let the barrier reach full strength while task gradients are still detached.
 model.classifier.tpa_warmup_steps = 100
 model.tpa_stabilization_steps = 500
-# Keep forward prototypes unchanged but attenuate the collapse-inducing detector
-# gradient into TPA after stabilization. APR retains its full gradient.
-model.tpa_task_gradient_scale = 0.1
+# Conflict projection handles collapse without slowing all task learning.
+model.tpa_task_gradient_scale = 1.0
 
 # Query initialization: Soft-attention aggregation parameters for multi-prototype query initialization
 model.use_soft_attention = True  # Enable soft-attention aggregation in query initialization

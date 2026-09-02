@@ -52,6 +52,7 @@ from lami_dino.checkpoint_init import (
     load_backbone_only,
     validate_backbone_trainable_scope,
 )
+from lami_dino.prototype_ops import route_conflicting_task_gradient
 
 logger = logging.getLogger("detrex")
 
@@ -69,6 +70,7 @@ class Trainer(SimpleTrainer):
         amp=False,
         clip_grad_params=None,
         separate_tpa_grad_clip=False,
+        tpa_conflict_projection=False,
         grad_scaler=None,
     ):
         super().__init__(model=model, data_loader=dataloader, optimizer=optimizer)
@@ -91,10 +93,18 @@ class Trainer(SimpleTrainer):
         # gradient clip hyper-params
         self.clip_grad_params = clip_grad_params
         self.separate_tpa_grad_clip = bool(separate_tpa_grad_clip)
-        
+        self.tpa_conflict_projection = bool(tpa_conflict_projection)
+
         self._last_tpa_grad_norm_pre_clip = float("nan")
         self._last_tpa_grad_norm_post_clip = float("nan")
         self._last_tpa_lr = float("nan")
+        self._last_tpa_projection_metrics = {
+            "task_grad_norm": float("nan"),
+            "apr_grad_norm": float("nan"),
+            "task_apr_cosine": float("nan"),
+            "conflict_projected": float("nan"),
+            "routed_grad_norm": float("nan"),
+        }
 
     def run_step(self):
         """
@@ -127,12 +137,14 @@ class Trainer(SimpleTrainer):
         wrap the optimizer with your custom `zero_grad()` method.
         """
         self.optimizer.zero_grad()
+        apr_gradients = self._compute_apr_gradients(loss_dict)
 
         if self.amp:
             self.grad_scaler.scale(losses).backward()
             # Unscale before both diagnostics and clipping. GradScaler.step()
             # accepts an optimizer that has already been unscaled.
             self.grad_scaler.unscale_(self.optimizer)
+            self._route_tpa_gradients(apr_gradients)
             self._capture_tpa_optimization_metrics(before_clip=True)
             if self.clip_grad_params is not None:
                 self.clip_model_grads()
@@ -141,6 +153,7 @@ class Trainer(SimpleTrainer):
             self.grad_scaler.update()
         else:
             losses.backward()
+            self._route_tpa_gradients(apr_gradients)
             self._capture_tpa_optimization_metrics(before_clip=True)
             if self.clip_grad_params is not None:
                 self.clip_model_grads()
@@ -156,6 +169,73 @@ class Trainer(SimpleTrainer):
             return getattr(model.transformer.decoder.class_embed[0], "tpa", None)
         except (AttributeError, IndexError):
             return None
+
+    def _compute_apr_gradients(self, loss_dict):
+        """Differentiate APR separately so conflicting task gradients are known."""
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        if (
+            not self.tpa_conflict_projection
+            or getattr(model, "tpa_stabilizing", False)
+            or not isinstance(loss_dict, dict)
+            or "loss_apr" not in loss_dict
+        ):
+            return None
+        tpa = self._get_tpa()
+        if tpa is None:
+            return None
+        parameters = list(tpa.parameters())
+        return torch.autograd.grad(
+            loss_dict["loss_apr"],
+            parameters,
+            retain_graph=True,
+            allow_unused=True,
+        )
+
+    def _route_tpa_gradients(self, apr_gradients):
+        """Project away only the detector gradient that would increase APR."""
+        if apr_gradients is None:
+            return
+        tpa = self._get_tpa()
+        if tpa is None:
+            return
+        parameters = list(tpa.parameters())
+        if len(parameters) != len(apr_gradients):
+            raise RuntimeError("TPA parameter set changed between forward and backward")
+
+        apr_flat = torch.cat([
+            (
+                gradient.detach().reshape(-1)
+                if gradient is not None
+                else torch.zeros_like(parameter).reshape(-1)
+            )
+            for parameter, gradient in zip(parameters, apr_gradients)
+        ])
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(apr_flat, op=dist.ReduceOp.SUM)
+            apr_flat.div_(dist.get_world_size())
+
+        total_flat = torch.cat([
+            (
+                parameter.grad.detach().reshape(-1)
+                if parameter.grad is not None
+                else torch.zeros_like(parameter).reshape(-1)
+            )
+            for parameter in parameters
+        ])
+        routed_flat, stats = route_conflicting_task_gradient(total_flat, apr_flat)
+
+        offset = 0
+        for parameter in parameters:
+            count = parameter.numel()
+            routed = routed_flat[offset : offset + count].view_as(parameter)
+            if parameter.grad is None:
+                parameter.grad = routed.clone()
+            else:
+                parameter.grad.copy_(routed)
+            offset += count
+        self._last_tpa_projection_metrics = {
+            key: float(value.item()) for key, value in stats.items()
+        }
 
     def _capture_tpa_optimization_metrics(self, *, before_clip):
         """Measure the actual synchronized TPA gradient, not just grad presence."""
@@ -236,7 +316,7 @@ class Trainer(SimpleTrainer):
             value = float(value)
             if math.isfinite(value):
                 storage.put_scalar(f"tpa/{key}", value, smoothing_hint=False)
-        for key, value in {
+        optimization_metrics = {
             "grad_norm_pre_clip": self._last_tpa_grad_norm_pre_clip,
             "grad_norm_post_clip": self._last_tpa_grad_norm_post_clip,
             "lr": self._last_tpa_lr,
@@ -244,7 +324,9 @@ class Trainer(SimpleTrainer):
             "task_gradient_scale": float(
                 getattr(model, "tpa_active_task_gradient_scale", 1.0)
             ),
-        }.items():
+        }
+        optimization_metrics.update(self._last_tpa_projection_metrics)
+        for key, value in optimization_metrics.items():
             if math.isfinite(value):
                 storage.put_scalar(f"tpa/{key}", value, smoothing_hint=False)
 
@@ -415,9 +497,10 @@ def do_train(args, cfg):
     )
     logger.info(
         "TPA stabilization: %d APR-only steps; post-stabilization task "
-        "gradient scale=%.4g; separate gradient clipping=%s",
+        "gradient scale=%.4g; conflict projection=%s; separate gradient clipping=%s",
         getattr(model, "tpa_stabilization_steps", 0),
         getattr(model, "tpa_task_gradient_scale", 1.0),
+        getattr(cfg.train, "tpa_conflict_projection", False),
         getattr(cfg.train, "separate_tpa_grad_clip", False),
     )
     model.to(cfg.train.device)
@@ -446,6 +529,7 @@ def do_train(args, cfg):
         amp=cfg.train.amp.enabled,
         clip_grad_params=cfg.train.clip_grad.params if cfg.train.clip_grad.enabled else None,
         separate_tpa_grad_clip=getattr(cfg.train, "separate_tpa_grad_clip", False),
+        tpa_conflict_projection=getattr(cfg.train, "tpa_conflict_projection", False),
     )
 
     checkpointer = DetectionCheckpointer(

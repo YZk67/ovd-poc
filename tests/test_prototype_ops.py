@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from lami_dino.prototype_ops import (
     calibrated_logmeanexp_similarity,
     prototype_task_view,
+    route_conflicting_task_gradient,
     soft_category_prototype_fusion,
 )
 
@@ -66,6 +67,42 @@ def test_prototype_task_view_rejects_invalid_gradient_scale():
             assert "task_gradient_scale" in str(error)
         else:
             raise AssertionError(f"expected invalid task gradient scale {scale} to fail")
+
+
+def test_conflict_projection_removes_only_opposing_task_component():
+    apr_gradient = torch.tensor([1.0, 0.0])
+    task_gradient = torch.tensor([-2.0, 3.0])
+    total_gradient = apr_gradient + task_gradient
+
+    routed, stats = route_conflicting_task_gradient(total_gradient, apr_gradient)
+
+    torch.testing.assert_close(routed, torch.tensor([1.0, 3.0]))
+    routed_task = routed - apr_gradient
+    assert torch.dot(routed_task, apr_gradient).abs() < 1e-6
+    assert routed_task[1] == task_gradient[1]
+    assert stats["conflict_projected"].item() == 1.0
+    assert stats["task_apr_cosine"].item() < 0.0
+
+
+def test_conflict_projection_preserves_full_aligned_task_gradient():
+    apr_gradient = torch.tensor([1.0, 0.0])
+    task_gradient = torch.tensor([2.0, 3.0])
+    total_gradient = apr_gradient + task_gradient
+
+    routed, stats = route_conflicting_task_gradient(total_gradient, apr_gradient)
+
+    torch.testing.assert_close(routed, total_gradient)
+    assert stats["conflict_projected"].item() == 0.0
+
+
+def test_conflict_projection_is_noop_without_apr_gradient():
+    total_gradient = torch.tensor([-2.0, 3.0])
+    apr_gradient = torch.zeros_like(total_gradient)
+
+    routed, stats = route_conflicting_task_gradient(total_gradient, apr_gradient)
+
+    torch.testing.assert_close(routed, total_gradient)
+    assert stats["conflict_projected"].item() == 0.0
 
 
 def test_logmeanexp_is_invariant_to_duplicate_prototypes():

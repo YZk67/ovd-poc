@@ -32,10 +32,11 @@ change one item mid-run and compare the resulting checkpoint with another row.
   is 0.03, both terms use a 100-step cosine warm-up, and the global APR weight
   is 1.0. During the first 500 steps, task consumers receive detached prototype
   tensors while APR continues to update TPA; joint end-to-end gradients start
-  at step 500 with the task gradient into TPA scaled by 0.1 (the forward values
-  are unchanged). The manuscript must disclose this stabilization/gradient
-  routing and update the equation from the failed squared-cosine form before
-  submission.
+  at step 500 at full strength. When the detector and APR gradients conflict,
+  only the detector component opposing APR is projected away; all aligned and
+  orthogonal task-gradient components are preserved. The manuscript must
+  disclose this stabilization/gradient routing and update the equation from
+  the failed squared-cosine form before submission.
 - Eq. (6): 8 visual centers, `tau_r=0.06`, soft-k-means sigma 1.0. RPSA uses
   the top 1,024 distinct valid encoder tokens, excludes padding, and applies the
   stricter of fixed background threshold 0.05 and per-image 60th percentile.

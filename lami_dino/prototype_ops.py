@@ -8,10 +8,59 @@ Detectron2/Detrex.
 from __future__ import annotations
 
 import math
-from typing import Tuple
+from typing import Dict, Tuple
 
 import torch
 import torch.nn.functional as F
+
+
+def route_conflicting_task_gradient(
+    total_gradient: torch.Tensor,
+    apr_gradient: torch.Tensor,
+    *,
+    eps: float = 1e-12,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Remove only the task-gradient component that opposes APR.
+
+    ``total_gradient`` is the gradient of ``L_task + L_APR`` and
+    ``apr_gradient`` is the gradient of ``L_APR`` alone.  When the recovered
+    task gradient has a negative inner product with the APR gradient, following
+    it would increase APR to first order.  Project that single conflicting
+    component away and preserve every orthogonal/aligned task component.
+    """
+    if total_gradient.shape != apr_gradient.shape:
+        raise ValueError(
+            "total_gradient and apr_gradient must have the same shape, got "
+            f"{total_gradient.shape} and {apr_gradient.shape}"
+        )
+    if eps <= 0:
+        raise ValueError(f"eps must be positive, got {eps}")
+
+    task_gradient = total_gradient - apr_gradient
+    task_norm = task_gradient.norm(2)
+    apr_norm = apr_gradient.norm(2)
+    inner_product = torch.dot(task_gradient.reshape(-1), apr_gradient.reshape(-1))
+    cosine = inner_product / (task_norm * apr_norm).clamp_min(eps)
+
+    should_project = bool(
+        inner_product.detach().item() < 0.0
+        and apr_norm.detach().item() > eps
+    )
+    routed_task_gradient = task_gradient
+    if should_project:
+        routed_task_gradient = task_gradient - (
+            inner_product / apr_gradient.square().sum().clamp_min(eps)
+        ) * apr_gradient
+
+    routed_gradient = apr_gradient + routed_task_gradient
+    stats = {
+        "task_grad_norm": task_norm.detach(),
+        "apr_grad_norm": apr_norm.detach(),
+        "task_apr_cosine": cosine.detach(),
+        "conflict_projected": total_gradient.new_tensor(float(should_project)),
+        "routed_grad_norm": routed_gradient.norm(2).detach(),
+    }
+    return routed_gradient, stats
 
 
 def prototype_task_view(
