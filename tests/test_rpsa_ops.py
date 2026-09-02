@@ -73,6 +73,44 @@ def test_fixed_and_adaptive_background_thresholds_are_combined():
     torch.testing.assert_close(stats["rpsa_bg_ratio"], torch.tensor(0.5))
 
 
+def test_empty_valid_set_returns_observable_graph_connected_zero():
+    """An empty Eq. (6) valid set skips one batch without killing training."""
+    mu = F.normalize(torch.randn(2, 3, 4), dim=-1).requires_grad_()
+    prototypes = F.normalize(torch.randn(5, 2, 4), dim=-1).requires_grad_()
+    pi = torch.full((2, 3, 5), 0.01)
+
+    loss, stats = weighted_infoNCE(
+        mu,
+        prototypes,
+        pi,
+        bg_thresh=0.05,
+    )
+    loss.backward()
+
+    torch.testing.assert_close(loss, torch.tensor(0.0))
+    torch.testing.assert_close(stats["rpsa_valid_clusters"], torch.tensor(0.0))
+    torch.testing.assert_close(stats["rpsa_active"], torch.tensor(0.0))
+    torch.testing.assert_close(stats["rpsa_empty_image_ratio"], torch.tensor(1.0))
+    assert mu.grad is not None and torch.isfinite(mu.grad).all()
+    assert prototypes.grad is not None and torch.isfinite(prototypes.grad).all()
+
+
+def test_full_rpsa_module_allows_empty_filtered_batch():
+    regions = torch.randn(2, 12, 8, requires_grad=True)
+    prototypes = torch.randn(5, 3, 8, requires_grad=True)
+    token_mask = torch.full((2, 12, 5), 0.01)
+    module = RPSAModule(K=3, em_iters=1, bg_thresh=0.05, bg_percentile=0.6)
+
+    loss, stats, _ = module(regions, prototypes, token_mask)
+    loss.backward()
+
+    torch.testing.assert_close(loss, torch.tensor(0.0))
+    torch.testing.assert_close(stats["rpsa_active"], torch.tensor(0.0))
+    torch.testing.assert_close(stats["rpsa_empty_image_ratio"], torch.tensor(1.0))
+    assert regions.grad is not None and torch.isfinite(regions.grad).all()
+    assert prototypes.grad is not None and torch.isfinite(prototypes.grad).all()
+
+
 def test_rpsa_is_invariant_to_uniform_prototype_duplication():
     torch.manual_seed(0)
     mu = F.normalize(torch.randn(2, 3, 8), dim=-1)

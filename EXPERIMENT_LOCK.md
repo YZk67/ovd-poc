@@ -41,11 +41,14 @@ change one item mid-run and compare the resulting checkpoint with another row.
 1. `python tools/preflight_instructdet.py --hash` passes on the training host.
 2. Fresh-run log says `Loaded CLIP backbone only`, with at least 95% parameter
    coverage, and validates `output_norm_only` backbone scope.
-3. A 200-500 iteration smoke run has finite task/APR/RPSA losses and non-zero
-   RPSA valid clusters. No RPSA warning may be ignored; enabled RPSA is fail-fast.
+3. A 200-500 iteration smoke run has finite task/APR/RPSA losses and observes
+   active RPSA batches with non-zero valid clusters after its shortened warm-up.
+   An empty filtered set for an individual batch is an observable zero-loss skip
+   (`loss_rpsa_active=0`); shape errors and non-finite values remain fail-fast.
 4. Record `tpa/proto_pairwise_cos`, `tpa/proto_effective_rank`,
    `query_fusion/category_max_weight`, `query_fusion/prototype_max_weight`,
-   `loss_rpsa_bg_ratio`, and `loss_rpsa_valid_clusters`.
+   `loss_rpsa_bg_ratio`, `loss_rpsa_valid_clusters`, `loss_rpsa_active`, and
+   `loss_rpsa_empty_image_ratio`.
 5. Every ablation uses a distinct stable output directory and the same seed,
    initialization, batch size, and iteration budget.
 

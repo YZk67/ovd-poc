@@ -272,13 +272,21 @@ def weighted_infoNCE(mu: torch.Tensor,
     loss_k = loss_k.masked_fill(bg_mask, 0.0)                       # ignore BG
 
     valid_counts = (~bg_mask).float().sum(dim=1)                    # [B]
-    valid_total = valid_counts.sum().clamp_min(1.0)
-    loss = loss_k.sum() / valid_total
+    valid_total = valid_counts.sum()
+    # Eq. (6) averages over the valid-center set V.  V can legitimately be
+    # empty for an early/noisy mini-batch after confidence filtering.  In that
+    # case there is no RPSA supervision to apply: return a graph-connected zero
+    # instead of dividing by zero, retaining a low-confidence center, or
+    # aborting the detector training run.  Shape and non-finite failures remain
+    # hard errors in RPSAModule.
+    loss = loss_k.sum() / valid_total.clamp_min(1.0)
 
     stats = {
         "rpsa_pos_mean": pos.mean().detach(),
         "rpsa_bg_ratio": (bg_mask.float().mean().detach()),
         "rpsa_valid_clusters": valid_counts.mean().detach(),
+        "rpsa_active": (valid_total > 0).to(dtype=mu.dtype).detach(),
+        "rpsa_empty_image_ratio": (valid_counts == 0).float().mean().detach(),
     }
     return loss, stats
 
@@ -445,8 +453,6 @@ class RPSAModule(nn.Module):
             )
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"non-finite RPSA loss: {loss.detach().item()}")
-            if float(stats["rpsa_valid_clusters"]) <= 0.0:
-                raise ValueError("RPSA background filtering removed every visual center")
         except RuntimeError as e:
             logger.error(f"[RPSA] Error in weighted_infoNCE: {e}, centers_mu.shape={centers_mu.shape}, t.shape={t.shape}, pi.shape={pi.shape}")
             raise

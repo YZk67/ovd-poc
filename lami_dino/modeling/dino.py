@@ -654,6 +654,10 @@ class DINO(nn.Module):
                             storage.put_scalar("loss_rpsa_bg_ratio", float(stats["rpsa_bg_ratio"]), smoothing_hint=False)
                         if "rpsa_valid_clusters" in stats:
                             storage.put_scalar("loss_rpsa_valid_clusters", float(stats["rpsa_valid_clusters"]), smoothing_hint=False)
+                        if "rpsa_active" in stats:
+                            storage.put_scalar("loss_rpsa_active", float(stats["rpsa_active"]), smoothing_hint=False)
+                        if "rpsa_empty_image_ratio" in stats:
+                            storage.put_scalar("loss_rpsa_empty_image_ratio", float(stats["rpsa_empty_image_ratio"]), smoothing_hint=False)
                         if "rpsa_tokens" in stats:
                             storage.put_scalar("loss_rpsa_tokens", float(stats["rpsa_tokens"]), smoothing_hint=False)
                         if "rpsa_center_orth_mse" in stats:
