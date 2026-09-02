@@ -19,6 +19,7 @@ def prototype_task_view(
     *,
     iteration: int,
     stabilization_steps: int,
+    task_gradient_scale: float = 1.0,
     training: bool,
 ) -> torch.Tensor:
     """Detach task consumers during the APR-only prototype formation phase.
@@ -26,12 +27,21 @@ def prototype_task_view(
     APR is computed from the original ``prototypes`` tensor before this view is
     created, so TPA continues to receive its diversity/balance gradient. Only
     detector classification and query-fusion gradients are blocked until the
-    prototype set has formed distinct directions.
+    prototype set has formed distinct directions. Afterwards their gradients
+    are multiplied by ``task_gradient_scale`` without changing forward values;
+    APR continues to use the unscaled prototype tensor.
     """
     if stabilization_steps < 0:
         raise ValueError("stabilization_steps must be non-negative")
+    if not 0.0 <= task_gradient_scale <= 1.0:
+        raise ValueError("task_gradient_scale must be within [0, 1]")
     if training and int(iteration) < int(stabilization_steps):
         return prototypes.detach()
+    if training and task_gradient_scale < 1.0:
+        # Straight-through gradient scaling: numerically this is exactly
+        # ``prototypes`` in the forward pass, while its task gradient is scaled.
+        detached = prototypes.detach()
+        return detached + float(task_gradient_scale) * (prototypes - detached)
     return prototypes
 
 

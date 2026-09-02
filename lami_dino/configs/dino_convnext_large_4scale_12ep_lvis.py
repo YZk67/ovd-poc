@@ -154,6 +154,9 @@ model.classifier.tpa_log_interval = 200
 # Let the barrier reach full strength while task gradients are still detached.
 model.classifier.tpa_warmup_steps = 100
 model.tpa_stabilization_steps = 500
+# Keep forward prototypes unchanged but attenuate the collapse-inducing detector
+# gradient into TPA after stabilization. APR retains its full gradient.
+model.tpa_task_gradient_scale = 0.1
 
 # Query initialization: Soft-attention aggregation parameters for multi-prototype query initialization
 model.use_soft_attention = True  # Enable soft-attention aggregation in query initialization

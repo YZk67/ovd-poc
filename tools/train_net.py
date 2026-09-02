@@ -241,6 +241,9 @@ class Trainer(SimpleTrainer):
             "grad_norm_post_clip": self._last_tpa_grad_norm_post_clip,
             "lr": self._last_tpa_lr,
             "stabilizing": float(getattr(model, "tpa_stabilizing", False)),
+            "task_gradient_scale": float(
+                getattr(model, "tpa_active_task_gradient_scale", 1.0)
+            ),
         }.items():
             if math.isfinite(value):
                 storage.put_scalar(f"tpa/{key}", value, smoothing_hint=False)
@@ -411,8 +414,10 @@ def do_train(args, cfg):
         ", ".join(trainable_backbone) if trainable_backbone else "none",
     )
     logger.info(
-        "TPA stabilization: %d APR-only steps; separate gradient clipping=%s",
+        "TPA stabilization: %d APR-only steps; post-stabilization task "
+        "gradient scale=%.4g; separate gradient clipping=%s",
         getattr(model, "tpa_stabilization_steps", 0),
+        getattr(model, "tpa_task_gradient_scale", 1.0),
         getattr(cfg.train, "separate_tpa_grad_clip", False),
     )
     model.to(cfg.train.device)

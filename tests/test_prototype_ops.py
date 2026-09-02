@@ -21,6 +21,7 @@ def test_prototype_stabilization_blocks_only_task_gradient():
         prototypes,
         iteration=10,
         stabilization_steps=10,
+        task_gradient_scale=1.0,
         training=True,
     )
     evaluating = prototype_task_view(
@@ -33,6 +34,38 @@ def test_prototype_stabilization_blocks_only_task_gradient():
     assert not forming.requires_grad
     assert joint is prototypes
     assert evaluating is prototypes
+
+
+def test_prototype_task_view_scales_gradient_without_changing_forward():
+    prototypes = torch.randn(3, 5, 8, requires_grad=True)
+    task_view = prototype_task_view(
+        prototypes,
+        iteration=10,
+        stabilization_steps=10,
+        task_gradient_scale=0.1,
+        training=True,
+    )
+
+    torch.testing.assert_close(task_view, prototypes)
+    task_view.sum().backward()
+    torch.testing.assert_close(prototypes.grad, torch.full_like(prototypes, 0.1))
+
+
+def test_prototype_task_view_rejects_invalid_gradient_scale():
+    prototypes = torch.randn(3, 5, 8)
+    for scale in (-0.1, 1.1):
+        try:
+            prototype_task_view(
+                prototypes,
+                iteration=10,
+                stabilization_steps=10,
+                task_gradient_scale=scale,
+                training=True,
+            )
+        except ValueError as error:
+            assert "task_gradient_scale" in str(error)
+        else:
+            raise AssertionError(f"expected invalid task gradient scale {scale} to fail")
 
 
 def test_logmeanexp_is_invariant_to_duplicate_prototypes():

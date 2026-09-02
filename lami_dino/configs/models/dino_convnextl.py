@@ -166,6 +166,7 @@ model = L(DINO)(
     soft_category_topk=3,
     soft_category_tau=1.0,
     tpa_stabilization_steps=0,
+    tpa_task_gradient_scale=1.0,
 )
 
 # set aux loss weight dict

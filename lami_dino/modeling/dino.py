@@ -108,6 +108,7 @@ class DINO(nn.Module):
         soft_category_topk: int = 3,
         soft_category_tau: float = 1.0,
         tpa_stabilization_steps: int = 0,
+        tpa_task_gradient_scale: float = 1.0,
     ):
         super().__init__()
         self.vlm_temperature = vlm_temperature
@@ -124,8 +125,12 @@ class DINO(nn.Module):
         self.soft_category_tau = float(soft_category_tau)
         if tpa_stabilization_steps < 0:
             raise ValueError("tpa_stabilization_steps must be non-negative")
+        if not 0.0 <= tpa_task_gradient_scale <= 1.0:
+            raise ValueError("tpa_task_gradient_scale must be within [0, 1]")
         self.tpa_stabilization_steps = int(tpa_stabilization_steps)
+        self.tpa_task_gradient_scale = float(tpa_task_gradient_scale)
         self.tpa_stabilizing = False
+        self.tpa_active_task_gradient_scale = 1.0
         # define backbone and position embedding module
         self.backbone = backbone
         self.position_embedding = position_embedding
@@ -516,10 +521,17 @@ class DINO(nn.Module):
             self.tpa_stabilizing = bool(
                 self.training and current_iter < self.tpa_stabilization_steps
             )
+            if not self.training:
+                self.tpa_active_task_gradient_scale = 1.0
+            elif self.tpa_stabilizing:
+                self.tpa_active_task_gradient_scale = 0.0
+            else:
+                self.tpa_active_task_gradient_scale = self.tpa_task_gradient_scale
             task_prototypes = prototype_task_view(
                 shared_prototypes,
                 iteration=current_iter,
                 stabilization_steps=self.tpa_stabilization_steps,
+                task_gradient_scale=self.tpa_task_gradient_scale,
                 training=self.training,
             )
             # Broadcast to every class_embed copy so they reuse the same prototype tensor.
