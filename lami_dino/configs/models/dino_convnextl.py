@@ -140,6 +140,9 @@ model = L(DINO)(
         tpa_cls_tau=0.07,
         # APR diversity log-barrier numerical ceiling near |cosine|=1.
         tpa_diversity_barrier_eps=1e-4,
+        tpa_slot_prior_strength=0.0,
+        tpa_prototype_mode_strength=0.0,
+        tpa_identity_value_init=False,
         tpa_log_interval=200,
     ),
     query_path="dataset/metadata/coco_clip_convnextl_a+cname.npy",

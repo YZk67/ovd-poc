@@ -17,6 +17,18 @@ def _pairwise_cos(prototypes):
     return (off_sum / (k * k - k)).mean()
 
 
+def _effective_rank(prototypes):
+    normed = F.normalize(prototypes, p=2, dim=-1)
+    gram = torch.einsum("ckd,cmd->ckm", normed, normed)
+    singular_values = torch.linalg.eigvalsh(gram.float()).clamp_min(0.0).sqrt()
+    fractions = singular_values / singular_values.sum(
+        dim=-1, keepdim=True
+    ).clamp_min(1e-12)
+    return torch.exp(
+        -(fractions * fractions.clamp_min(1e-12).log()).sum(dim=-1)
+    ).mean()
+
+
 def test_tpa_output_shape():
     num_classes, num_phrases, dim, num_prototypes = 5, 7, 16, 3
     text_feats = torch.randn(num_classes, num_phrases, dim)
@@ -59,6 +71,117 @@ def test_prototypes_are_distinct_at_init():
         "TPA prototypes are collapsed at initialization: the K prototypes are "
         "effectively one vector, so num_prototypes>1 buys nothing."
     )
+
+
+def test_semantic_mode_initialization_starts_high_rank_without_warmup():
+    torch.manual_seed(0)
+    num_classes, num_phrases, dim, num_prototypes = 64, 8, 128, 5
+    base = F.normalize(torch.randn(num_classes, 1, dim), p=2, dim=-1)
+    spread = F.normalize(torch.randn(num_classes, num_phrases, dim), p=2, dim=-1)
+    text_feats = F.normalize(base + 0.58 * spread, p=2, dim=-1)
+
+    tpa = TextPrototypeAggregator(
+        dim=dim,
+        num_prototypes=num_prototypes,
+        hidden_dim=256,
+        dropout=0.0,
+        tau=0.004375,
+        slot_prior_strength=0.2,
+        prototype_mode_strength=1.5,
+        identity_value_init=True,
+        warmup_steps=0,
+    )
+    tpa.eval()
+    with torch.no_grad():
+        prototypes, _ = tpa(text_feats, with_loss=False)
+
+    assert _pairwise_cos(prototypes) < 0.5
+    assert _effective_rank(prototypes) > 4.3
+    torch.testing.assert_close(tpa.value_proj.weight, torch.eye(dim))
+
+
+def test_slot_prior_seeds_evenly_spaced_prompt_roles():
+    tpa = TextPrototypeAggregator(
+        dim=16,
+        num_prototypes=5,
+        hidden_dim=32,
+        dropout=0.0,
+        tau=0.004375,
+        slot_prior_strength=0.2,
+        identity_value_init=True,
+    )
+    with torch.no_grad():
+        tpa.key_proj.weight.zero_()
+        tpa.key_proj.bias.zero_()
+        tpa.prototype_queries.zero_()
+        tpa(torch.randn(3, 8, 16), with_loss=False)
+
+    expected = torch.tensor([0, 2, 4, 5, 7])
+    actual = tpa._last_logits[0].argmax(dim=-1).cpu()
+    torch.testing.assert_close(actual, expected)
+
+
+def test_centered_semantic_modes_have_fixed_relative_radius():
+    torch.manual_seed(1)
+    text_feats = torch.randn(4, 8, 16)
+    mode_strength = 1.5
+    tpa = TextPrototypeAggregator(
+        dim=16,
+        num_prototypes=5,
+        hidden_dim=32,
+        dropout=0.0,
+        slot_prior_strength=0.2,
+        prototype_mode_strength=mode_strength,
+        identity_value_init=True,
+    )
+    tpa.eval()
+    with torch.no_grad():
+        prototypes, _ = tpa(text_feats, with_loss=False)
+
+    centroid = text_feats.mean(dim=1, keepdim=True)
+    actual_radius = (prototypes - centroid).norm(dim=-1)
+    expected_radius = mode_strength * centroid.norm(dim=-1).expand_as(actual_radius)
+    torch.testing.assert_close(actual_radius, expected_radius)
+
+
+def test_semantic_mode_settings_survive_checkpoint_roundtrip():
+    original = _make_tpa(
+        slot_prior_strength=0.2,
+        prototype_mode_strength=1.5,
+        identity_value_init=True,
+    )
+    state = original.state_dict()
+    assert "slot_prior_strength" in state
+    assert "prototype_mode_strength" in state
+
+    restored = _make_tpa(
+        slot_prior_strength=0.2,
+        prototype_mode_strength=1.5,
+        identity_value_init=True,
+    )
+    restored.load_state_dict(state)
+    assert torch.isclose(restored.slot_prior_strength, torch.tensor(0.2))
+    assert restored.prototype_mode_strength.item() == 1.5
+
+
+def test_semantic_mode_parameterization_has_finite_task_and_apr_gradients():
+    torch.manual_seed(2)
+    tpa = TextPrototypeAggregator(
+        dim=32,
+        num_prototypes=5,
+        hidden_dim=64,
+        dropout=0.0,
+        slot_prior_strength=0.2,
+        prototype_mode_strength=1.5,
+        identity_value_init=True,
+        warmup_steps=0,
+    )
+    prototypes, apr_loss = tpa(torch.randn(9, 8, 32), with_loss=True)
+    (prototypes.square().mean() + apr_loss).backward()
+
+    for name, parameter in tpa.named_parameters():
+        assert parameter.grad is not None, f"missing gradient for {name}"
+        assert torch.isfinite(parameter.grad).all(), f"non-finite gradient for {name}"
 
 
 def test_eq1_scaled_temperature_controls_attention_sharpness():

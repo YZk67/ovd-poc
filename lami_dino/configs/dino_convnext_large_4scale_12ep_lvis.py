@@ -153,11 +153,14 @@ model.classifier.tpa_dropout = 0.1
 model.classifier.tpa_tau = 0.004375
 model.classifier.tpa_cls_tau = 0.07  # Eq. (2) temperature-controlled log-mean-exp
 model.classifier.tpa_diversity_barrier_eps = 1e-4
+model.classifier.tpa_slot_prior_strength = 0.2
+model.classifier.tpa_prototype_mode_strength = 1.5
+model.classifier.tpa_identity_value_init = True
 model.classifier.tpa_log_interval = 200
-# Let the barrier reach full strength while task gradients are still detached.
-model.classifier.tpa_warmup_steps = 100
-model.tpa_stabilization_steps = 500
-# Conflict projection handles collapse without slowing all task learning.
+# Non-collapsed semantic-mode initialization makes an APR-only formation phase
+# unnecessary. APR and the full task gradient are active from iteration zero.
+model.classifier.tpa_warmup_steps = 0
+model.tpa_stabilization_steps = 0
 model.tpa_task_gradient_scale = 1.0
 
 # Query initialization: Soft-attention aggregation parameters for multi-prototype query initialization

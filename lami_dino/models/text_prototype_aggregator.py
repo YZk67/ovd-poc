@@ -45,6 +45,9 @@ class TextPrototypeAggregator(nn.Module):
         lambda_orth: float = 0.10,
         lambda_div: float = 0.03,
         diversity_barrier_eps: float = 1e-4,
+        slot_prior_strength: float = 0.0,
+        prototype_mode_strength: float = 0.0,
+        identity_value_init: bool = False,
         warmup_steps: int = DEFAULT_WARMUP_STEPS,  # set from train.max_iter * WARMUP_RATIO
         log_interval: int = 200,
     ) -> None:
@@ -63,6 +66,21 @@ class TextPrototypeAggregator(nn.Module):
         if not 0.0 < diversity_barrier_eps < 1.0:
             raise ValueError("diversity_barrier_eps must be within (0, 1)")
         self.diversity_barrier_eps = float(diversity_barrier_eps)
+        if slot_prior_strength < 0.0:
+            raise ValueError("slot_prior_strength must be non-negative")
+        if prototype_mode_strength < 0.0:
+            raise ValueError("prototype_mode_strength must be non-negative")
+        self.register_buffer(
+            "slot_prior_strength",
+            torch.tensor(float(slot_prior_strength)),
+            persistent=True,
+        )
+        self.register_buffer(
+            "prototype_mode_strength",
+            torch.tensor(float(prototype_mode_strength)),
+            persistent=True,
+        )
+        self.identity_value_init = bool(identity_value_init)
         self.warmup_steps = int(warmup_steps)
 
         # projections
@@ -90,9 +108,49 @@ class TextPrototypeAggregator(nn.Module):
     def _reset_parameters(self):
         nn.init.xavier_uniform_(self.key_proj.weight)
         nn.init.constant_(self.key_proj.bias, 0.0)
-        nn.init.xavier_uniform_(self.value_proj.weight)
+        if self.identity_value_init:
+            nn.init.eye_(self.value_proj.weight)
+        else:
+            nn.init.xavier_uniform_(self.value_proj.weight)
         nn.init.constant_(self.value_proj.bias, 0.0)
         nn.init.xavier_uniform_(self.prototype_queries)
+
+    def _add_slot_prior(self, logits: torch.Tensor) -> torch.Tensor:
+        """Seed prototype slots from evenly spaced semantic prompt roles."""
+        num_prompts = logits.shape[-1]
+        positions = torch.linspace(
+            0,
+            num_prompts - 1,
+            steps=self.num_prototypes,
+            device=logits.device,
+        ).round().long()
+        prior = logits.new_zeros((self.num_prototypes, num_prompts))
+        prior.scatter_(
+            1,
+            positions[:, None],
+            self.slot_prior_strength.to(dtype=logits.dtype).expand(
+                self.num_prototypes, 1
+            ),
+        )
+        return logits + prior.unsqueeze(0)
+
+    def _centered_semantic_modes(
+        self,
+        prototypes: torch.Tensor,
+        values: torch.Tensor,
+    ) -> torch.Tensor:
+        """Use fixed-radius prompt residuals so modes cannot shrink radially."""
+        centroid = values.mean(dim=1, keepdim=True)
+        residual = prototypes - centroid
+        unit_residual = residual / residual.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        strength = self.prototype_mode_strength.to(dtype=prototypes.dtype)
+        mode_radius = (
+            strength
+            * centroid.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        )
+        fixed_radius_modes = centroid + mode_radius * unit_residual
+        enabled = (strength > 0.0).to(dtype=prototypes.dtype)
+        return prototypes + enabled * (fixed_radius_modes - prototypes)
 
     # === lambda warmup ===
     def _effective_lambdas(self) -> Tuple[float, float]:
@@ -120,9 +178,11 @@ class TextPrototypeAggregator(nn.Module):
         values = self.value_proj(text_feats)
 
         logits = torch.einsum("kh,cnh->ckn", self.prototype_queries, keys)
+        logits = self._add_slot_prior(logits)
         attn = F.softmax(logits / self.attention_scale, dim=-1)
 
         prototypes_clean = torch.einsum("ckn,cnd->ckd", attn, values)
+        prototypes_clean = self._centered_semantic_modes(prototypes_clean, values)
         prototypes = self.dropout(prototypes_clean)
 
         self._last_logits = logits.detach()
