@@ -215,3 +215,72 @@ def test_teacher_routed_mode_alignment_empty_batch_is_graph_connected_zero():
     torch.testing.assert_close(stats["teacher_rpsa_active"], torch.tensor(0.0))
     assert student.grad is not None
     assert prototypes.grad is not None
+
+
+def test_teacher_routed_mode_alignment_balances_sparse_groups():
+    torch.manual_seed(9)
+    student = torch.randn(1, 5, 6, requires_grad=True)
+    teacher = torch.randn(1, 5, 6)
+    prototypes = torch.randn(1, 5, 2, 3, 6, requires_grad=True)
+    gt = torch.tensor([[True, True, True, True, False]])
+    novel = torch.tensor([[False, False, False, False, True]])
+    valid = gt | novel
+    group_masks = torch.stack((gt, novel), dim=0)
+
+    grouped_loss, stats = teacher_routed_mode_alignment(
+        student,
+        teacher,
+        prototypes,
+        valid_mask=valid,
+        group_masks=group_masks,
+        group_weights=torch.tensor([1.0, 2.0]),
+    )
+    gt_loss, _ = teacher_routed_mode_alignment(
+        student,
+        teacher,
+        prototypes,
+        valid_mask=gt,
+    )
+    novel_loss, _ = teacher_routed_mode_alignment(
+        student,
+        teacher,
+        prototypes,
+        valid_mask=novel,
+    )
+
+    torch.testing.assert_close(grouped_loss, (gt_loss + 2.0 * novel_loss) / 3.0)
+    torch.testing.assert_close(
+        stats["teacher_rpsa_group_active"], torch.tensor([True, True])
+    )
+    grouped_loss.backward()
+    assert student.grad is not None and torch.isfinite(student.grad).all()
+    assert prototypes.grad is not None and torch.isfinite(prototypes.grad).all()
+
+
+def test_teacher_routed_mode_alignment_ignores_an_empty_group():
+    torch.manual_seed(10)
+    student = torch.randn(1, 3, 4)
+    teacher = torch.randn(1, 3, 4)
+    prototypes = torch.randn(1, 3, 2, 2, 4)
+    gt = torch.tensor([[True, False, True]])
+    novel = torch.zeros_like(gt)
+
+    grouped_loss, stats = teacher_routed_mode_alignment(
+        student,
+        teacher,
+        prototypes,
+        valid_mask=gt,
+        group_masks=torch.stack((gt, novel), dim=0),
+        group_weights=torch.tensor([1.0, 100.0]),
+    )
+    gt_loss, _ = teacher_routed_mode_alignment(
+        student,
+        teacher,
+        prototypes,
+        valid_mask=gt,
+    )
+
+    torch.testing.assert_close(grouped_loss, gt_loss)
+    torch.testing.assert_close(
+        stats["teacher_rpsa_group_active"], torch.tensor([True, False])
+    )

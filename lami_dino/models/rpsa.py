@@ -300,6 +300,8 @@ def teacher_routed_mode_alignment(
     valid_mask: Optional[torch.Tensor] = None,
     allowed_category_mask: Optional[torch.Tensor] = None,
     proposal_weights: Optional[torch.Tensor] = None,
+    group_masks: Optional[torch.Tensor] = None,
+    group_weights: Optional[torch.Tensor] = None,
     temperature: float = 0.07,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Distill full-vocabulary CLIP region routing into category prototypes.
@@ -319,6 +321,11 @@ def teacher_routed_mode_alignment(
             proposals use it to restrict the teacher target to the known class
             while retaining a soft distribution over that class's modes.
         proposal_weights: Optional per-proposal balancing weights ``[B, M]``.
+        group_masks: Optional disjoint supervision groups ``[G, B, M]``.
+            When present, the loss is averaged inside each group first, so a
+            numerous group cannot drown out a sparse one.
+        group_weights: Optional non-negative relative weights ``[G]`` used to
+            combine active group means.
         temperature: Category-and-mode distillation temperature.
 
     The target distribution is detached, while the student features and live
@@ -419,7 +426,51 @@ def teacher_routed_mode_alignment(
 
     effective_weights = proposal_weights * valid_mask.to(proposal_weights.dtype)
     weight_sum = effective_weights.sum()
-    loss = (loss_per_proposal * effective_weights).sum() / weight_sum.clamp_min(1.0)
+    group_losses = None
+    group_active = None
+    if group_masks is None:
+        loss = (
+            (loss_per_proposal * effective_weights).sum()
+            / weight_sum.clamp_min(1.0)
+        )
+    else:
+        if group_masks.ndim != 3 or group_masks.shape[1:] != (batch, proposals):
+            raise ValueError("group_masks must have shape [G, B, M]")
+        group_masks = group_masks.to(device=device, dtype=torch.bool)
+        if (group_masks & ~valid_mask.unsqueeze(0)).any():
+            raise ValueError("group_masks must be subsets of valid_mask")
+        if (group_masks.sum(dim=0) > 1).any():
+            raise ValueError("group_masks must be disjoint")
+
+        group_count = group_masks.shape[0]
+        if group_weights is None:
+            group_weights = student_regions.new_ones(group_count)
+        if group_weights.shape != (group_count,):
+            raise ValueError("group_weights must have shape [G]")
+        group_weights = group_weights.to(
+            device=device,
+            dtype=student_regions.dtype,
+        )
+        if (group_weights < 0).any():
+            raise ValueError("group_weights must be non-negative")
+
+        grouped_weights = (
+            group_masks.to(effective_weights.dtype)
+            * effective_weights.unsqueeze(0)
+        )
+        group_denominators = grouped_weights.sum(dim=(1, 2))
+        group_losses = (
+            (grouped_weights * loss_per_proposal.unsqueeze(0)).sum(dim=(1, 2))
+            / group_denominators.clamp_min(1.0)
+        )
+        group_active = group_denominators > 0
+        active_group_weights = (
+            group_weights * group_active.to(group_weights.dtype)
+        )
+        loss = (
+            (group_losses * active_group_weights).sum()
+            / active_group_weights.sum().clamp_min(1.0)
+        )
     if not torch.isfinite(loss):
         raise FloatingPointError("teacher-routed mode alignment produced non-finite loss")
 
@@ -450,6 +501,9 @@ def teacher_routed_mode_alignment(
                 * valid_mask.to(teacher_category_probs.dtype)
             ).sum() / valid_mask.sum().clamp_min(1),
         }
+        if group_losses is not None:
+            stats["teacher_rpsa_group_losses"] = group_losses.detach()
+            stats["teacher_rpsa_group_active"] = group_active.detach()
     return loss, stats
 
 

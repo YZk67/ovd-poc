@@ -338,6 +338,11 @@ class Trainer(SimpleTrainer):
             "teacher_rpsa_novel_ratio": "teacher_rpsa/novel_ratio",
             "teacher_rpsa_confidence": "teacher_rpsa/confidence",
             "teacher_rpsa_margin": "teacher_rpsa/margin",
+            "teacher_rpsa_active_groups": "teacher_rpsa/active_groups",
+            "teacher_rpsa_gt_group_loss": "teacher_rpsa/gt_group_loss",
+            "teacher_rpsa_novel_group_loss": "teacher_rpsa/novel_group_loss",
+            "teacher_rpsa_gt_anchors": "teacher_rpsa/gt_anchors",
+            "teacher_rpsa_novel_proposals": "teacher_rpsa/novel_proposals",
         }
         rpsa_stats = getattr(model.transformer, "rpsa_last_stats", {})
         device = next(model.parameters()).device

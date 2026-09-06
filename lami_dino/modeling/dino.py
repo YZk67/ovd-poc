@@ -118,6 +118,7 @@ class DINO(nn.Module):
         teacher_rpsa_gt_iou_threshold: float = 0.5,
         teacher_rpsa_mode_temperature: float = 0.07,
         teacher_rpsa_novel_weight: float = 1.5,
+        teacher_rpsa_novel_balanced: bool = False,
         teacher_rpsa_warmup_start: int = 7100,
         teacher_rpsa_warmup_iters: int = 7100,
     ):
@@ -152,8 +153,13 @@ class DINO(nn.Module):
         self.teacher_rpsa_gt_iou_threshold = float(teacher_rpsa_gt_iou_threshold)
         self.teacher_rpsa_mode_temperature = float(teacher_rpsa_mode_temperature)
         self.teacher_rpsa_novel_weight = float(teacher_rpsa_novel_weight)
+        self.teacher_rpsa_novel_balanced = bool(teacher_rpsa_novel_balanced)
         self.teacher_rpsa_warmup_start = int(teacher_rpsa_warmup_start)
         self.teacher_rpsa_warmup_iters = int(teacher_rpsa_warmup_iters)
+        if self.teacher_rpsa_novel_balanced and not self.teacher_rpsa:
+            raise ValueError(
+                "teacher_rpsa_novel_balanced requires teacher_rpsa=True"
+            )
         if self.teacher_rpsa_num_proposals < 1:
             raise ValueError("teacher_rpsa_num_proposals must be positive")
         if self.teacher_rpsa_category_topk < 1:
@@ -568,21 +574,37 @@ class DINO(nn.Module):
                 proposal_xyxy[batch_index].float(),
                 box_cxcywh_to_xyxy(boxes.detach()).float(),
             )
-            best_iou, best_gt = ious.max(dim=1)
-            matched = best_iou >= self.teacher_rpsa_gt_iou_threshold
-            if not matched.any():
-                continue
-            matched_gt[batch_index, matched] = True
-            candidate_ids[batch_index, matched, 0] = labels[best_gt[matched]]
-            allowed_categories[batch_index, matched] = False
-            allowed_categories[batch_index, matched, 0] = True
+            if self.teacher_rpsa_novel_balanced:
+                # Use at most one proposal per GT and at most one GT per
+                # proposal. Processing the strongest pairs first resolves the
+                # rare case where two GT boxes select the same proposal.
+                best_iou, best_proposal = ious.max(dim=0)
+                used_proposals = set()
+                for gt_index in torch.argsort(best_iou, descending=True).tolist():
+                    if best_iou[gt_index] < self.teacher_rpsa_gt_iou_threshold:
+                        break
+                    proposal_index = int(best_proposal[gt_index])
+                    if proposal_index in used_proposals:
+                        continue
+                    used_proposals.add(proposal_index)
+                    matched_gt[batch_index, proposal_index] = True
+                    candidate_ids[batch_index, proposal_index, 0] = labels[gt_index]
+                    allowed_categories[batch_index, proposal_index] = False
+                    allowed_categories[batch_index, proposal_index, 0] = True
+            else:
+                best_iou, best_gt = ious.max(dim=1)
+                matched = best_iou >= self.teacher_rpsa_gt_iou_threshold
+                if not matched.any():
+                    continue
+                matched_gt[batch_index, matched] = True
+                candidate_ids[batch_index, matched, 0] = labels[best_gt[matched]]
+                allowed_categories[batch_index, matched] = False
+                allowed_categories[batch_index, matched, 0] = True
 
         pseudo_valid = (
             (confidence >= self.teacher_rpsa_confidence_threshold)
             & (margin >= self.teacher_rpsa_margin_threshold)
         )
-        valid_mask = matched_gt | pseudo_valid
-
         encoder_classifier = self.transformer.decoder.class_embed[
             self.transformer.decoder.num_layers
         ]
@@ -610,14 +632,34 @@ class DINO(nn.Module):
             candidate_bank.shape[-1],
         ).float()
 
-        predicted_classes = candidate_ids[..., 0]
-        novel_mask = self.novel_idx.to(predicted_classes.device)[predicted_classes]
-        pseudo_novel = novel_mask & ~matched_gt
-        proposal_weights = torch.where(
-            pseudo_novel,
-            encoder_regions.new_tensor(self.teacher_rpsa_novel_weight),
-            encoder_regions.new_tensor(1.0),
-        ).float()
+        candidate_novel = self.novel_idx.to(candidate_ids.device)[candidate_ids]
+        pseudo_novel = pseudo_valid & candidate_novel[..., 0] & ~matched_gt
+
+        if self.teacher_rpsa_novel_balanced:
+            # Only novel pseudo categories may contribute. A top-1 novel
+            # prediction guarantees at least one allowed category here.
+            allowed_categories = torch.where(
+                pseudo_novel.unsqueeze(-1),
+                allowed_categories & candidate_novel,
+                allowed_categories,
+            )
+            selected_pseudo = pseudo_novel
+            valid_mask = matched_gt | selected_pseudo
+            proposal_weights = None
+            group_masks = torch.stack((matched_gt, selected_pseudo), dim=0)
+            group_weights = encoder_regions.new_tensor(
+                [1.0, self.teacher_rpsa_novel_weight]
+            )
+        else:
+            selected_pseudo = pseudo_valid & ~matched_gt
+            valid_mask = matched_gt | pseudo_valid
+            proposal_weights = torch.where(
+                pseudo_novel,
+                encoder_regions.new_tensor(self.teacher_rpsa_novel_weight),
+                encoder_regions.new_tensor(1.0),
+            ).float()
+            group_masks = None
+            group_weights = None
 
         loss, stats = teacher_routed_mode_alignment(
             student_regions,
@@ -627,16 +669,18 @@ class DINO(nn.Module):
             valid_mask=valid_mask,
             allowed_category_mask=allowed_categories,
             proposal_weights=proposal_weights,
+            group_masks=group_masks,
+            group_weights=group_weights,
             temperature=self.teacher_rpsa_mode_temperature,
         )
         with torch.no_grad():
+            group_losses = stats.pop("teacher_rpsa_group_losses", None)
+            group_active = stats.pop("teacher_rpsa_group_active", None)
             valid_count = valid_mask.sum().clamp_min(1)
             stats.update(
                 {
                     "teacher_rpsa_gt_ratio": matched_gt.float().mean(),
-                    "teacher_rpsa_pseudo_ratio": (
-                        (pseudo_valid & ~matched_gt).float().mean()
-                    ),
+                    "teacher_rpsa_pseudo_ratio": selected_pseudo.float().mean(),
                     "teacher_rpsa_novel_ratio": (
                         (pseudo_novel & valid_mask).sum() / valid_count
                     ),
@@ -651,6 +695,16 @@ class DINO(nn.Module):
                     ),
                 }
             )
+            if group_losses is not None:
+                stats.update(
+                    {
+                        "teacher_rpsa_active_groups": group_active.float().sum(),
+                        "teacher_rpsa_gt_group_loss": group_losses[0],
+                        "teacher_rpsa_novel_group_loss": group_losses[1],
+                        "teacher_rpsa_gt_anchors": matched_gt.float().sum(dim=1).mean(),
+                        "teacher_rpsa_novel_proposals": selected_pseudo.float().sum(dim=1).mean(),
+                    }
+                )
         return loss, stats
 
 
