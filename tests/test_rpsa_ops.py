@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from lami_dino.models.rpsa import (
     RPSAModule,
     select_high_confidence_tokens,
+    teacher_routed_mode_alignment,
     weighted_infoNCE,
 )
 
@@ -140,3 +141,77 @@ def test_full_rpsa_module_propagates_finite_gradients():
     assert prototypes.grad is not None and torch.isfinite(prototypes.grad).all()
     assert float(stats["rpsa_valid_clusters"]) > 0
     assert extras["centers_mu"].shape == (2, 3, 8)
+
+
+def test_teacher_routed_mode_alignment_distills_without_teacher_gradient():
+    torch.manual_seed(2)
+    student = torch.randn(2, 4, 8, requires_grad=True)
+    teacher = torch.randn(2, 4, 8, requires_grad=True)
+    prototypes = torch.randn(2, 4, 3, 2, 8, requires_grad=True)
+    valid = torch.tensor(
+        [[True, True, False, True], [True, False, True, True]]
+    )
+    allowed = torch.ones(2, 4, 3, dtype=torch.bool)
+    allowed[0, 0, 1:] = False
+    category_probs = torch.softmax(torch.randn(2, 4, 3), dim=-1)
+
+    loss, stats = teacher_routed_mode_alignment(
+        student,
+        teacher,
+        prototypes,
+        candidate_category_probs=category_probs,
+        valid_mask=valid,
+        allowed_category_mask=allowed,
+        temperature=0.1,
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert student.grad is not None and torch.isfinite(student.grad).all()
+    assert prototypes.grad is not None and torch.isfinite(prototypes.grad).all()
+    assert teacher.grad is None
+    torch.testing.assert_close(
+        stats["teacher_rpsa_valid_proposals"], torch.tensor(3.0)
+    )
+
+
+def test_teacher_routed_gt_mask_overrides_category_distribution():
+    student = torch.tensor([[[1.0, 0.0]]], requires_grad=True)
+    teacher = torch.tensor([[[1.0, 0.0]]])
+    prototypes = torch.tensor(
+        [[[[[1.0, 0.0]], [[0.0, 1.0]]]]], requires_grad=True
+    )
+    category_probs = torch.tensor([[[0.99, 0.01]]])
+    allowed = torch.tensor([[[False, True]]])
+
+    loss, stats = teacher_routed_mode_alignment(
+        student,
+        teacher,
+        prototypes,
+        candidate_category_probs=category_probs,
+        allowed_category_mask=allowed,
+    )
+
+    assert torch.isfinite(loss)
+    torch.testing.assert_close(
+        stats["teacher_rpsa_category_max_weight"], torch.tensor(1.0)
+    )
+
+
+def test_teacher_routed_mode_alignment_empty_batch_is_graph_connected_zero():
+    student = torch.randn(1, 3, 4, requires_grad=True)
+    teacher = torch.randn(1, 3, 4)
+    prototypes = torch.randn(1, 3, 2, 2, 4, requires_grad=True)
+
+    loss, stats = teacher_routed_mode_alignment(
+        student,
+        teacher,
+        prototypes,
+        valid_mask=torch.zeros(1, 3, dtype=torch.bool),
+    )
+    loss.backward()
+
+    torch.testing.assert_close(loss, torch.tensor(0.0))
+    torch.testing.assert_close(stats["teacher_rpsa_active"], torch.tensor(0.0))
+    assert student.grad is not None
+    assert prototypes.grad is not None

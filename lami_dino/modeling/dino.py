@@ -35,6 +35,7 @@ from detectron2.utils.logger import setup_logger
 from detectron2.utils.events import get_event_storage
 from lami_dino.checkpoint_init import load_trusted_torch_file
 from lami_dino.prototype_ops import prototype_task_view
+from lami_dino.models import teacher_routed_mode_alignment
 
 logger_rpsa = setup_logger()  # 用于RPSA日志输出
 
@@ -109,6 +110,16 @@ class DINO(nn.Module):
         soft_category_tau: float = 1.0,
         tpa_stabilization_steps: int = 0,
         tpa_task_gradient_scale: float = 1.0,
+        teacher_rpsa: bool = False,
+        teacher_rpsa_num_proposals: int = 64,
+        teacher_rpsa_category_topk: int = 3,
+        teacher_rpsa_confidence_threshold: float = 0.25,
+        teacher_rpsa_margin_threshold: float = 0.05,
+        teacher_rpsa_gt_iou_threshold: float = 0.5,
+        teacher_rpsa_mode_temperature: float = 0.07,
+        teacher_rpsa_novel_weight: float = 1.5,
+        teacher_rpsa_warmup_start: int = 7100,
+        teacher_rpsa_warmup_iters: int = 7100,
     ):
         super().__init__()
         self.vlm_temperature = vlm_temperature
@@ -131,6 +142,38 @@ class DINO(nn.Module):
         self.tpa_task_gradient_scale = float(tpa_task_gradient_scale)
         self.tpa_stabilizing = False
         self.tpa_active_task_gradient_scale = 1.0
+        self.teacher_rpsa = bool(teacher_rpsa)
+        self.teacher_rpsa_num_proposals = int(teacher_rpsa_num_proposals)
+        self.teacher_rpsa_category_topk = int(teacher_rpsa_category_topk)
+        self.teacher_rpsa_confidence_threshold = float(
+            teacher_rpsa_confidence_threshold
+        )
+        self.teacher_rpsa_margin_threshold = float(teacher_rpsa_margin_threshold)
+        self.teacher_rpsa_gt_iou_threshold = float(teacher_rpsa_gt_iou_threshold)
+        self.teacher_rpsa_mode_temperature = float(teacher_rpsa_mode_temperature)
+        self.teacher_rpsa_novel_weight = float(teacher_rpsa_novel_weight)
+        self.teacher_rpsa_warmup_start = int(teacher_rpsa_warmup_start)
+        self.teacher_rpsa_warmup_iters = int(teacher_rpsa_warmup_iters)
+        if self.teacher_rpsa_num_proposals < 1:
+            raise ValueError("teacher_rpsa_num_proposals must be positive")
+        if self.teacher_rpsa_category_topk < 1:
+            raise ValueError("teacher_rpsa_category_topk must be positive")
+        if not 0.0 <= self.teacher_rpsa_confidence_threshold <= 1.0:
+            raise ValueError("teacher_rpsa_confidence_threshold must be within [0, 1]")
+        if not 0.0 <= self.teacher_rpsa_margin_threshold <= 1.0:
+            raise ValueError("teacher_rpsa_margin_threshold must be within [0, 1]")
+        if not 0.0 <= self.teacher_rpsa_gt_iou_threshold <= 1.0:
+            raise ValueError("teacher_rpsa_gt_iou_threshold must be within [0, 1]")
+        if self.teacher_rpsa_mode_temperature <= 0.0:
+            raise ValueError("teacher_rpsa_mode_temperature must be positive")
+        if self.teacher_rpsa_novel_weight <= 0.0:
+            raise ValueError("teacher_rpsa_novel_weight must be positive")
+        if self.teacher_rpsa_warmup_start < 0 or self.teacher_rpsa_warmup_iters < 0:
+            raise ValueError("teacher RPSA warmup values must be non-negative")
+        if self.teacher_rpsa and getattr(transformer, "use_rpsa", False):
+            raise ValueError(
+                "teacher_rpsa and the legacy transformer RPSA cannot be enabled together"
+            )
         # define backbone and position embedding module
         self.backbone = backbone
         self.position_embedding = position_embedding
@@ -262,6 +305,13 @@ class DINO(nn.Module):
             self.identical, self.thead = clip_head[0]
             self.head = clip_head[1]
 
+            # These modules define the frozen region teacher. They are used for
+            # score ensembling at evaluation and, optionally, detached proposal
+            # supervision during training; neither path may update the teacher.
+            for teacher_module in (self.identical, self.thead, self.head):
+                for parameter in teacher_module.parameters():
+                    parameter.requires_grad_(False)
+
             self.seen_classes = json.load(open(seen_classes))
             self.all_classes = json.load(open(all_classes))
             idx = [self.all_classes.index(seen) for seen in self.seen_classes]
@@ -274,9 +324,32 @@ class DINO(nn.Module):
                 self.novel_idx[idx_novel] = True
             else:
                 self.novel_idx = self.base_idx == False
+        elif self.teacher_rpsa:
+            raise ValueError("teacher_rpsa requires score_ensemble and its CLIP ROI head")
+        if self.teacher_rpsa and not hasattr(self, "vlm_content_query_embedding"):
+            raise ValueError("teacher_rpsa requires a full-vocabulary vlm_query_path")
+        if (
+            self.teacher_rpsa
+            and self.vlm_content_query_embedding.shape[0] != self.num_classes
+        ):
+            raise ValueError(
+                "teacher_rpsa requires one frozen CLIP text vector per detector "
+                f"class, got {self.vlm_content_query_embedding.shape[0]} vectors "
+                f"for {self.num_classes} classes"
+            )
         self.save_dir = save_dir
         if self.save_dir:
             os.makedirs(self.save_dir, exist_ok=True)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.teacher_rpsa and hasattr(self, "identical"):
+            # DINO.train() recursively switches every child to train mode. Put
+            # the frozen CLIP region teacher back into deterministic eval mode.
+            self.identical.eval()
+            self.thead.eval()
+            self.head.eval()
+        return self
     
     def _aggregate_prototypes(self, embeddings, method='mean', region_feats=None, tau=0.1):
         """
@@ -420,7 +493,167 @@ class DINO(nn.Module):
 
         return content_inds, batched_inputs
 
- 
+    def _teacher_rpsa_scale(self, iteration: int) -> float:
+        if iteration < self.teacher_rpsa_warmup_start:
+            return 0.0
+        if self.teacher_rpsa_warmup_iters <= 0:
+            return 1.0
+        progress = (
+            iteration - self.teacher_rpsa_warmup_start
+        ) / float(self.teacher_rpsa_warmup_iters)
+        return min(max(progress, 0.0), 1.0)
+
+    def _compute_teacher_rpsa(
+        self,
+        *,
+        encoder_regions,
+        proposal_boxes,
+        clip_features,
+        target_boxes,
+        global_gt_classes,
+    ):
+        """Build detached full-vocabulary CLIP targets for proposal modes."""
+        proposal_count = min(
+            self.teacher_rpsa_num_proposals,
+            encoder_regions.shape[1],
+            proposal_boxes.shape[1],
+        )
+        encoder_regions = encoder_regions[:, :proposal_count]
+        proposal_boxes = proposal_boxes[:, :proposal_count]
+
+        # The CLIP branch is a frozen teacher. Only the detector projection and
+        # live TPA prototypes below receive gradients.
+        with torch.no_grad():
+            teacher_regions = self.extract_region_feature(
+                clip_features,
+                proposal_boxes.detach(),
+                "p3",
+            ).float()
+            teacher_regions = F.normalize(teacher_regions, dim=-1)
+            teacher_category_logits = torch.einsum(
+                "bmd,cd->bmc",
+                teacher_regions,
+                self.vlm_content_query_embedding.to(
+                    device=teacher_regions.device,
+                    dtype=teacher_regions.dtype,
+                ),
+            ) * self.vlm_temperature
+            teacher_category_probs = teacher_category_logits.softmax(dim=-1)
+            candidate_probs, candidate_ids = teacher_category_probs.topk(
+                min(self.teacher_rpsa_category_topk, self.num_classes),
+                dim=-1,
+            )
+            confidence = candidate_probs[..., 0]
+            if candidate_probs.shape[-1] > 1:
+                margin = candidate_probs[..., 0] - candidate_probs[..., 1]
+            else:
+                margin = candidate_probs[..., 0]
+
+        batch_size = encoder_regions.shape[0]
+        matched_gt = torch.zeros(
+            batch_size,
+            proposal_count,
+            dtype=torch.bool,
+            device=encoder_regions.device,
+        )
+        allowed_categories = torch.ones_like(candidate_ids, dtype=torch.bool)
+        proposal_xyxy = box_cxcywh_to_xyxy(proposal_boxes.detach())
+
+        for batch_index in range(batch_size):
+            boxes = target_boxes[batch_index]
+            labels = global_gt_classes[batch_index]
+            if boxes.numel() == 0:
+                continue
+            ious = torchvision.ops.box_iou(
+                proposal_xyxy[batch_index].float(),
+                box_cxcywh_to_xyxy(boxes.detach()).float(),
+            )
+            best_iou, best_gt = ious.max(dim=1)
+            matched = best_iou >= self.teacher_rpsa_gt_iou_threshold
+            if not matched.any():
+                continue
+            matched_gt[batch_index, matched] = True
+            candidate_ids[batch_index, matched, 0] = labels[best_gt[matched]]
+            allowed_categories[batch_index, matched] = False
+            allowed_categories[batch_index, matched, 0] = True
+
+        pseudo_valid = (
+            (confidence >= self.teacher_rpsa_confidence_threshold)
+            & (margin >= self.teacher_rpsa_margin_threshold)
+        )
+        valid_mask = matched_gt | pseudo_valid
+
+        encoder_classifier = self.transformer.decoder.class_embed[
+            self.transformer.decoder.num_layers
+        ]
+        student_regions = encoder_classifier.linear(encoder_regions).float()
+
+        # Compute live TPA modes only for the union of teacher candidates in
+        # this batch. This exposes novel categories to RPSA without expanding
+        # the focal/FedLoss vocabulary or paying for all 1,203 classes in TPA.
+        unique_ids, inverse = torch.unique(
+            candidate_ids.reshape(-1),
+            sorted=True,
+            return_inverse=True,
+        )
+        full_text_feats = encoder_classifier._maybe_move_text_feats(training=True)
+        candidate_bank, _ = encoder_classifier.tpa(
+            full_text_feats[unique_ids],
+            with_loss=False,
+            advance_step=False,
+            apply_dropout=False,
+            update_monitor_state=False,
+        )
+        candidate_prototypes = candidate_bank[inverse].view(
+            *candidate_ids.shape,
+            candidate_bank.shape[-2],
+            candidate_bank.shape[-1],
+        ).float()
+
+        predicted_classes = candidate_ids[..., 0]
+        novel_mask = self.novel_idx.to(predicted_classes.device)[predicted_classes]
+        pseudo_novel = novel_mask & ~matched_gt
+        proposal_weights = torch.where(
+            pseudo_novel,
+            encoder_regions.new_tensor(self.teacher_rpsa_novel_weight),
+            encoder_regions.new_tensor(1.0),
+        ).float()
+
+        loss, stats = teacher_routed_mode_alignment(
+            student_regions,
+            teacher_regions,
+            candidate_prototypes,
+            candidate_category_probs=candidate_probs,
+            valid_mask=valid_mask,
+            allowed_category_mask=allowed_categories,
+            proposal_weights=proposal_weights,
+            temperature=self.teacher_rpsa_mode_temperature,
+        )
+        with torch.no_grad():
+            valid_count = valid_mask.sum().clamp_min(1)
+            stats.update(
+                {
+                    "teacher_rpsa_gt_ratio": matched_gt.float().mean(),
+                    "teacher_rpsa_pseudo_ratio": (
+                        (pseudo_valid & ~matched_gt).float().mean()
+                    ),
+                    "teacher_rpsa_novel_ratio": (
+                        (pseudo_novel & valid_mask).sum() / valid_count
+                    ),
+                    "teacher_rpsa_confidence": (
+                        confidence * valid_mask.to(confidence.dtype)
+                    ).sum() / valid_count,
+                    "teacher_rpsa_margin": (
+                        margin * valid_mask.to(margin.dtype)
+                    ).sum() / valid_count,
+                    "rpsa_tokens": encoder_regions.new_tensor(
+                        float(proposal_count)
+                    ),
+                }
+            )
+        return loss, stats
+
+
     def forward(self, batched_inputs):
         """Forward function of `DINO` which excepts a list of dict as inputs.
 
@@ -452,12 +685,17 @@ class DINO(nn.Module):
         images = self.preprocess_image(batched_inputs)
 
         content_inds = None
+        global_gt_classes = None
         if self.training:
             batch_size, _, H, W = images.tensor.shape
             img_masks = images.tensor.new_ones(batch_size, H, W)
             for img_id in range(batch_size):
                 img_h, img_w = batched_inputs[img_id]["instances"].image_size
                 img_masks[img_id, :img_h, :img_w] = 0
+            global_gt_classes = [
+                sample["instances"].gt_classes.to(self.device).clone()
+                for sample in batched_inputs
+            ]
             if self.use_fed_loss:
                 content_inds, batched_inputs = self.filter_content_info(batched_inputs)
         else:
@@ -595,6 +833,33 @@ class DINO(nn.Module):
             content_query_embeds=raw_content_query_embeds,  # Pass raw multi-prototype embeddings
             content_inds=content_inds, 
         )
+
+        teacher_rpsa_loss = None
+        teacher_rpsa_scale = 0.0
+        if self.training and self.teacher_rpsa:
+            try:
+                teacher_rpsa_iteration = get_event_storage().iter
+            except AssertionError:
+                teacher_rpsa_iteration = 0
+            teacher_rpsa_scale = self._teacher_rpsa_scale(teacher_rpsa_iteration)
+            if teacher_rpsa_scale > 0.0:
+                teacher_rpsa_loss, teacher_rpsa_stats = self._compute_teacher_rpsa(
+                    encoder_regions=enc_state,
+                    proposal_boxes=enc_reference,
+                    clip_features=features_wonorm,
+                    target_boxes=[target["boxes"] for target in targets],
+                    global_gt_classes=global_gt_classes,
+                )
+            else:
+                teacher_rpsa_loss = enc_state.sum() * 0.0
+                teacher_rpsa_stats = {
+                    "teacher_rpsa_active": enc_state.new_tensor(0.0),
+                    "teacher_rpsa_valid_proposals": enc_state.new_tensor(0.0),
+                    "teacher_rpsa_valid_ratio": enc_state.new_tensor(0.0),
+                    "rpsa_tokens": enc_state.new_tensor(0.0),
+                }
+            self.transformer.rpsa_last_loss = teacher_rpsa_loss.detach()
+            self.transformer.rpsa_last_stats = teacher_rpsa_stats
         # hack implementation for distributed training
         # inter_states[0] += self.label_enc.weight[0, 0] * 0.0
         inter_states[0] += self.content_layer.weight[0, 0] * 0.0
@@ -647,9 +912,13 @@ class DINO(nn.Module):
 
             # === 2️⃣ 添加 RPSA 损失（Region–Prototype Semantic Alignment） ===
             # Formal runs must never continue silently without Eq. (6).
-            if getattr(self.transformer, "use_rpsa", False):
+            if self.teacher_rpsa or getattr(self.transformer, "use_rpsa", False):
                 dec_encoder = self.transformer.decoder.class_embed[self.transformer.decoder.num_layers]
-                rpsa_loss_value = getattr(dec_encoder, "rpsa_loss", None)
+                rpsa_loss_value = (
+                    teacher_rpsa_loss
+                    if self.teacher_rpsa
+                    else getattr(dec_encoder, "rpsa_loss", None)
+                )
                 if rpsa_loss_value is None:
                     raise RuntimeError("RPSA is enabled but no loss was produced")
                 if not torch.isfinite(rpsa_loss_value).all():
@@ -666,17 +935,20 @@ class DINO(nn.Module):
                 except AssertionError:
                     current_iter = 0
 
-                warmup_iters = getattr(self.transformer, "rpsa_warmup_iters", 0)
-                warmup_start = getattr(self.transformer, "rpsa_warmup_start", 0)
-                warmup_init = getattr(self.transformer, "rpsa_warmup_init_scale", 0.0)
-                warmup_power = getattr(self.transformer, "rpsa_warmup_power", 1.0)
-                schedule_scale = 1.0
-                if warmup_iters > 0:
-                    if current_iter < warmup_start:
-                        schedule_scale = warmup_init
-                    elif current_iter < warmup_start + warmup_iters:
-                        progress = (current_iter - warmup_start) / float(max(warmup_iters, 1))
-                        schedule_scale = warmup_init + (progress ** warmup_power) * (1.0 - warmup_init)
+                if self.teacher_rpsa:
+                    schedule_scale = teacher_rpsa_scale
+                else:
+                    warmup_iters = getattr(self.transformer, "rpsa_warmup_iters", 0)
+                    warmup_start = getattr(self.transformer, "rpsa_warmup_start", 0)
+                    warmup_init = getattr(self.transformer, "rpsa_warmup_init_scale", 0.0)
+                    warmup_power = getattr(self.transformer, "rpsa_warmup_power", 1.0)
+                    schedule_scale = 1.0
+                    if warmup_iters > 0:
+                        if current_iter < warmup_start:
+                            schedule_scale = warmup_init
+                        elif current_iter < warmup_start + warmup_iters:
+                            progress = (current_iter - warmup_start) / float(max(warmup_iters, 1))
+                            schedule_scale = warmup_init + (progress ** warmup_power) * (1.0 - warmup_init)
 
                 loss_dict["loss_rpsa"] = loss_dict["loss_rpsa"] * schedule_scale
 

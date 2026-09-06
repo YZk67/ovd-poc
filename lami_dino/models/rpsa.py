@@ -291,6 +291,168 @@ def weighted_infoNCE(mu: torch.Tensor,
     return loss, stats
 
 
+def teacher_routed_mode_alignment(
+    student_regions: torch.Tensor,
+    teacher_regions: torch.Tensor,
+    candidate_prototypes: torch.Tensor,
+    *,
+    candidate_category_probs: Optional[torch.Tensor] = None,
+    valid_mask: Optional[torch.Tensor] = None,
+    allowed_category_mask: Optional[torch.Tensor] = None,
+    proposal_weights: Optional[torch.Tensor] = None,
+    temperature: float = 0.07,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Distill full-vocabulary CLIP region routing into category prototypes.
+
+    Args:
+        student_regions: Detector proposal features ``[B, M, D]``.
+        teacher_regions: Frozen CLIP ROI features ``[B, M, D]``.
+        candidate_prototypes: Per-proposal category prototype sets
+            ``[B, M, L, Kp, D]``. ``L`` is a short full-vocabulary category
+            list selected by the teacher; it is independent of FedLoss.
+        candidate_category_probs: Frozen CLIP probabilities for those ``L``
+            categories, ``[B, M, L]``. The final target factorizes into this
+            category distribution and a CLIP-derived distribution over the
+            prototypes within each category.
+        valid_mask: Proposals trusted for pseudo supervision, ``[B, M]``.
+        allowed_category_mask: Optional ``[B, M, L]`` mask. GT-matched
+            proposals use it to restrict the teacher target to the known class
+            while retaining a soft distribution over that class's modes.
+        proposal_weights: Optional per-proposal balancing weights ``[B, M]``.
+        temperature: Category-and-mode distillation temperature.
+
+    The target distribution is detached, while the student features and live
+    prototypes receive gradients. Consequently the frozen teacher cannot be
+    changed to make its own pseudo labels easier to satisfy.
+    """
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    if student_regions.ndim != 3 or teacher_regions.ndim != 3:
+        raise ValueError("student_regions and teacher_regions must be [B, M, D]")
+    if student_regions.shape != teacher_regions.shape:
+        raise ValueError(
+            "student_regions and teacher_regions must have identical shapes, "
+            f"got {student_regions.shape} and {teacher_regions.shape}"
+        )
+    if candidate_prototypes.ndim != 5:
+        raise ValueError("candidate_prototypes must be [B, M, L, Kp, D]")
+
+    batch, proposals, dim = student_regions.shape
+    if candidate_prototypes.shape[:2] != (batch, proposals):
+        raise ValueError("candidate_prototypes must share [B, M]")
+    if candidate_prototypes.shape[-1] != dim:
+        raise ValueError("region and prototype dimensions must match")
+
+    device = student_regions.device
+    if valid_mask is None:
+        valid_mask = torch.ones(batch, proposals, dtype=torch.bool, device=device)
+    if valid_mask.shape != (batch, proposals):
+        raise ValueError("valid_mask must have shape [B, M]")
+    valid_mask = valid_mask.to(device=device, dtype=torch.bool)
+
+    category_count = candidate_prototypes.shape[2]
+    if candidate_category_probs is None:
+        candidate_category_probs = student_regions.new_ones(
+            batch, proposals, category_count
+        )
+    if candidate_category_probs.shape != (batch, proposals, category_count):
+        raise ValueError("candidate_category_probs must have shape [B, M, L]")
+    candidate_category_probs = candidate_category_probs.to(
+        device=device, dtype=student_regions.dtype
+    )
+    if (candidate_category_probs < 0).any():
+        raise ValueError("candidate_category_probs must be non-negative")
+
+    if allowed_category_mask is None:
+        allowed_category_mask = torch.ones(
+            batch,
+            proposals,
+            category_count,
+            dtype=torch.bool,
+            device=device,
+        )
+    if allowed_category_mask.shape != (batch, proposals, category_count):
+        raise ValueError("allowed_category_mask must have shape [B, M, L]")
+    allowed_category_mask = allowed_category_mask.to(device=device, dtype=torch.bool)
+    if (valid_mask & ~allowed_category_mask.any(dim=-1)).any():
+        raise ValueError("every valid proposal must allow at least one category")
+
+    if proposal_weights is None:
+        proposal_weights = student_regions.new_ones((batch, proposals))
+    if proposal_weights.shape != (batch, proposals):
+        raise ValueError("proposal_weights must have shape [B, M]")
+    proposal_weights = proposal_weights.to(
+        device=device, dtype=student_regions.dtype
+    ).clamp_min(0.0)
+
+    student = l2_normalize(student_regions, dim=-1)
+    teacher = l2_normalize(teacher_regions.detach(), dim=-1)
+    prototypes = l2_normalize(candidate_prototypes, dim=-1)
+
+    student_logits = torch.einsum("bmd,bmlkd->bmlk", student, prototypes)
+    with torch.no_grad():
+        teacher_mode_logits = torch.einsum(
+            "bmd,bmlkd->bmlk", teacher, prototypes.detach()
+        )
+        teacher_mode_probs = torch.softmax(
+            teacher_mode_logits / temperature,
+            dim=-1,
+        )
+        teacher_category_probs = candidate_category_probs.detach().masked_fill(
+            ~allowed_category_mask, 0.0
+        )
+        teacher_category_probs = teacher_category_probs / (
+            teacher_category_probs.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        )
+        teacher_probs = (
+            teacher_category_probs.unsqueeze(-1) * teacher_mode_probs
+        ).flatten(start_dim=2)
+
+    student_log_probs = torch.log_softmax(
+        (student_logits / temperature).flatten(start_dim=2), dim=-1
+    )
+    loss_per_proposal = F.kl_div(
+        student_log_probs,
+        teacher_probs,
+        reduction="none",
+    ).sum(dim=-1)
+
+    effective_weights = proposal_weights * valid_mask.to(proposal_weights.dtype)
+    weight_sum = effective_weights.sum()
+    loss = (loss_per_proposal * effective_weights).sum() / weight_sum.clamp_min(1.0)
+    if not torch.isfinite(loss):
+        raise FloatingPointError("teacher-routed mode alignment produced non-finite loss")
+
+    with torch.no_grad():
+        entropy_denominator = math.log(max(teacher_probs.shape[-1], 2))
+        teacher_entropy = -(
+            teacher_probs.clamp_min(1e-8).log() * teacher_probs
+        ).sum(dim=-1) / entropy_denominator
+        marginal_mode_probs = teacher_probs.view(
+            batch,
+            proposals,
+            category_count,
+            candidate_prototypes.shape[3],
+        ).sum(dim=2)
+        stats = {
+            "teacher_rpsa_active": (weight_sum > 0).to(student_regions.dtype),
+            "teacher_rpsa_valid_proposals": valid_mask.float().sum(dim=1).mean(),
+            "teacher_rpsa_valid_ratio": valid_mask.float().mean(),
+            "teacher_rpsa_target_entropy": (
+                teacher_entropy * valid_mask.to(teacher_entropy.dtype)
+            ).sum() / valid_mask.sum().clamp_min(1),
+            "teacher_rpsa_mode_max_weight": (
+                marginal_mode_probs.max(dim=-1).values
+                * valid_mask.to(marginal_mode_probs.dtype)
+            ).sum() / valid_mask.sum().clamp_min(1),
+            "teacher_rpsa_category_max_weight": (
+                teacher_category_probs.max(dim=-1).values
+                * valid_mask.to(teacher_category_probs.dtype)
+            ).sum() / valid_mask.sum().clamp_min(1),
+        }
+    return loss, stats
+
+
 class RPSAModule(nn.Module):
     def __init__(self,
                  K: int = 8, # number of visual clusters per image

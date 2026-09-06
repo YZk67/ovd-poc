@@ -46,6 +46,9 @@ train.output_dir = "./output/instructdet_clip_convnext_large_12ep_lvis"
 # endpoint; the previous 92,300 value silently added roughly one extra epoch.
 iterations_per_epoch = 7100
 train.max_iter = 12 * iterations_per_epoch
+# Keep the LR timeline explicit and checkpointed. Short screening configs
+# inherit this 12ep horizon even when they stop at an intermediate checkpoint.
+train.lr_scheduler_max_iter = 12 * iterations_per_epoch
 
 # run evaluation every ~4 epochs (28400 ≈ 4 × 7100)
 # was 99999999 (never) — without intermediate eval there is no signal that the

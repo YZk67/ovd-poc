@@ -3,6 +3,7 @@ from .rpsa import (
     RPSAModule,
     build_token_class_mask_from_logits,
     select_high_confidence_tokens,
+    teacher_routed_mode_alignment,
 )
 
 
@@ -12,4 +13,5 @@ __all__ = [
     "RPSAModule",
     "build_token_class_mask_from_logits",
     "select_high_confidence_tokens",
+    "teacher_routed_mode_alignment",
 ]

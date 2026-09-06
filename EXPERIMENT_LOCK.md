@@ -16,9 +16,20 @@ change one item mid-run and compare the resulting checkpoint with another row.
   remaining detector parameters.
 - Hardware/batch: 4 GPUs, total batch size 16, AMP enabled.
 - Schedule: 12 epochs, 7,100 iterations/epoch, 85,200 total iterations.
+- Resume invariant: `train.lr_scheduler_max_iter`, not the screening stop, is
+  the fixed learning-rate horizon. The scheduler uses normalized progress
+  (`iteration / lr_scheduler_max_iter`), with the 12-epoch decay at 11/12 of
+  that horizon. The old implementation tied this denominator to `max_iter`, so
+  extending a 14,200-iteration run to 28,400 iterations moved the decay from
+  about iteration 13,017 to 26,033 and raised the restored base/TPA learning
+  rates by 10x (`1e-5 -> 1e-4` and `1e-4 -> 1e-3`). Checkpoints now record and
+  validate the scheduler horizon. A four-epoch screen may stop at 28,400 and
+  later continue to 85,200 only while its scheduler horizon remains 85,200.
 - Seed: 42. Dataset: `lvis_v1_train_norare`; federated focal loss over 100
-  sampled categories per step. TPA/APR/RPSA use that same synchronized category
-  subset during training and the full vocabulary at evaluation.
+  sampled categories per step. The detector loss and legacy RPSA use that same
+  synchronized subset. Teacher-routed RPSA is the declared exception: it uses
+  a detached frozen-CLIP distribution over the full 1,203-class vocabulary,
+  while detector classification remains federated.
 
 ## Paper equations
 
@@ -62,6 +73,23 @@ change one item mid-run and compare the resulting checkpoint with another row.
    `loss_rpsa_empty_image_ratio`. RPSA diagnostics are averaged across ranks.
 5. Every ablation uses a distinct stable output directory and the same seed,
    initialization, batch size, and iteration budget.
+
+## Four-epoch screening and twelve-epoch promotion
+
+- New method variants are screened with a clean, matched four-epoch run before
+  receiving a twelve-epoch training budget. The four-epoch LR protocol must be
+  fixed in advance and identical across candidates; a run whose `max_iter` was
+  changed during resume is diagnostic only.
+- The rare-class promotion band is `APr=39.5--40.5`: candidates below 39.5 do
+  not advance, candidates in `[39.5, 40.0)` advance only with supporting gains
+  in the other metrics, and candidates at or above 40.0 are preferred for a
+  twelve-epoch run. `APr>=40.5` is a strong promotion result.
+- Promotion also requires no material regression in overall AP or an obvious
+  collapse in APc/APf. Prototype-rank diagnostics and training stability must
+  remain healthy; inference settings are fixed rather than retuned per method.
+- The manuscript targets are `AP>=46.1` and `APr>=46.0` (do not interchange
+  them). Promoted configurations are retrained under the locked twelve-epoch
+  protocol and evaluated at the four-, eight-, and twelve-epoch checkpoints.
 
 ## Manuscript details that must match this lock
 

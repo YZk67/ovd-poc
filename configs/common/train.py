@@ -7,6 +7,11 @@ train = dict(
     init_checkpoint="",
     # The total training iterations
     max_iter=1320000,
+    # Optional denominator used by iteration-based LR schedulers. Leave unset
+    # to preserve Detectron2's default behavior (schedule horizon == max_iter).
+    # Short screening runs can set this to the final formal-run horizon so that
+    # their LR curve is an exact prefix of the long run.
+    lr_scheduler_max_iter=None,
     # options for Automatic Mixed Precision
     amp=dict(enabled=False),
     # options for DistributedDataParallel
@@ -31,6 +36,9 @@ train = dict(
     checkpointer=dict(period=5000, max_to_keep=100),
     # Run evaluation after every `eval_period` number of iterations
     eval_period=5000,
+    # Allow short numerical smoke tests to skip the otherwise unconditional
+    # full validation pass. Paper screening/formal configs leave this enabled.
+    eval_after_train=True,
     # Output log to console every `log_period` number of iterations.
     log_period=20,
     device="cuda",

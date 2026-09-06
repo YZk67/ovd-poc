@@ -38,8 +38,10 @@ from detectron2.engine import (
 )
 from detectron2.engine.defaults import create_ddp_model
 from detectron2.evaluation import inference_on_dataset, print_csv_format
+from detectron2.solver import LRMultiplier
 from detectron2.utils import comm
 from detectron2.utils.events import get_event_storage
+from fvcore.common.param_scheduler import ParamScheduler
 
 # ==== Added by ChatGPT ====
 import torch.distributed as dist
@@ -71,6 +73,7 @@ class Trainer(SimpleTrainer):
         clip_grad_params=None,
         separate_tpa_grad_clip=False,
         tpa_conflict_projection=False,
+        lr_scheduler_max_iter=None,
         grad_scaler=None,
     ):
         super().__init__(model=model, data_loader=dataloader, optimizer=optimizer)
@@ -94,6 +97,11 @@ class Trainer(SimpleTrainer):
         self.clip_grad_params = clip_grad_params
         self.separate_tpa_grad_clip = bool(separate_tpa_grad_clip)
         self.tpa_conflict_projection = bool(tpa_conflict_projection)
+        self.lr_scheduler_max_iter = (
+            int(lr_scheduler_max_iter)
+            if lr_scheduler_max_iter is not None
+            else None
+        )
 
         self._last_tpa_grad_norm_pre_clip = float("nan")
         self._last_tpa_grad_norm_post_clip = float("nan")
@@ -105,6 +113,33 @@ class Trainer(SimpleTrainer):
             "conflict_projected": float("nan"),
             "routed_grad_norm": float("nan"),
         }
+
+    def state_dict(self):
+        state = super().state_dict()
+        if self.lr_scheduler_max_iter is not None:
+            state["lr_scheduler_max_iter"] = self.lr_scheduler_max_iter
+        if self.amp:
+            state["grad_scaler"] = self.grad_scaler.state_dict()
+        return state
+
+    def load_state_dict(self, state_dict):
+        saved_horizon = state_dict.get("lr_scheduler_max_iter")
+        if (
+            saved_horizon is not None
+            and self.lr_scheduler_max_iter is not None
+            and int(saved_horizon) != self.lr_scheduler_max_iter
+        ):
+            raise ValueError(
+                "Cannot resume with a different LR scheduler horizon: "
+                f"checkpoint={int(saved_horizon)}, "
+                f"current={self.lr_scheduler_max_iter}. Change train.max_iter "
+                "only when train.lr_scheduler_max_iter remains fixed."
+            )
+        super().load_state_dict(state_dict)
+        # Older checkpoints did not persist AMP state, so keep their resume
+        # path valid while making all newly produced checkpoints complete.
+        if self.amp and "grad_scaler" in state_dict:
+            self.grad_scaler.load_state_dict(state_dict["grad_scaler"])
 
     def run_step(self):
         """
@@ -292,6 +327,17 @@ class Trainer(SimpleTrainer):
             "rpsa_tokens": "loss_rpsa_tokens",
             "rpsa_center_orth_mse": "rpsa_center_orth_mse",
             "rpsa_pi_entropy": "rpsa_pi_entropy",
+            "teacher_rpsa_active": "teacher_rpsa/active",
+            "teacher_rpsa_valid_proposals": "teacher_rpsa/valid_proposals",
+            "teacher_rpsa_valid_ratio": "teacher_rpsa/valid_ratio",
+            "teacher_rpsa_target_entropy": "teacher_rpsa/target_entropy",
+            "teacher_rpsa_mode_max_weight": "teacher_rpsa/mode_max_weight",
+            "teacher_rpsa_category_max_weight": "teacher_rpsa/category_max_weight",
+            "teacher_rpsa_gt_ratio": "teacher_rpsa/gt_ratio",
+            "teacher_rpsa_pseudo_ratio": "teacher_rpsa/pseudo_ratio",
+            "teacher_rpsa_novel_ratio": "teacher_rpsa/novel_ratio",
+            "teacher_rpsa_confidence": "teacher_rpsa/confidence",
+            "teacher_rpsa_margin": "teacher_rpsa/margin",
         }
         rpsa_stats = getattr(model.transformer, "rpsa_last_stats", {})
         device = next(model.parameters()).device
@@ -518,6 +564,42 @@ def do_train(args, cfg):
     cfg.optimizer.params.model = model
     optim = instantiate(cfg.optimizer)
 
+    configured_scheduler_horizon = getattr(
+        cfg.train, "lr_scheduler_max_iter", None
+    )
+    scheduler_horizon = int(
+        cfg.train.max_iter
+        if configured_scheduler_horizon is None
+        else configured_scheduler_horizon
+    )
+    if scheduler_horizon < int(cfg.train.max_iter):
+        raise ValueError(
+            "train.lr_scheduler_max_iter must be greater than or equal to "
+            f"train.max_iter, got {scheduler_horizon} < {int(cfg.train.max_iter)}"
+        )
+
+    scheduler = instantiate(cfg.lr_multiplier)
+    if isinstance(scheduler, ParamScheduler):
+        # Construct LRMultiplier here instead of letting the hook use
+        # trainer.max_iter. This decouples the stopping horizon of a short
+        # screening run from the formal-run LR timeline.
+        scheduler = LRMultiplier(
+            optim,
+            scheduler,
+            max_iter=scheduler_horizon,
+        )
+    elif scheduler_horizon != int(cfg.train.max_iter):
+        raise TypeError(
+            "A separate train.lr_scheduler_max_iter is supported only for "
+            "fvcore ParamScheduler instances."
+        )
+
+    logger.info(
+        "Training stop iteration=%d; LR scheduler horizon=%d",
+        int(cfg.train.max_iter),
+        scheduler_horizon,
+    )
+
     train_loader = instantiate(cfg.dataloader.train)
 
     model = create_ddp_model(model, **cfg.train.ddp)
@@ -530,6 +612,7 @@ def do_train(args, cfg):
         clip_grad_params=cfg.train.clip_grad.params if cfg.train.clip_grad.enabled else None,
         separate_tpa_grad_clip=getattr(cfg.train, "separate_tpa_grad_clip", False),
         tpa_conflict_projection=getattr(cfg.train, "tpa_conflict_projection", False),
+        lr_scheduler_max_iter=scheduler_horizon,
     )
 
     checkpointer = DetectionCheckpointer(
@@ -541,11 +624,15 @@ def do_train(args, cfg):
     trainer.register_hooks(
         [
             hooks.IterationTimer(),
-            hooks.LRScheduler(scheduler=instantiate(cfg.lr_multiplier)),
+            hooks.LRScheduler(optimizer=optim, scheduler=scheduler),
             hooks.PeriodicCheckpointer(checkpointer, **cfg.train.checkpointer)
             if comm.is_main_process()
             else None,
-            hooks.EvalHook(cfg.train.eval_period, lambda: do_test(cfg, model)),
+            hooks.EvalHook(
+                cfg.train.eval_period,
+                lambda: do_test(cfg, model),
+                eval_after_train=getattr(cfg.train, "eval_after_train", True),
+            ),
             hooks.PeriodicWriter(
                 default_writers(cfg.train.output_dir, cfg.train.max_iter),
                 period=cfg.train.log_period,
@@ -612,6 +699,7 @@ def main(args):
     cfg = LazyConfig.apply_overrides(cfg, args.opts)
     if args.ddebug:
         cfg.train.max_iter = 8
+        cfg.train.lr_scheduler_max_iter = 8
         cfg.train.eval_period = 8
         cfg.train.log_period = 4
         cfg.train.checkpointer.period = 8

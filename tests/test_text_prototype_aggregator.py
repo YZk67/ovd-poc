@@ -257,6 +257,30 @@ def test_warmup_state_survives_checkpoint_roundtrip():
     assert lam_before == lam_after
 
 
+def test_auxiliary_candidate_forward_does_not_advance_or_replace_monitors():
+    """Teacher routing may query extra classes without becoming a second step."""
+    tpa = _make_tpa(warmup_steps=0)
+    tpa.train()
+    main_features = torch.randn(8, 6, 16)
+    candidate_features = torch.randn(3, 6, 16)
+
+    tpa(main_features)
+    step = int(tpa._step)
+    monitored = tpa._last_prototypes.clone()
+    candidates, apr_loss = tpa(
+        candidate_features,
+        with_loss=False,
+        advance_step=False,
+        apply_dropout=False,
+        update_monitor_state=False,
+    )
+
+    assert candidates.shape == (3, tpa.num_prototypes, 16)
+    assert apr_loss is None
+    assert int(tpa._step) == step
+    torch.testing.assert_close(tpa._last_prototypes, monitored)
+
+
 def test_warmup_ramps_lambdas_from_zero_to_base():
     lambda_orth, lambda_div = 0.10, 0.03
     tpa = _make_tpa(warmup_steps=100, lambda_orth=lambda_orth, lambda_div=lambda_div)

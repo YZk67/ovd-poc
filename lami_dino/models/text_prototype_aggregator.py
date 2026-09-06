@@ -170,7 +170,15 @@ class TextPrototypeAggregator(nn.Module):
 
 
     # === forward ===
-    def forward(self, text_feats: torch.Tensor, with_loss: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        text_feats: torch.Tensor,
+        with_loss: bool = True,
+        *,
+        advance_step: bool = True,
+        apply_dropout: Optional[bool] = None,
+        update_monitor_state: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert text_feats.ndim == 3, f"Expected [C,N,D], got {text_feats.shape}"
         C, N, D = text_feats.shape
 
@@ -183,29 +191,35 @@ class TextPrototypeAggregator(nn.Module):
 
         prototypes_clean = torch.einsum("ckn,cnd->ckd", attn, values)
         prototypes_clean = self._centered_semantic_modes(prototypes_clean, values)
-        prototypes = self.dropout(prototypes_clean)
+        if apply_dropout is None:
+            apply_dropout = self.training
+        prototypes = self.dropout(prototypes_clean) if apply_dropout else prototypes_clean
 
-        self._last_logits = logits.detach()
-        self._last_prototypes = prototypes_clean.detach()
-        # Diagnostics must describe this forward. Keeping the previous dict made
-        # metrics.json repeat stale rank/cosine values until log_interval happened
-        # to refresh the cache.
-        self.last_monitor_terms = {}
+        if update_monitor_state:
+            self._last_logits = logits.detach()
+            self._last_prototypes = prototypes_clean.detach()
+            # Diagnostics must describe this forward. Keeping the previous dict made
+            # metrics.json repeat stale rank/cosine values until log_interval happened
+            # to refresh the cache.
+            self.last_monitor_terms = {}
 
         apr_loss = None
         if with_loss:
             apr_loss = self.compute_apr_loss(prototypes_clean, logits)
             apr_value = apr_loss.detach()
-        else:
+        elif update_monitor_state:
             apr_value = self._update_metrics_no_grad(prototypes_clean.detach(), logits.detach())
+        else:
+            apr_value = None
 
         # Only training iterations advance the warmup clock. Counting eval forwards
         # too would fast-forward the schedule by however many validation passes have
         # run, which is not what "5% of training" is supposed to mean.
-        if self.training:
+        if self.training and advance_step:
             self._step += 1
 
-        self._maybe_log(apr_value)
+        if update_monitor_state:
+            self._maybe_log(apr_value)
         return prototypes, apr_loss
 
     # === APR loss ===
