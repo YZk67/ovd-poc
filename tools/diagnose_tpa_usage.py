@@ -1,32 +1,22 @@
+#!/usr/bin/env python
+"""Diagnose whether non-collapsed TPA modes improve final-query recognition.
+
+The diagnostic matches final decoder boxes to LVIS ground-truth boxes and then
+compares the true-class ranking of three detector-side text representations:
+
+* ``logmeanexp``: the current K-prototype Eq. (2) classifier;
+* ``prototype_mean``: the same learned prototypes averaged into one vector;
+* ``prompt_mean``: the original prompt bank averaged into one vector.
+
+It also measures posterior sharpness and slot usage for the true class. This
+separates "the prototype vectors have high rank" from "visual instances
+actually select and benefit from different prototype modes".
 """
-TPA prototype-usage diagnostic.
 
-Runs inference on N LVIS val images, hooks the final decoder's class_embed
-to capture (a) the final-layer query features [B,Q,D] and (b) the TPA
-prototypes [C,K,D]. For every (query, class) pair whose sigmoid score
-exceeds a threshold, computes argmax over K (which prototype "won").
-Aggregates per class to get a distribution over K and its entropy.
+from __future__ import annotations
 
-Decision rule (avg normalized entropy across classes with >=5 detections):
-  > 0.6   --> B-route viable: detection-space t-SNE colored by argmax-K
-              should reveal sub-clusters within each class.
-  0.4-0.6 --> grey zone: inspect per-class detail.
-  < 0.4   --> B-route fails: prototypes get used in collapsed mode at
-              detection time. Stick with A-route (prototype-space t-SNE).
-
-Outputs to --save-dir:
-  features.pt       (last image's query features [Q,D])
-  prototypes.pt     (TPA prototypes [C,K,D])
-  per_class_argmax.pt  (dict: class_id -> [argmax-K, ...])
-
-Run:
-  python tools/diagnose_tpa_usage.py \
-    --config lami_dino/configs/dino_convnext_large_4scale_12ep_lvis.py \
-    --ckpt /root/autodl-tmp/model_final.pth \
-    --num-images 100 \
-    --save-dir /root/autodl-tmp/tpa_diagnostic
-"""
 import argparse
+import json
 import math
 import sys
 from collections import Counter, defaultdict
@@ -34,190 +24,435 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 
-def install_capture_hook(model, capture):
-    """Monkey-patch the last class_embed's _compute_tpa_logits so each call
-    saves the same `features` and `prototypes` tensors used in its einsum."""
-    last = model.transformer.decoder.class_embed[-1]
-    original = last._compute_tpa_logits
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 
-    def patched(x, *, content_inds, additional_class):
-        result = original(x, content_inds=content_inds, additional_class=additional_class)
+from lami_dino.diagnostic_ops import (  # noqa: E402
+    prototype_variant_logits,
+    true_class_mode_weights,
+)
 
-        if last._external_prototypes is not None:
-            prototypes = last._external_prototypes
-        elif last._cached_eval is not None:
-            prototypes = last._cached_eval
-        else:
-            return result
 
-        if last.norm_weight:
-            prototypes = F.normalize(prototypes, p=2, dim=-1)
+def install_capture_hooks(model, capture):
+    """Capture the final decoder classifier inputs and normalized query boxes."""
+    final_index = model.transformer.decoder.num_layers - 1
+    classifier = model.class_embed[final_index]
+    original_logits = classifier._compute_tpa_logits
 
-        features = last._normalize_features(x)
-        capture["features"] = features.detach().cpu()
-        capture["prototypes"] = prototypes.detach().cpu()
+    def capture_logits(x, *, content_inds, additional_class):
+        result = original_logits(
+            x,
+            content_inds=content_inds,
+            additional_class=additional_class,
+        )
+        prototypes = classifier._external_prototypes
+        if prototypes is None:
+            prototypes = classifier._cached_eval
+        if prototypes is not None:
+            # _compute_tpa_logits receives the output of classifier.linear;
+            # applying the projection a second time would be dimensionally
+            # invalid (and was the main flaw in the old diagnostic hook).
+            capture["projected_features"] = x.detach()
+            capture["detector_logits"] = result.detach()
+            capture["prototypes"] = prototypes.detach()
+            capture["prompt_features"] = classifier.eval_text_feats.detach()
         return result
 
-    last._compute_tpa_logits = patched
+    classifier._compute_tpa_logits = capture_logits
+
+    original_inference = model.inference
+
+    def capture_inference(box_cls, box_pred, image_sizes, wo_sigmoid=False):
+        capture["query_boxes"] = box_pred.detach()
+        capture["image_sizes"] = tuple(image_sizes)
+        return original_inference(
+            box_cls,
+            box_pred,
+            image_sizes,
+            wo_sigmoid=wo_sigmoid,
+        )
+
+    model.inference = capture_inference
+    return classifier
 
 
-def diagnose(per_class_argmax, K, min_det):
-    log_K = math.log(K)
-    detail = []
-    for cls, ams in per_class_argmax.items():
-        if len(ams) < min_det:
+def box_cxcywh_to_xyxy(boxes):
+    cx, cy, width, height = boxes.unbind(-1)
+    return torch.stack(
+        (cx - 0.5 * width, cy - 0.5 * height, cx + 0.5 * width, cy + 0.5 * height),
+        dim=-1,
+    )
+
+
+def box_iou(boxes1, boxes2):
+    area1 = (boxes1[:, 2:] - boxes1[:, :2]).clamp_min(0).prod(dim=-1)
+    area2 = (boxes2[:, 2:] - boxes2[:, :2]).clamp_min(0).prod(dim=-1)
+    left_top = torch.maximum(boxes1[:, None, :2], boxes2[None, :, :2])
+    right_bottom = torch.minimum(boxes1[:, None, 2:], boxes2[None, :, 2:])
+    intersection = (right_bottom - left_top).clamp_min(0).prod(dim=-1)
+    return intersection / (area1[:, None] + area2[None, :] - intersection).clamp_min(1e-12)
+
+
+def update_ranking_stats(accumulator, logits, class_ids, frequencies):
+    true_logits = logits.gather(1, class_ids[:, None])
+    ranks = 1 + (logits > true_logits).sum(dim=-1)
+    for rank, frequency in zip(ranks.tolist(), frequencies):
+        for split in ("all", frequency):
+            row = accumulator[split]
+            row["count"] += 1
+            row["top1"] += int(rank <= 1)
+            row["top5"] += int(rank <= 5)
+            row["reciprocal_rank"] += 1.0 / float(rank)
+            row["rank_sum"] += int(rank)
+
+
+def finalize_ranking_stats(accumulator):
+    result = {}
+    for split in ("all", "r", "c", "f"):
+        row = accumulator[split]
+        count = int(row["count"])
+        if count == 0:
+            result[split] = {"count": 0}
             continue
-        cnt = Counter(ams)
-        probs = np.array([cnt[k] / len(ams) for k in range(K)])
-        entropy = -np.sum(probs * np.log(probs + 1e-12))
-        detail.append((cls, len(ams), entropy, probs))
+        result[split] = {
+            "count": count,
+            "top1": row["top1"] / count,
+            "top5": row["top5"] / count,
+            "mrr": row["reciprocal_rank"] / count,
+            "mean_rank": row["rank_sum"] / count,
+        }
+    return result
 
-    if not detail:
-        print(f"[!] no class has >= {min_det} detections; lower --score-thresh or "
-              f"--min-det-per-class.")
-        return None
 
-    detail.sort(key=lambda x: -x[2])
-    norm_ents = np.array([d[2] for d in detail]) / log_K
+def normalized_entropy(probabilities):
+    probabilities = probabilities.float()
+    entropy = -(probabilities * probabilities.clamp_min(1e-12).log()).sum(dim=-1)
+    return entropy / math.log(probabilities.shape[-1])
 
-    print(f"\n=== Diagnostic Report (K={K}) ===")
-    print(f"Classes with >= {min_det} detections: {len(detail)}")
-    print(f"Normalized entropy (entropy / log(K)):")
-    print(f"  mean   = {norm_ents.mean():.3f}")
-    print(f"  median = {np.median(norm_ents):.3f}")
-    print(f"  min    = {norm_ents.min():.3f}")
-    print(f"  max    = {norm_ents.max():.3f}")
 
-    avg = float(norm_ents.mean())
-    print(f"\n=== Decision ===")
-    if avg > 0.6:
-        verdict = "B-VIABLE"
-        msg = "B-route VIABLE: detection-space sub-cluster viz should work"
-    elif avg > 0.4:
-        verdict = "GREY"
-        msg = "GREY ZONE: inspect per-class detail before deciding"
-    else:
-        verdict = "A-ONLY"
-        msg = "B-route FAILS at detection time. Stick with A-route (prototype t-SNE)"
-    print(f"  norm_entropy = {avg:.3f}  ->  {verdict}")
-    print(f"  {msg}")
+def format_percent(value):
+    return "-" if value is None else f"{100.0 * value:6.2f}"
 
-    print(f"\nTop 8 most-diverse classes (highest entropy):")
-    for cls, n, ent, probs in detail[:8]:
-        ps = " ".join(f"{p:.2f}" for p in probs)
-        print(f"  cls={cls:4d}  N={n:5d}  ent={ent:.3f}  norm={ent/log_K:.3f}  "
-              f"probs=[{ps}]")
 
-    print(f"\nTop 8 most-collapsed classes (lowest entropy):")
-    for cls, n, ent, probs in detail[-8:]:
-        ps = " ".join(f"{p:.2f}" for p in probs)
-        print(f"  cls={cls:4d}  N={n:5d}  ent={ent:.3f}  norm={ent/log_K:.3f}  "
-              f"probs=[{ps}]")
-    return verdict
+def print_ranking_table(results):
+    print("\n=== Oracle-query category recognition ===")
+    print("The best-IoU query for each GT isolates text classification from proposal recall.\n")
+    print(
+        f"{'variant':>18} {'split':>6} {'N':>7} "
+        f"{'top1':>8} {'top5':>8} {'MRR':>8} {'mean_rank':>11}"
+    )
+    for variant, splits in results.items():
+        for split in ("all", "r", "c", "f"):
+            row = splits[split]
+            if not row.get("count"):
+                print(f"{variant:>18} {split:>6} {0:7d} {'-':>8} {'-':>8} {'-':>8} {'-':>11}")
+                continue
+            print(
+                f"{variant:>18} {split:>6} {row['count']:7d} "
+                f"{format_percent(row['top1']):>8} "
+                f"{format_percent(row['top5']):>8} "
+                f"{row['mrr']:8.4f} {row['mean_rank']:11.2f}"
+            )
+
+
+def frequency_lookup(metadata, num_classes):
+    counts = [None] * num_classes
+    for item in metadata.class_image_count:
+        category_index = int(item["id"]) - 1
+        if 0 <= category_index < num_classes:
+            counts[category_index] = int(item["image_count"])
+    if any(value is None for value in counts):
+        raise ValueError("LVIS class_image_count does not cover every classifier category")
+    return ["r" if value <= 10 else "c" if value <= 100 else "f" for value in counts]
+
+
+def select_dataset_records(records, num_images, seed):
+    if num_images <= 0 or num_images >= len(records):
+        return records
+    generator = np.random.default_rng(seed)
+    indices = np.sort(generator.choice(len(records), size=num_images, replace=False))
+    return [records[int(index)] for index in indices]
 
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--config",
-                   default="lami_dino/configs/dino_convnext_large_4scale_12ep_lvis.py")
-    p.add_argument("--ckpt", default="/root/autodl-tmp/model_final.pth")
-    p.add_argument("--num-images", type=int, default=100)
-    p.add_argument("--score-thresh", type=float, default=0.1)
-    p.add_argument("--min-det-per-class", type=int, default=5)
-    p.add_argument("--save-dir", default="/root/autodl-tmp/tpa_diagnostic",
-                   help="dir to save features + prototypes + per_class_argmax")
-    args = p.parse_args()
-
-    repo_root = Path(__file__).resolve().parent.parent
-    sys.path.insert(0, str(repo_root))
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config-file",
+        "--config",
+        dest="config_file",
+        default="lami_dino/configs/dino_convnext_large_4scale_12ep_lvis.py",
+    )
+    parser.add_argument("--checkpoint", "--ckpt", dest="checkpoint", required=True)
+    parser.add_argument("--num-images", type=int, default=500, help="0 means all images")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--min-iou", type=float, default=0.5)
+    parser.add_argument("--min-per-class", type=int, default=5)
+    parser.add_argument("--output", default=None, help="optional JSON report path")
+    parser.add_argument(
+        "opts",
+        nargs=argparse.REMAINDER,
+        help="LazyConfig overrides, e.g. model.beta=0.3 model.novel_scale=3.0",
+    )
+    args = parser.parse_args()
 
     from detectron2.checkpoint import DetectionCheckpointer
     from detectron2.config import LazyConfig, instantiate
-    from detectron2.data import (
-        build_detection_test_loader,
-        get_detection_dataset_dicts,
-    )
+    from detectron2.data import MetadataCatalog, build_detection_test_loader
+    from detectron2.data import get_detection_dataset_dicts
+    from detectron2.structures import BoxMode
 
-    print(f"[load] config: {args.config}")
-    cfg = LazyConfig.load(args.config)
-    print(f"[load] instantiating model")
+    cfg = LazyConfig.load(args.config_file)
+    cfg = LazyConfig.apply_overrides(cfg, args.opts)
+    dataset_name = cfg.dataloader.test.dataset.names
+    if not isinstance(dataset_name, str):
+        if len(dataset_name) != 1:
+            raise ValueError("prototype diagnostic requires exactly one test dataset")
+        dataset_name = dataset_name[0]
+
+    print(f"[load] config={args.config_file}")
     model = instantiate(cfg.model)
-    model.eval()
-    if torch.cuda.is_available():
-        model.cuda()
-    print(f"[load] checkpoint: {args.ckpt}")
-    DetectionCheckpointer(model).load(args.ckpt)
+    device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
+    model.to(device).eval()
+    print(f"[load] checkpoint={args.checkpoint}")
+    DetectionCheckpointer(model).load(args.checkpoint)
 
-    dataset_dicts = get_detection_dataset_dicts(
-        names="lvis_v1_val", filter_empty=False
-    )
-    dataset_dicts = dataset_dicts[: args.num_images]
+    metadata = MetadataCatalog.get(dataset_name)
+    records = get_detection_dataset_dicts(names=dataset_name, filter_empty=False)
+    records = select_dataset_records(records, args.num_images, args.seed)
+    records_by_id = {record["image_id"]: record for record in records}
     loader = build_detection_test_loader(
-        dataset=dataset_dicts,
+        dataset=records,
         mapper=instantiate(cfg.dataloader.test.mapper),
-        num_workers=2,
+        num_workers=0,
     )
 
     capture = {}
-    install_capture_hook(model, capture)
+    classifier = install_capture_hooks(model, capture)
+    frequencies_by_class = frequency_lookup(metadata, model.num_classes)
+    ranking = {
+        name: defaultdict(lambda: defaultdict(float))
+        for name in ("logmeanexp", "prototype_mean", "prompt_mean")
+    }
+    winners_by_class = defaultdict(list)
+    mode_maxima = []
+    mode_entropies = []
+    routing_category_maxima = []
+    routing_prototype_maxima = []
+    matched_count = 0
+    gt_count = 0
+    lme_max_error = 0.0
 
-    per_class_argmax = defaultdict(list)
-    K = None
-    last_features = None
-    last_prototypes = None
-
-    print(f"[run] inference on {len(dataset_dicts)} images...")
+    print(f"[run] {len(records)} images, min IoU={args.min_iou}")
     with torch.no_grad():
-        for i, batched_inputs in enumerate(loader):
+        for batch_index, batched_inputs in enumerate(loader):
+            capture.clear()
             _ = model(batched_inputs)
+            required = {
+                "projected_features",
+                "detector_logits",
+                "prototypes",
+                "prompt_features",
+                "query_boxes",
+            }
+            missing = required - set(capture)
+            if missing:
+                raise RuntimeError(f"capture hooks missed: {sorted(missing)}")
 
-            features = capture.get("features")        # [1, Q, D]
-            prototypes = capture.get("prototypes")    # [C, K, D]
-            if features is None or prototypes is None:
-                print(f"[!] image {i}: hook didn't capture; skipping")
-                continue
+            features = capture["projected_features"]
+            detector_logits = capture["detector_logits"]
+            query_boxes = capture["query_boxes"]
+            prototypes = capture["prototypes"]
+            prompts = capture["prompt_features"]
 
-            B, Q, D = features.shape
-            C, Kp, _ = prototypes.shape
-            K = Kp
-            last_features = features.clone()
-            last_prototypes = prototypes.clone()
+            for local_index, model_input in enumerate(batched_inputs):
+                record = records_by_id[model_input["image_id"]]
+                annotations = record.get("annotations", [])
+                if not annotations:
+                    continue
+                gt_count += len(annotations)
+                gt_boxes = torch.tensor(
+                    [
+                        BoxMode.convert(
+                            annotation["bbox"],
+                            annotation["bbox_mode"],
+                            BoxMode.XYXY_ABS,
+                        )
+                        for annotation in annotations
+                    ],
+                    dtype=torch.float32,
+                    device=device,
+                )
+                gt_classes = torch.tensor(
+                    [annotation["category_id"] for annotation in annotations],
+                    dtype=torch.long,
+                    device=device,
+                )
+                predicted = box_cxcywh_to_xyxy(query_boxes[local_index].float())
+                scale = predicted.new_tensor(
+                    [record["width"], record["height"], record["width"], record["height"]]
+                )
+                predicted = predicted * scale
+                predicted[:, 0::2].clamp_(0, record["width"])
+                predicted[:, 1::2].clamp_(0, record["height"])
+                overlaps = box_iou(gt_boxes, predicted)
+                best_iou, best_query = overlaps.max(dim=1)
+                valid = best_iou >= args.min_iou
+                if not valid.any():
+                    continue
 
-            logits_4d = torch.einsum("bqd,ckd->bqck", features, prototypes)
-            logits_3d = torch.logsumexp(logits_4d, dim=-1)
-            scores = logits_3d.sigmoid()
+                selected_queries = best_query[valid]
+                selected_classes = gt_classes[valid]
+                selected_features = features[local_index, selected_queries]
+                selected_frequencies = [
+                    frequencies_by_class[class_id]
+                    for class_id in selected_classes.tolist()
+                ]
+                matched_count += int(valid.sum())
 
-            mask = scores[0] > args.score_thresh
-            qs, cs = mask.nonzero(as_tuple=True)
-            for q, c in zip(qs.tolist(), cs.tolist()):
-                argmax_k = logits_4d[0, q, c].argmax().item()
-                per_class_argmax[c].append(argmax_k)
+                variants = prototype_variant_logits(
+                    selected_features,
+                    prototypes,
+                    prompts,
+                    temperature=classifier.tpa_cls_tau,
+                    logit_scale=classifier.norm_temperature,
+                )
+                if classifier.use_bias:
+                    variants = {
+                        name: logits + classifier.cls_bias
+                        for name, logits in variants.items()
+                    }
+                current_logits = detector_logits[local_index, selected_queries].float()
+                lme_max_error = max(
+                    lme_max_error,
+                    float((variants["logmeanexp"] - current_logits).abs().max().item()),
+                )
+                variants["logmeanexp"] = current_logits
+                for name, logits in variants.items():
+                    update_ranking_stats(
+                        ranking[name], logits, selected_classes, selected_frequencies
+                    )
 
-            if (i + 1) % 10 == 0:
-                total = sum(len(v) for v in per_class_argmax.values())
-                print(f"  [{i+1}/{len(dataset_dicts)}] cumulative dets={total}")
+                weights = true_class_mode_weights(
+                    selected_features,
+                    prototypes,
+                    selected_classes,
+                    temperature=classifier.tpa_cls_tau,
+                )
+                mode_maxima.extend(weights.max(dim=-1).values.cpu().tolist())
+                mode_entropies.extend(normalized_entropy(weights).cpu().tolist())
+                for class_id, winner in zip(
+                    selected_classes.tolist(), weights.argmax(dim=-1).tolist()
+                ):
+                    winners_by_class[class_id].append(winner)
 
-    total = sum(len(v) for v in per_class_argmax.values())
-    print(f"\n[done] processed {len(dataset_dicts)} images, {total} detections "
-          f"(score>{args.score_thresh}), {len(per_class_argmax)} active classes")
+            routing = getattr(model.transformer, "last_query_fusion_stats", {})
+            if routing:
+                routing_category_maxima.append(float(routing["category_max_weight"]))
+                routing_prototype_maxima.append(float(routing["prototype_max_weight"]))
+            if (batch_index + 1) % 50 == 0:
+                print(
+                    f"  [{batch_index + 1}/{len(records)}] "
+                    f"GT matched={matched_count}/{gt_count}"
+                )
 
-    if K is None:
-        print("[!] no captures; aborting")
-        return
+    finalized = {
+        name: finalize_ranking_stats(stats) for name, stats in ranking.items()
+    }
+    print_ranking_table(finalized)
 
-    verdict = diagnose(per_class_argmax, K, args.min_det_per_class)
+    if matched_count == 0:
+        raise RuntimeError(
+            "no GT box matched a final query; lower --min-iou or inspect box capture"
+        )
+    prototype_count = int(prototypes.shape[1])
+    winner_counts = Counter(
+        winner for winners in winners_by_class.values() for winner in winners
+    )
+    winner_probabilities = torch.tensor(
+        [winner_counts[index] for index in range(prototype_count)], dtype=torch.float32
+    )
+    winner_probabilities /= winner_probabilities.sum().clamp_min(1)
+    class_usage_entropies = []
+    for winners in winners_by_class.values():
+        if len(winners) < args.min_per_class:
+            continue
+        counts = torch.tensor(
+            [winners.count(index) for index in range(prototype_count)], dtype=torch.float32
+        )
+        probabilities = counts / counts.sum()
+        class_usage_entropies.append(float(normalized_entropy(probabilities[None])[0]))
 
-    if args.save_dir:
-        out = Path(args.save_dir)
-        out.mkdir(parents=True, exist_ok=True)
-        torch.save(last_features, out / "features_last.pt")
-        torch.save(last_prototypes, out / "prototypes.pt")
-        torch.save(dict(per_class_argmax), out / "per_class_argmax.pt")
-        print(f"\n[save] features_last.pt, prototypes.pt, per_class_argmax.pt -> {out}")
-        print(f"       (use these for plotting: prototype t-SNE [A] or detection viz [B])")
+    mode_report = {
+        "prototype_count": prototype_count,
+        "matched_gt": matched_count,
+        "total_gt": gt_count,
+        "matched_ratio": matched_count / max(gt_count, 1),
+        "mean_posterior_max": float(np.mean(mode_maxima)) if mode_maxima else None,
+        "mean_posterior_normalized_entropy": (
+            float(np.mean(mode_entropies)) if mode_entropies else None
+        ),
+        "winner_distribution": winner_probabilities.tolist(),
+        "winner_normalized_entropy": float(
+            normalized_entropy(winner_probabilities[None])[0]
+        ),
+        "classes_with_min_matches": len(class_usage_entropies),
+        "mean_per_class_winner_entropy": (
+            float(np.mean(class_usage_entropies)) if class_usage_entropies else None
+        ),
+        "query_fusion_category_max_weight": (
+            float(np.mean(routing_category_maxima)) if routing_category_maxima else None
+        ),
+        "query_fusion_prototype_max_weight": (
+            float(np.mean(routing_prototype_maxima)) if routing_prototype_maxima else None
+        ),
+        "classifier_recompute_max_abs_error": lme_max_error,
+    }
+    print("\n=== Mode utilization on true-class matched queries ===")
+    for key, value in mode_report.items():
+        print(f"{key}: {value}")
+
+    current = finalized["logmeanexp"]["all"]
+    baselines = [
+        finalized["prototype_mean"]["all"],
+        finalized["prompt_mean"]["all"],
+    ]
+    best_baseline_top1 = max(row.get("top1", 0.0) for row in baselines)
+    gain = current.get("top1", 0.0) - best_baseline_top1
+    diffuse = (
+        mode_report["mean_posterior_normalized_entropy"] is not None
+        and mode_report["mean_posterior_normalized_entropy"] > 0.9
+    )
+    print("\n=== Decision ===")
+    if gain > 0.005 and not diffuse:
+        verdict = "PROTOTYPES_USED"
+        explanation = "K-prototype classification beats both one-vector controls and routing is not uniform."
+    elif gain <= 0.005 and diffuse:
+        verdict = "PROTOTYPES_NOT_EFFECTIVE"
+        explanation = "K prototypes do not beat one-vector controls and per-instance mode weights are near-uniform."
+    else:
+        verdict = "MIXED"
+        explanation = "Classification gain and mode utilization disagree; inspect split metrics before changing TPA."
+    print(f"verdict: {verdict}")
+    print(f"top1_gain_over_best_one_vector: {gain:+.6f}")
+    print(explanation)
+
+    report = {
+        "config": args.config_file,
+        "checkpoint": args.checkpoint,
+        "num_images": len(records),
+        "min_iou": args.min_iou,
+        "ranking": finalized,
+        "mode_utilization": mode_report,
+        "verdict": verdict,
+        "top1_gain_over_best_one_vector": gain,
+    }
+    if args.output:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        print(f"[save] {output_path}")
 
 
 if __name__ == "__main__":
