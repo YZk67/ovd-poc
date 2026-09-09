@@ -8,6 +8,10 @@ compares the true-class ranking of three detector-side text representations:
 * ``prototype_mean``: the same learned prototypes averaged into one vector;
 * ``prompt_mean``: the original prompt bank averaged into one vector.
 
+It additionally measures the exact 1203-way category rank after the current
+detector/CLIP fusion and whether that best-query/category pair survives the
+image-level top-k selection.
+
 It also measures posterior sharpness and slot usage for the true class. This
 separates "the prototype vectors have high rank" from "visual instances
 actually select and benefit from different prototype modes".
@@ -67,6 +71,9 @@ def install_capture_hooks(model, capture):
     def capture_inference(box_cls, box_pred, image_sizes, wo_sigmoid=False):
         capture["query_boxes"] = box_pred.detach()
         capture["image_sizes"] = tuple(image_sizes)
+        capture["final_scores"] = (
+            box_cls.detach() if wo_sigmoid else box_cls.detach().sigmoid()
+        )
         return original_inference(
             box_cls,
             box_pred,
@@ -104,8 +111,11 @@ def update_ranking_stats(accumulator, logits, class_ids, frequencies):
             row["count"] += 1
             row["top1"] += int(rank <= 1)
             row["top5"] += int(rank <= 5)
+            row["top10"] += int(rank <= 10)
+            row["top20"] += int(rank <= 20)
             row["reciprocal_rank"] += 1.0 / float(rank)
             row["rank_sum"] += int(rank)
+    return ranks
 
 
 def finalize_ranking_stats(accumulator):
@@ -120,6 +130,8 @@ def finalize_ranking_stats(accumulator):
             "count": count,
             "top1": row["top1"] / count,
             "top5": row["top5"] / count,
+            "top10": row["top10"] / count,
+            "top20": row["top20"] / count,
             "mrr": row["reciprocal_rank"] / count,
             "mean_rank": row["rank_sum"] / count,
         }
@@ -141,18 +153,24 @@ def print_ranking_table(results):
     print("The best-IoU query for each GT isolates text classification from proposal recall.\n")
     print(
         f"{'variant':>18} {'split':>6} {'N':>7} "
-        f"{'top1':>8} {'top5':>8} {'MRR':>8} {'mean_rank':>11}"
+        f"{'top1':>8} {'top5':>8} {'top10':>8} {'top20':>8} "
+        f"{'MRR':>8} {'mean_rank':>11}"
     )
     for variant, splits in results.items():
         for split in ("all", "r", "c", "f"):
             row = splits[split]
             if not row.get("count"):
-                print(f"{variant:>18} {split:>6} {0:7d} {'-':>8} {'-':>8} {'-':>8} {'-':>11}")
+                print(
+                    f"{variant:>18} {split:>6} {0:7d} "
+                    f"{'-':>8} {'-':>8} {'-':>8} {'-':>8} {'-':>8} {'-':>11}"
+                )
                 continue
             print(
                 f"{variant:>18} {split:>6} {row['count']:7d} "
                 f"{format_percent(row['top1']):>8} "
                 f"{format_percent(row['top5']):>8} "
+                f"{format_percent(row['top10']):>8} "
+                f"{format_percent(row['top20']):>8} "
                 f"{row['mrr']:8.4f} {row['mean_rank']:11.2f}"
             )
 
@@ -168,12 +186,134 @@ def frequency_lookup(metadata, num_classes):
     return ["r" if value <= 10 else "c" if value <= 100 else "f" for value in counts]
 
 
-def select_dataset_records(records, num_images, seed):
+def select_dataset_records(records, num_images, seed, sampling, frequencies):
+    if sampling == "rare":
+        records = [
+            record
+            for record in records
+            if any(
+                frequencies[annotation["category_id"]] == "r"
+                for annotation in record.get("annotations", [])
+            )
+        ]
     if num_images <= 0 or num_images >= len(records):
         return records
     generator = np.random.default_rng(seed)
     indices = np.sort(generator.choice(len(records), size=num_images, replace=False))
     return [records[int(index)] for index in indices]
+
+
+def make_selection_accumulator():
+    return {
+        split: {
+            "count": 0,
+            "ranks": [],
+            "global_topk": 0,
+            "rank_le_cutoff_global_hit": 0,
+            "rank_le_cutoff_global_miss": 0,
+            "rank_gt_cutoff_global_hit": 0,
+            "rank_gt_cutoff_global_miss": 0,
+        }
+        for split in ("all", "r", "c", "f")
+    }
+
+
+def update_selection_accumulator(accumulator, ranks, survives, frequencies, cutoff):
+    for rank, survived, frequency in zip(
+        ranks.tolist(), survives.tolist(), frequencies
+    ):
+        for split in ("all", frequency):
+            row = accumulator[split]
+            row["count"] += 1
+            row["ranks"].append(int(rank))
+            row["global_topk"] += int(survived)
+            if rank <= cutoff:
+                key = (
+                    "rank_le_cutoff_global_hit"
+                    if survived
+                    else "rank_le_cutoff_global_miss"
+                )
+            else:
+                key = (
+                    "rank_gt_cutoff_global_hit"
+                    if survived
+                    else "rank_gt_cutoff_global_miss"
+                )
+            row[key] += 1
+
+
+def finalize_selection_accumulator(accumulator, cutoff):
+    result = {}
+    for split, row in accumulator.items():
+        count = int(row["count"])
+        if count == 0:
+            result[split] = {"count": 0}
+            continue
+        ranks = np.asarray(row["ranks"], dtype=np.float64)
+        missed = count - int(row["global_topk"])
+        low_rank_miss = int(row["rank_gt_cutoff_global_miss"])
+        high_rank_miss = int(row["rank_le_cutoff_global_miss"])
+        result[split] = {
+            "count": count,
+            "category_rank_cutoff": cutoff,
+            "median_category_rank": float(np.median(ranks)),
+            "p90_category_rank": float(np.percentile(ranks, 90)),
+            "global_topk_recall": row["global_topk"] / count,
+            "global_missed": missed,
+            "rank_le_cutoff_global_hit": int(row["rank_le_cutoff_global_hit"]),
+            "rank_le_cutoff_global_miss": high_rank_miss,
+            "rank_gt_cutoff_global_hit": int(row["rank_gt_cutoff_global_hit"]),
+            "rank_gt_cutoff_global_miss": low_rank_miss,
+            "miss_due_to_category_rank_fraction": (
+                low_rank_miss / missed if missed else 0.0
+            ),
+            "miss_despite_rank_cutoff_fraction": (
+                high_rank_miss / missed if missed else 0.0
+            ),
+        }
+    return result
+
+
+def print_selection_report(report, topk, cutoff):
+    print("\n=== Best-query fused category rank vs image-level selection ===")
+    print(
+        f"Only GTs with best-query IoU >= threshold are included; image top-k={topk}."
+    )
+    print(
+        f"{'split':>6} {'N':>7} {'median-rank':>12} {'p90-rank':>10} "
+        f"{'pair-topk%':>11} {'miss-rank>k%':>13} {'miss-rank<=k%':>14}"
+    )
+    for split in ("all", "r", "c", "f"):
+        row = report[split]
+        if not row.get("count"):
+            continue
+        print(
+            f"{split:>6} {row['count']:7d} {row['median_category_rank']:12.1f} "
+            f"{row['p90_category_rank']:10.1f} "
+            f"{100.0 * row['global_topk_recall']:11.2f} "
+            f"{100.0 * row['miss_due_to_category_rank_fraction']:13.2f} "
+            f"{100.0 * row['miss_despite_rank_cutoff_fraction']:14.2f}"
+        )
+    rare = report.get("r", {})
+    print("\n=== Rare best-query bottleneck verdict ===")
+    if not rare.get("count") or not rare.get("global_missed"):
+        print("verdict: INSUFFICIENT_RARE_MISSES")
+        return "INSUFFICIENT_RARE_MISSES"
+    category_fraction = rare["miss_due_to_category_rank_fraction"]
+    global_fraction = rare["miss_despite_rank_cutoff_fraction"]
+    if category_fraction > 0.6:
+        verdict = "WITHIN_QUERY_CATEGORY_RANK_DOMINANT"
+    elif global_fraction > 0.6:
+        verdict = "IMAGE_LEVEL_TOPK_DOMINANT"
+    else:
+        verdict = "MIXED_CATEGORY_AND_GLOBAL_RANKING"
+    print(f"verdict: {verdict}")
+    print(
+        f"Among missed best-query pairs, {100.0 * category_fraction:.2f}% have "
+        f"true-class rank > {cutoff}; {100.0 * global_fraction:.2f}% are already "
+        f"within top-{cutoff} but are displaced at image-level top-k."
+    )
+    return verdict
 
 
 def main():
@@ -189,6 +329,14 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--min-iou", type=float, default=0.5)
     parser.add_argument("--min-per-class", type=int, default=5)
+    parser.add_argument(
+        "--sampling",
+        choices=("random", "rare"),
+        default="random",
+        help="rare keeps only validation images containing at least one rare GT",
+    )
+    parser.add_argument("--image-topk", type=int, default=300)
+    parser.add_argument("--category-rank-cutoff", type=int, default=5)
     parser.add_argument("--output", default=None, help="optional JSON report path")
     parser.add_argument(
         "opts",
@@ -196,6 +344,12 @@ def main():
         help="LazyConfig overrides, e.g. model.beta=0.3 model.novel_scale=3.0",
     )
     args = parser.parse_args()
+    if not 0.0 < args.min_iou <= 1.0:
+        raise ValueError("--min-iou must be within (0,1]")
+    if args.image_topk < 1:
+        raise ValueError("--image-topk must be positive")
+    if args.category_rank_cutoff < 1:
+        raise ValueError("--category-rank-cutoff must be positive")
 
     from detectron2.checkpoint import DetectionCheckpointer
     from detectron2.config import LazyConfig, instantiate
@@ -217,10 +371,28 @@ def main():
     model.to(device).eval()
     print(f"[load] checkpoint={args.checkpoint}")
     DetectionCheckpointer(model).load(args.checkpoint)
+    if not getattr(model, "score_ensemble", False):
+        raise ValueError("exact fused-rank diagnosis requires model.score_ensemble=True")
+    fusion_protocol = {
+        "alpha": float(model.alpha),
+        "beta": float(model.beta),
+        "novel_scale": float(model.novel_scale),
+        "vlm_temperature": float(model.vlm_temperature),
+    }
+    print(f"[protocol] {fusion_protocol}")
 
     metadata = MetadataCatalog.get(dataset_name)
+    capture = {}
+    classifier = install_capture_hooks(model, capture)
+    frequencies_by_class = frequency_lookup(metadata, model.num_classes)
     records = get_detection_dataset_dicts(names=dataset_name, filter_empty=False)
-    records = select_dataset_records(records, args.num_images, args.seed)
+    records = select_dataset_records(
+        records,
+        args.num_images,
+        args.seed,
+        args.sampling,
+        frequencies_by_class,
+    )
     records_by_id = {record["image_id"]: record for record in records}
     loader = build_detection_test_loader(
         dataset=records,
@@ -228,12 +400,23 @@ def main():
         num_workers=0,
     )
 
-    capture = {}
-    classifier = install_capture_hooks(model, capture)
-    frequencies_by_class = frequency_lookup(metadata, model.num_classes)
     ranking = {
         name: defaultdict(lambda: defaultdict(float))
-        for name in ("logmeanexp", "prototype_mean", "prompt_mean")
+        for name in (
+            "fused_current",
+            "logmeanexp",
+            "prototype_mean",
+            "prompt_mean",
+        )
+    }
+    selection_accumulator = make_selection_accumulator()
+    occupancy = {
+        "images": 0,
+        "unique_queries": [],
+        "unique_classes": [],
+        "max_pairs_per_query": [],
+        "pairs_per_unique_query": [],
+        "frequency_pair_counts": Counter(),
     }
     winners_by_class = defaultdict(list)
     mode_maxima = []
@@ -244,7 +427,10 @@ def main():
     gt_count = 0
     lme_max_error = 0.0
 
-    print(f"[run] {len(records)} images, min IoU={args.min_iou}")
+    print(
+        f"[run] {len(records)} images, sampling={args.sampling}, "
+        f"min IoU={args.min_iou}"
+    )
     with torch.no_grad():
         for batch_index, batched_inputs in enumerate(loader):
             capture.clear()
@@ -255,6 +441,7 @@ def main():
                 "prototypes",
                 "prompt_features",
                 "query_boxes",
+                "final_scores",
             }
             missing = required - set(capture)
             if missing:
@@ -265,8 +452,40 @@ def main():
             query_boxes = capture["query_boxes"]
             prototypes = capture["prototypes"]
             prompts = capture["prompt_features"]
+            final_scores = capture["final_scores"].float()
+            if final_scores.shape != detector_logits.shape:
+                raise RuntimeError(
+                    "final fused score shape does not match detector logits: "
+                    f"{final_scores.shape} vs {detector_logits.shape}"
+                )
 
             for local_index, model_input in enumerate(batched_inputs):
+                image_scores = final_scores[local_index]
+                selected_count = min(args.image_topk, image_scores.numel())
+                top_flat_ids = image_scores.reshape(-1).topk(selected_count).indices
+                top_query_ids = torch.div(
+                    top_flat_ids, image_scores.shape[-1], rounding_mode="floor"
+                )
+                top_class_ids = top_flat_ids % image_scores.shape[-1]
+                unique_queries, pairs_per_query = torch.unique(
+                    top_query_ids, return_counts=True
+                )
+                occupancy["images"] += 1
+                occupancy["unique_queries"].append(int(unique_queries.numel()))
+                occupancy["unique_classes"].append(
+                    int(torch.unique(top_class_ids).numel())
+                )
+                occupancy["max_pairs_per_query"].append(
+                    int(pairs_per_query.max()) if pairs_per_query.numel() else 0
+                )
+                occupancy["pairs_per_unique_query"].append(
+                    selected_count / max(int(unique_queries.numel()), 1)
+                )
+                occupancy["frequency_pair_counts"].update(
+                    frequencies_by_class[class_id]
+                    for class_id in top_class_ids.tolist()
+                )
+
                 record = records_by_id[model_input["image_id"]]
                 annotations = record.get("annotations", [])
                 if not annotations:
@@ -334,6 +553,27 @@ def main():
                         ranking[name], logits, selected_classes, selected_frequencies
                     )
 
+                fused_selected_scores = image_scores[selected_queries]
+                fused_ranks = update_ranking_stats(
+                    ranking["fused_current"],
+                    fused_selected_scores,
+                    selected_classes,
+                    selected_frequencies,
+                )
+                true_pair_ids = (
+                    selected_queries * image_scores.shape[-1] + selected_classes
+                )
+                survives_global_topk = (
+                    true_pair_ids[:, None] == top_flat_ids[None, :]
+                ).any(dim=1)
+                update_selection_accumulator(
+                    selection_accumulator,
+                    fused_ranks,
+                    survives_global_topk,
+                    selected_frequencies,
+                    args.category_rank_cutoff,
+                )
+
                 weights = true_class_mode_weights(
                     selected_features,
                     prototypes,
@@ -361,6 +601,34 @@ def main():
         name: finalize_ranking_stats(stats) for name, stats in ranking.items()
     }
     print_ranking_table(finalized)
+
+    selection_report = finalize_selection_accumulator(
+        selection_accumulator, args.category_rank_cutoff
+    )
+    ranking_verdict = print_selection_report(
+        selection_report,
+        args.image_topk,
+        args.category_rank_cutoff,
+    )
+    total_pairs = sum(occupancy["frequency_pair_counts"].values())
+    occupancy_report = {
+        "images": occupancy["images"],
+        "mean_unique_queries": float(np.mean(occupancy["unique_queries"])),
+        "mean_unique_classes": float(np.mean(occupancy["unique_classes"])),
+        "mean_max_pairs_per_query": float(
+            np.mean(occupancy["max_pairs_per_query"])
+        ),
+        "mean_pairs_per_unique_query": float(
+            np.mean(occupancy["pairs_per_unique_query"])
+        ),
+        "frequency_pair_fraction": {
+            split: occupancy["frequency_pair_counts"][split] / max(total_pairs, 1)
+            for split in ("r", "c", "f")
+        },
+    }
+    print("\n=== Image-level top-k occupancy ===")
+    for key, value in occupancy_report.items():
+        print(f"{key}: {value}")
 
     if matched_count == 0:
         raise RuntimeError(
@@ -442,8 +710,13 @@ def main():
         "config": args.config_file,
         "checkpoint": args.checkpoint,
         "num_images": len(records),
+        "sampling": args.sampling,
         "min_iou": args.min_iou,
+        "fusion_protocol": fusion_protocol,
         "ranking": finalized,
+        "selection": selection_report,
+        "selection_verdict": ranking_verdict,
+        "topk_occupancy": occupancy_report,
         "mode_utilization": mode_report,
         "verdict": verdict,
         "top1_gain_over_best_one_vector": gain,
