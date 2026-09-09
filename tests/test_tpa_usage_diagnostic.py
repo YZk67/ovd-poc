@@ -4,15 +4,22 @@ import pytest
 import torch
 
 from tools.diagnose_tpa_usage import (
+    complementarity_verdict,
     component_branch_verdict,
+    finalize_complementarity_accumulator,
     finalize_component_accumulator,
     finalize_ranking_stats,
     finalize_selection_accumulator,
-    make_selection_accumulator,
+    greedy_gt_topk_matches,
+    make_complementarity_accumulator,
     make_component_accumulator,
+    make_selection_accumulator,
     select_dataset_records,
-    update_ranking_stats,
+    semantic_best_queries,
+    true_class_topk_hits,
+    update_complementarity_accumulator,
     update_component_accumulator,
+    update_ranking_stats,
     update_selection_accumulator,
 )
 
@@ -76,7 +83,7 @@ def test_component_report_separates_hit_and_miss_branch_scores():
         vlm_probabilities=torch.tensor([0.4, 0.1]),
         fused_scores=torch.tensor([0.5, 0.05]),
         topk_threshold=0.1,
-        best_ious=torch.tensor([0.8, 0.6]),
+        selected_ious=torch.tensor([0.8, 0.6]),
         category_ranks=torch.tensor([1, 10]),
         survives=torch.tensor([True, False]),
         frequencies=["r", "r"],
@@ -95,3 +102,98 @@ def test_component_report_separates_hit_and_miss_branch_scores():
     assert verdict["detector_weighted_log_separation"] > verdict[
         "vlm_weighted_log_separation"
     ]
+
+
+def test_semantic_best_uses_highest_true_score_among_iou_valid_queries():
+    overlaps = torch.tensor(
+        [
+            [0.9, 0.7, 0.2],
+            [0.1, 0.4, 0.3],
+        ]
+    )
+    classes = torch.tensor([1, 0])
+    scores = torch.tensor(
+        [
+            [0.1, 0.2],
+            [0.2, 0.8],
+            [0.9, 0.1],
+        ]
+    )
+    valid, queries, selected_ious = semantic_best_queries(
+        overlaps, classes, scores, min_iou=0.5
+    )
+    assert valid.tolist() == [True, False]
+    # Query 0 has the best IoU, but query 1 has the strongest true-class score.
+    assert queries.tolist() == [1]
+    assert selected_ious.tolist() == pytest.approx([0.7])
+
+
+def test_true_class_topk_hits_and_complementarity_partition_actual_misses():
+    eligible = torch.tensor(
+        [
+            [True, True, False],
+            [False, True, True],
+            [True, False, False],
+            [False, False, False],
+        ]
+    )
+    classes = torch.tensor([1, 0, 1, 0])
+    # Flat pair ids use query * C + class with C=2.
+    current_hits = true_class_topk_hits(
+        eligible, classes, torch.tensor([3]), num_classes=2
+    )
+    detector_hits = true_class_topk_hits(
+        eligible, classes, torch.tensor([1]), num_classes=2
+    )
+    vlm_hits = true_class_topk_hits(
+        eligible, classes, torch.tensor([2]), num_classes=2
+    )
+    assert current_hits.tolist() == [True, False, False, False]
+    assert detector_hits.tolist() == [True, False, True, False]
+    assert vlm_hits.tolist() == [False, True, False, False]
+
+    accumulator = make_complementarity_accumulator()
+    update_complementarity_accumulator(
+        accumulator,
+        valid=eligible.any(dim=1),
+        current_hits=current_hits,
+        detector_hits=detector_hits,
+        vlm_hits=vlm_hits,
+        frequencies=["r", "r", "r", "r"],
+    )
+    report = finalize_complementarity_accumulator(accumulator)
+    assert report["r"]["proposal_valid"] == 3
+    assert report["r"]["current_hit"] == 1
+    assert report["r"]["vlm_only"] == 1
+    assert report["r"]["detector_only"] == 1
+    assert report["r"]["neither"] == 0
+    assert complementarity_verdict(report) == "COMPLEMENTARY_COMPONENTS"
+
+
+def test_greedy_topk_matching_is_one_to_one_and_score_ordered():
+    overlaps = torch.tensor(
+        [
+            [0.9, 0.8],
+            [0.85, 0.7],
+        ]
+    )
+    classes = torch.tensor([0, 0])
+    # q0/class0 is higher scored than q1/class0.
+    hits, matched_queries = greedy_gt_topk_matches(
+        overlaps,
+        classes,
+        torch.tensor([0, 2]),
+        num_classes=2,
+        min_iou=0.5,
+    )
+    assert hits.tolist() == [True, True]
+    assert matched_queries.tolist() == [0, 1]
+
+    one_hit, _ = greedy_gt_topk_matches(
+        overlaps,
+        classes,
+        torch.tensor([0]),
+        num_classes=2,
+        min_iou=0.5,
+    )
+    assert one_hit.tolist() == [True, False]

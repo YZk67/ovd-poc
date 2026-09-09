@@ -5,12 +5,13 @@ For each LVIS GT instance this script measures:
 
 1. whether any class-agnostic decoder query reaches an IoU threshold;
 2. whether the correct class paired with the best-IoU query survives top-k;
-3. whether any correct-class query reaching the threshold survives top-k.
+3. whether any correct-class query reaching the threshold survives top-k;
+4. which rare false-positive type occupies the selected top-k.
 
 The first-to-third gap localizes recall loss before versus after proposal
-generation. Because the compact cache does not contain all Q x C logits, this
-cannot recover the exact 1203-way rank of a true-class pair below top-k and it
-does not diagnose false-positive precision errors.
+generation.  Rare precision errors are matched over the complete validation
+set using LVIS positive/negative/not-exhaustive image annotations.  This is a
+diagnostic decomposition, not a replacement for official LVIS AP.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import torch
@@ -104,7 +105,152 @@ def selected_pairs(payload, profile, novel_mask, max_dets, path):
     )
     count = min(int(max_dets), scores.numel())
     selected = scores.topk(count).indices
-    return query_ids[selected], class_ids[selected]
+    return query_ids[selected], class_ids[selected], scores[selected]
+
+
+def pairwise_iou(boxes1, boxes2):
+    if boxes1.numel() == 0 or boxes2.numel() == 0:
+        return boxes1.new_zeros((boxes1.shape[0], boxes2.shape[0]))
+    area1 = (boxes1[:, 2:] - boxes1[:, :2]).clamp_min(0).prod(dim=-1)
+    area2 = (boxes2[:, 2:] - boxes2[:, :2]).clamp_min(0).prod(dim=-1)
+    left_top = torch.maximum(boxes1[:, None, :2], boxes2[None, :, :2])
+    right_bottom = torch.minimum(boxes1[:, None, 2:], boxes2[None, :, 2:])
+    intersection = (right_bottom - left_top).clamp_min(0).prod(dim=-1)
+    return intersection / (
+        area1[:, None] + area2[None, :] - intersection
+    ).clamp_min(1e-12)
+
+
+def classify_rare_detections(
+    detection_boxes,
+    detection_scores,
+    detection_classes,
+    gt_boxes,
+    gt_classes,
+    *,
+    negative_classes,
+    not_exhaustive_classes,
+    iou_threshold,
+    background_iou,
+):
+    """Greedily classify score-ordered rare detections into TP/FP reasons.
+
+    Category ids are zero based.  Unmatched detections for categories that LVIS
+    does not exhaustively verify in an image are marked ignored rather than
+    counted as false positives.
+    """
+    if not 0.0 <= background_iou < iou_threshold <= 1.0:
+        raise ValueError("require 0 <= background_iou < iou_threshold <= 1")
+    if (
+        detection_boxes.shape[0] != detection_scores.numel()
+        or detection_scores.numel() != detection_classes.numel()
+    ):
+        raise ValueError("detection tensors must contain the same number of rows")
+    if gt_boxes.shape[0] != gt_classes.numel():
+        raise ValueError("GT tensors must contain the same number of rows")
+
+    order = detection_scores.argsort(descending=True)
+    overlaps = pairwise_iou(detection_boxes, gt_boxes)
+    matched_gt = set()
+    positive_classes = set(gt_classes.tolist())
+    results = []
+    for detection_index in order.tolist():
+        category = int(detection_classes[detection_index])
+        score = float(detection_scores[detection_index])
+        row = overlaps[detection_index]
+        same_indices = torch.nonzero(
+            gt_classes == category, as_tuple=False
+        ).flatten()
+        same_ious = row[same_indices] if same_indices.numel() else row.new_empty((0,))
+
+        available = [
+            int(gt_index)
+            for gt_index, iou in zip(same_indices.tolist(), same_ious.tolist())
+            if iou >= iou_threshold and int(gt_index) not in matched_gt
+        ]
+        if available:
+            best_match = max(available, key=lambda index: float(row[index]))
+            matched_gt.add(best_match)
+            outcome = "tp"
+        elif category in not_exhaustive_classes:
+            outcome = "ignored_not_exhaustive"
+        elif category not in positive_classes and category not in negative_classes:
+            outcome = "ignored_unknown"
+        elif same_ious.numel() and float(same_ious.max()) >= iou_threshold:
+            outcome = "duplicate"
+        else:
+            different = row[gt_classes != category]
+            if different.numel() and float(different.max()) >= iou_threshold:
+                outcome = "classification"
+            elif row.numel() and float(row.max()) >= background_iou:
+                outcome = "localization"
+            else:
+                outcome = "background"
+        # Keep millions of full-validation records compact in memory.
+        results.append((category, score, outcome))
+    return results
+
+
+def _summarize_outcomes(records):
+    counts = Counter(record[2] for record in records)
+    evaluated = sum(
+        count for outcome, count in counts.items() if not outcome.startswith("ignored_")
+    )
+    true_positives = counts["tp"]
+    false_positives = evaluated - true_positives
+    fp_types = {
+        key: int(counts[key])
+        for key in ("duplicate", "classification", "localization", "background")
+    }
+    return {
+        "detections": len(records),
+        "evaluated": evaluated,
+        "true_positives": int(true_positives),
+        "false_positives": int(false_positives),
+        "diagnostic_precision": safe_ratio(true_positives, evaluated),
+        "false_positive_types": fp_types,
+        "false_positive_fractions": {
+            key: safe_ratio(value, false_positives) for key, value in fp_types.items()
+        },
+        "ignored_not_exhaustive": int(counts["ignored_not_exhaustive"]),
+        "ignored_unknown": int(counts["ignored_unknown"]),
+    }
+
+
+def summarize_rare_false_positives(records):
+    """Summarize all selected predictions and the AP-relevant score prefix.
+
+    For each category, predictions below its last true positive cannot create a
+    later recall increase.  The per-category prefix through the last TP is
+    therefore more informative than counting every low-score tail prediction.
+    Categories without a TP retain their complete evaluated list.
+    """
+    by_class = defaultdict(list)
+    for record in records:
+        by_class[int(record[0])].append(record)
+    relevant = []
+    categories_without_tp = 0
+    for class_records in by_class.values():
+        ordered = sorted(class_records, key=lambda item: item[1], reverse=True)
+        evaluated_indices = [
+            index
+            for index, item in enumerate(ordered)
+            if not item[2].startswith("ignored_")
+        ]
+        true_positive_indices = [
+            index for index in evaluated_indices if ordered[index][2] == "tp"
+        ]
+        if true_positive_indices:
+            relevant.extend(ordered[: max(true_positive_indices) + 1])
+        else:
+            categories_without_tp += 1
+            relevant.extend(ordered)
+    return {
+        "all_selected": _summarize_outcomes(records),
+        "through_last_true_positive_per_category": _summarize_outcomes(relevant),
+        "categories_with_predictions": len(by_class),
+        "categories_without_true_positive": categories_without_tp,
+    }
 
 
 def make_accumulator(thresholds):
@@ -210,8 +356,47 @@ def print_report(report, thresholds, profile, max_dets):
         print(f"rare_localization_miss_rate: {localization}")
         print(f"rare_post_proposal_miss_rate: {post_proposal}")
     print(
-        "\nScope: coverage upper bounds only. This report does not measure false-positive "
-        "precision errors or exact 1203-way ranks below the cached top-k."
+        "\nRecall scope: coverage upper bounds only; the compact cache cannot "
+        "recover exact 1203-way ranks below its candidate pool."
+    )
+
+
+def print_false_positive_report(report, iou_threshold, background_iou):
+    print(f"\n=== Rare top-300 precision-side decomposition @IoU={iou_threshold:.2f} ===")
+    print(
+        "LVIS unknown/not-exhaustive detections are ignored. 'localization' "
+        f"means max GT IoU is in [{background_iou:.2f}, {iou_threshold:.2f})."
+    )
+    print(
+        f"{'scope':>38} {'eval':>9} {'TP':>8} {'FP':>9} {'prec%':>8} "
+        f"{'dup%':>8} {'cls%':>8} {'loc%':>8} {'bg%':>8}"
+    )
+    for label, key in (
+        ("all selected rare detections", "all_selected"),
+        ("per-class prefix through last TP", "through_last_true_positive_per_category"),
+    ):
+        row = report[key]
+        fractions = row["false_positive_fractions"]
+        print(
+            f"{label:>38} {row['evaluated']:9d} {row['true_positives']:8d} "
+            f"{row['false_positives']:9d} "
+            f"{100.0 * (row['diagnostic_precision'] or 0.0):8.2f} "
+            f"{100.0 * (fractions['duplicate'] or 0.0):8.2f} "
+            f"{100.0 * (fractions['classification'] or 0.0):8.2f} "
+            f"{100.0 * (fractions['localization'] or 0.0):8.2f} "
+            f"{100.0 * (fractions['background'] or 0.0):8.2f}"
+        )
+    all_selected = report["all_selected"]
+    print(f"ignored_not_exhaustive: {all_selected['ignored_not_exhaustive']}")
+    print(f"ignored_unknown: {all_selected['ignored_unknown']}")
+    print(f"categories_with_predictions: {report['categories_with_predictions']}")
+    print(
+        "categories_without_true_positive: "
+        f"{report['categories_without_true_positive']}"
+    )
+    print(
+        "The prefix table is diagnostic, not official AP: it identifies which "
+        "high-ranked FP types precede useful recall."
     )
 
 
@@ -221,12 +406,18 @@ def main():
     parser.add_argument("--profile", default="current_power")
     parser.add_argument("--max-dets", type=int, default=300)
     parser.add_argument("--iou-thresholds", type=float, nargs="+", default=[0.5, 0.75])
+    parser.add_argument("--fp-iou-threshold", type=float, default=0.5)
+    parser.add_argument("--fp-background-iou", type=float, default=0.1)
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
 
     thresholds = sorted(set(float(value) for value in args.iou_thresholds))
     if any(value <= 0.0 or value > 1.0 for value in thresholds):
         raise ValueError("IoU thresholds must be within (0,1]")
+    if not 0.0 <= args.fp_background_iou < args.fp_iou_threshold <= 1.0:
+        raise ValueError(
+            "require 0 <= --fp-background-iou < --fp-iou-threshold <= 1"
+        )
     dump_dir = Path(args.dump_dir)
     manifest = json.loads((dump_dir / "manifest.json").read_text(encoding="utf-8"))
     if args.max_dets > int(manifest["topk_per_profile"]):
@@ -260,16 +451,30 @@ def main():
         if bbox[2] <= 0 or bbox[3] <= 0:
             continue
         annotations_by_image[int(annotation["image_id"])].append(annotation)
+    images_by_id = {
+        int(image["id"]): image for image in annotation_data["images"]
+    }
 
     num_classes = max(max(categories), max(manifest["novel_class_ids"]) + 1)
     novel_mask = torch.zeros(num_classes, dtype=torch.bool)
     novel_mask[torch.tensor(manifest["novel_class_ids"], dtype=torch.long)] = True
     accumulator = make_accumulator(thresholds)
+    rare_detection_records = []
 
     for index, path in enumerate(files):
         payload = load_tensor_file(path)
         image_id = int(payload["image_id"])
         annotations = annotations_by_image.get(image_id, [])
+        query_boxes = normalized_cxcywh_to_xyxy(
+            payload["query_boxes"],
+            int(payload["width"]),
+            int(payload["height"]),
+        )
+        (
+            selected_query_ids,
+            selected_class_ids,
+            selected_log_scores,
+        ) = selected_pairs(payload, profile, novel_mask, args.max_dets, path)
         if annotations:
             gt_boxes = xywh_to_xyxy(
                 torch.tensor([item["bbox"] for item in annotations], dtype=torch.float32)
@@ -277,14 +482,6 @@ def main():
             gt_classes = torch.tensor(
                 [int(item["category_id"]) - 1 for item in annotations],
                 dtype=torch.long,
-            )
-            query_boxes = normalized_cxcywh_to_xyxy(
-                payload["query_boxes"],
-                int(payload["width"]),
-                int(payload["height"]),
-            )
-            selected_query_ids, selected_class_ids = selected_pairs(
-                payload, profile, novel_mask, args.max_dets, path
             )
             best_iou, stages = detection_stage_hits(
                 query_boxes,
@@ -300,16 +497,63 @@ def main():
                 best_iou,
                 stages,
             )
+
+        rare_prediction_mask = torch.tensor(
+            [frequencies[int(class_id) + 1] == "r" for class_id in selected_class_ids],
+            dtype=torch.bool,
+        )
+        if rare_prediction_mask.any():
+            rare_query_ids = selected_query_ids[rare_prediction_mask]
+            rare_classes = selected_class_ids[rare_prediction_mask]
+            rare_boxes = query_boxes[rare_query_ids]
+            rare_scores = selected_log_scores[rare_prediction_mask].exp()
+            if annotations:
+                fp_gt_boxes = gt_boxes
+                fp_gt_classes = gt_classes
+            else:
+                fp_gt_boxes = query_boxes.new_empty((0, 4))
+                fp_gt_classes = selected_class_ids.new_empty((0,))
+            image_metadata = images_by_id[image_id]
+            rare_detection_records.extend(
+                classify_rare_detections(
+                    rare_boxes,
+                    rare_scores,
+                    rare_classes,
+                    fp_gt_boxes,
+                    fp_gt_classes,
+                    negative_classes={
+                        int(value) - 1
+                        for value in image_metadata.get("neg_category_ids", [])
+                    },
+                    not_exhaustive_classes={
+                        int(value) - 1
+                        for value in image_metadata.get(
+                            "not_exhaustive_category_ids", []
+                        )
+                    },
+                    iou_threshold=args.fp_iou_threshold,
+                    background_iou=args.fp_background_iou,
+                )
+            )
         if (index + 1) % 500 == 0:
             print(f"loaded {index + 1}/{len(files)} images", flush=True)
 
     report = finalize(accumulator, thresholds)
     print_report(report, thresholds, args.profile, args.max_dets)
+    rare_false_positive_report = summarize_rare_false_positives(
+        rare_detection_records
+    )
+    print_false_positive_report(
+        rare_false_positive_report,
+        args.fp_iou_threshold,
+        args.fp_background_iou,
+    )
     payload = {
         "dump_dir": str(dump_dir),
         "profile": args.profile,
         "max_dets": args.max_dets,
         "report": report,
+        "rare_false_positive_decomposition": rare_false_positive_report,
     }
     if args.output:
         output_path = Path(args.output)

@@ -9,8 +9,10 @@ compares the true-class ranking of three detector-side text representations:
 * ``prompt_mean``: the original prompt bank averaged into one vector.
 
 It additionally measures the exact 1203-way category rank after the current
-detector/CLIP fusion and whether that best-query/category pair survives the
-image-level top-k selection.
+detector/CLIP fusion. Recall-side hits use score-ordered one-to-one GT matching;
+misses use the highest-scoring true-class query among *all* queries whose IoU
+reaches the threshold. This avoids assuming that the best-IoU query is also the
+semantic best query.
 
 It also measures posterior sharpness and slot usage for the true class. This
 separates "the prototype vectors have high rank" from "visual instances
@@ -111,6 +113,91 @@ def box_iou(boxes1, boxes2):
     right_bottom = torch.minimum(boxes1[:, None, 2:], boxes2[None, :, 2:])
     intersection = (right_bottom - left_top).clamp_min(0).prod(dim=-1)
     return intersection / (area1[:, None] + area2[None, :] - intersection).clamp_min(1e-12)
+
+
+def semantic_best_queries(overlaps, class_ids, class_scores, min_iou):
+    """Select the strongest true-class query among localization-valid queries.
+
+    Args:
+        overlaps: Pairwise GT/query IoU with shape ``[G, Q]``.
+        class_ids: True category for each GT, shape ``[G]``.
+        class_scores: Final scores with shape ``[Q, C]``.
+        min_iou: Minimum IoU for an eligible query.
+
+    Returns:
+        ``(valid, query_ids, selected_ious)``.  The latter two tensors contain
+        only GTs for which at least one eligible query exists.
+    """
+    if overlaps.ndim != 2 or class_scores.ndim != 2 or class_ids.ndim != 1:
+        raise ValueError("expected overlaps [G,Q], class_ids [G], scores [Q,C]")
+    if overlaps.shape[0] != class_ids.numel():
+        raise ValueError("GT dimension differs between overlaps and class_ids")
+    if overlaps.shape[1] != class_scores.shape[0]:
+        raise ValueError("query dimension differs between overlaps and scores")
+    if class_ids.numel() and int(class_ids.max()) >= class_scores.shape[1]:
+        raise ValueError("class id exceeds class score dimension")
+
+    eligible = overlaps >= float(min_iou)
+    valid = eligible.any(dim=1)
+    if not valid.any():
+        empty_ids = class_ids.new_empty((0,))
+        return valid, empty_ids, overlaps.new_empty((0,))
+    true_scores = class_scores[:, class_ids].t()
+    masked_scores = true_scores.masked_fill(~eligible, -torch.inf)
+    selected_queries = masked_scores[valid].argmax(dim=1)
+    valid_rows = torch.nonzero(valid, as_tuple=False).flatten()
+    selected_ious = overlaps[valid_rows, selected_queries]
+    return valid, selected_queries, selected_ious
+
+
+def true_class_topk_hits(eligible, class_ids, flat_topk_ids, num_classes):
+    """Whether any eligible true-class query appears in a flat image top-k."""
+    if eligible.ndim != 2 or class_ids.ndim != 1 or flat_topk_ids.ndim != 1:
+        raise ValueError("expected eligible [G,Q], class_ids [G], topk ids [K]")
+    if eligible.shape[0] != class_ids.numel():
+        raise ValueError("GT dimension differs between eligible and class_ids")
+    query_ids = torch.div(flat_topk_ids, num_classes, rounding_mode="floor")
+    selected_classes = flat_topk_ids % num_classes
+    return (
+        eligible[:, query_ids]
+        & (class_ids[:, None] == selected_classes[None, :])
+    ).any(dim=1)
+
+
+def greedy_gt_topk_matches(
+    overlaps,
+    class_ids,
+    flat_topk_ids,
+    num_classes,
+    min_iou,
+):
+    """One-to-one score-ordered GT matching for an image-level pair top-k.
+
+    ``flat_topk_ids`` must already be ordered from highest to lowest score.
+    The returned query id is ``-1`` for an unmatched GT.
+    """
+    if overlaps.ndim != 2 or class_ids.ndim != 1 or flat_topk_ids.ndim != 1:
+        raise ValueError("expected overlaps [G,Q], class_ids [G], topk ids [K]")
+    if overlaps.shape[0] != class_ids.numel():
+        raise ValueError("GT dimension differs between overlaps and class_ids")
+    hits = torch.zeros_like(class_ids, dtype=torch.bool)
+    matched_queries = torch.full_like(class_ids, -1)
+    for flat_id in flat_topk_ids.tolist():
+        query_id = int(flat_id) // int(num_classes)
+        category_id = int(flat_id) % int(num_classes)
+        candidates = (
+            (~hits)
+            & (class_ids == category_id)
+            & (overlaps[:, query_id] >= float(min_iou))
+        )
+        if not candidates.any():
+            continue
+        candidate_ids = torch.nonzero(candidates, as_tuple=False).flatten()
+        best_local = overlaps[candidate_ids, query_id].argmax()
+        gt_index = candidate_ids[best_local]
+        hits[gt_index] = True
+        matched_queries[gt_index] = query_id
+    return hits, matched_queries
 
 
 def update_ranking_stats(accumulator, logits, class_ids, frequencies):
@@ -286,9 +373,10 @@ def finalize_selection_accumulator(accumulator, cutoff):
 
 
 def print_selection_report(report, topk, cutoff):
-    print("\n=== Best-query fused category rank vs image-level selection ===")
+    print("\n=== One-to-one TP / semantic-best miss category rank ===")
     print(
-        f"Only GTs with best-query IoU >= threshold are included; image top-k={topk}."
+        "Hits use score-ordered one-to-one GT matches; misses use the strongest "
+        f"localization-valid true-class query; image top-k={topk}."
     )
     print(
         f"{'split':>6} {'N':>7} {'median-rank':>12} {'p90-rank':>10} "
@@ -306,7 +394,7 @@ def print_selection_report(report, topk, cutoff):
             f"{100.0 * row['miss_despite_rank_cutoff_fraction']:14.2f}"
         )
     rare = report.get("r", {})
-    print("\n=== Rare best-query bottleneck verdict ===")
+    print("\n=== Rare semantic-best bottleneck verdict ===")
     if not rare.get("count") or not rare.get("global_missed"):
         print("verdict: INSUFFICIENT_RARE_MISSES")
         return "INSUFFICIENT_RARE_MISSES"
@@ -320,7 +408,8 @@ def print_selection_report(report, topk, cutoff):
         verdict = "MIXED_CATEGORY_AND_GLOBAL_RANKING"
     print(f"verdict: {verdict}")
     print(
-        f"Among missed best-query pairs, {100.0 * category_fraction:.2f}% have "
+        f"Among genuinely missed localization-valid pairs, "
+        f"{100.0 * category_fraction:.2f}% have "
         f"true-class rank > {cutoff}; {100.0 * global_fraction:.2f}% are already "
         f"within top-{cutoff} but are displaced at image-level top-k."
     )
@@ -335,7 +424,7 @@ def make_component_accumulator():
         "topk_threshold",
         "score_margin",
         "log_score_margin",
-        "best_iou",
+        "selected_iou",
         "category_rank",
     )
     return {
@@ -354,7 +443,7 @@ def update_component_accumulator(
     vlm_probabilities,
     fused_scores,
     topk_threshold,
-    best_ious,
+    selected_ious,
     category_ranks,
     survives,
     frequencies,
@@ -369,7 +458,7 @@ def update_component_accumulator(
         "score_margin": fused_scores - thresholds,
         "log_score_margin": fused_scores.clamp_min(eps).log()
         - thresholds.clamp_min(eps).log(),
-        "best_iou": best_ious,
+        "selected_iou": selected_ious,
         "category_rank": category_ranks.float(),
     }
     cpu_values = {
@@ -431,10 +520,10 @@ def finalize_component_accumulator(accumulator):
         all_values = statuses["all"]
         split_report["correlation"] = {
             "pearson_iou_log_margin": correlation(
-                all_values["best_iou"], all_values["log_score_margin"]
+                all_values["selected_iou"], all_values["log_score_margin"]
             ),
             "spearman_iou_log_margin": correlation(
-                ordinal_ranks(all_values["best_iou"]),
+                ordinal_ranks(all_values["selected_iou"]),
                 ordinal_ranks(all_values["log_score_margin"]),
             ),
         }
@@ -481,7 +570,10 @@ def component_branch_verdict(report, *, detector_weight, vlm_weight):
 
 def print_component_report(report, verdict):
     print("\n=== Correct-pair score components: hit vs miss ===")
-    print("A hit means the best-IoU query/true-class pair survives image top-k.")
+    print(
+        "Hits use score-ordered one-to-one GT matches; misses use the strongest "
+        "localization-valid true-class candidate."
+    )
     print(
         f"{'split':>6} {'status':>6} {'N':>6} {'det-med':>10} {'vlm-med':>10} "
         f"{'fused-med':>11} {'thr-med':>10} {'logmargin-med':>14} {'IoU-med':>9}"
@@ -499,12 +591,156 @@ def print_component_report(report, verdict):
                 f"{row['fused_score']['median']:11.6f} "
                 f"{row['topk_threshold']['median']:10.6f} "
                 f"{row['log_score_margin']['median']:14.4f} "
-                f"{row['best_iou']['median']:9.4f}"
+                f"{row['selected_iou']['median']:9.4f}"
             )
     print("\n=== Rare score-component verdict ===")
     for key, value in verdict.items():
         print(f"{key}: {value}")
     print("rare_iou_margin_correlation:", report["r"]["correlation"])
+
+
+def make_complementarity_accumulator():
+    return {
+        split: Counter(
+            {
+                "proposal_valid": 0,
+                "current_hit": 0,
+                "current_miss": 0,
+                "detector_only": 0,
+                "vlm_only": 0,
+                "both": 0,
+                "neither": 0,
+            }
+        )
+        for split in ("all", "r", "c", "f")
+    }
+
+
+def update_complementarity_accumulator(
+    accumulator,
+    *,
+    valid,
+    current_hits,
+    detector_hits,
+    vlm_hits,
+    frequencies,
+):
+    """Partition genuine current misses by isolated component top-k recall."""
+    for index, frequency in enumerate(frequencies):
+        if not bool(valid[index]):
+            continue
+        current = bool(current_hits[index])
+        detector = bool(detector_hits[index])
+        vlm = bool(vlm_hits[index])
+        for split in ("all", frequency):
+            row = accumulator[split]
+            row["proposal_valid"] += 1
+            if current:
+                row["current_hit"] += 1
+                continue
+            row["current_miss"] += 1
+            if detector and vlm:
+                row["both"] += 1
+            elif detector:
+                row["detector_only"] += 1
+            elif vlm:
+                row["vlm_only"] += 1
+            else:
+                row["neither"] += 1
+
+
+def finalize_complementarity_accumulator(accumulator):
+    report = {}
+    for split, source in accumulator.items():
+        row = {key: int(value) for key, value in source.items()}
+        missed = row["current_miss"]
+        exclusive = row["detector_only"] + row["vlm_only"]
+        rescued = exclusive + row["both"]
+        row.update(
+            {
+                "current_recall_given_proposal": (
+                    row["current_hit"] / row["proposal_valid"]
+                    if row["proposal_valid"]
+                    else None
+                ),
+                "detector_only_fraction_of_misses": (
+                    row["detector_only"] / missed if missed else None
+                ),
+                "vlm_only_fraction_of_misses": (
+                    row["vlm_only"] / missed if missed else None
+                ),
+                "both_fraction_of_misses": row["both"] / missed if missed else None,
+                "neither_fraction_of_misses": (
+                    row["neither"] / missed if missed else None
+                ),
+                "exclusive_complementarity_fraction": (
+                    exclusive / missed if missed else None
+                ),
+                "any_component_rescue_fraction": (
+                    rescued / missed if missed else None
+                ),
+            }
+        )
+        report[split] = row
+    return report
+
+
+def complementarity_verdict(report):
+    rare = report["r"]
+    if not rare.get("current_miss"):
+        return "INSUFFICIENT_RARE_MISSES"
+    neither = rare["neither_fraction_of_misses"]
+    exclusive = rare["exclusive_complementarity_fraction"]
+    both = rare["both_fraction_of_misses"]
+    if neither >= 0.8:
+        return "COMPONENTS_JOINTLY_WEAK"
+    if exclusive >= 0.2:
+        return "COMPLEMENTARY_COMPONENTS"
+    if both >= 0.2:
+        return "POWER_FUSION_CALIBRATION_SUSPECT"
+    return "MIXED_LOW_COMPLEMENTARITY"
+
+
+def print_complementarity_report(report):
+    print("\n=== Actual-candidate detector/CLIP complementarity ===")
+    print(
+        "Rows partition current misses after proposal coverage. Component hits "
+        "use their own image-level top-k with the same novel scale."
+    )
+    print(
+        f"{'split':>6} {'valid':>7} {'cur-hit%':>9} {'miss':>7} "
+        f"{'det-only%':>10} {'vlm-only%':>10} {'both%':>8} {'neither%':>10}"
+    )
+    for split in ("all", "r", "c", "f"):
+        row = report[split]
+        if not row["proposal_valid"]:
+            continue
+        print(
+            f"{split:>6} {row['proposal_valid']:7d} "
+            f"{100.0 * row['current_recall_given_proposal']:9.2f} "
+            f"{row['current_miss']:7d} "
+            f"{100.0 * (row['detector_only_fraction_of_misses'] or 0.0):10.2f} "
+            f"{100.0 * (row['vlm_only_fraction_of_misses'] or 0.0):10.2f} "
+            f"{100.0 * (row['both_fraction_of_misses'] or 0.0):8.2f} "
+            f"{100.0 * (row['neither_fraction_of_misses'] or 0.0):10.2f}"
+        )
+    verdict = complementarity_verdict(report)
+    print("\n=== Rare complementarity verdict ===")
+    print(f"verdict: {verdict}")
+    if report["r"].get("current_miss"):
+        print(
+            "exclusive_complementarity_fraction: "
+            f"{report['r']['exclusive_complementarity_fraction']}"
+        )
+        print(
+            "any_component_rescue_fraction: "
+            f"{report['r']['any_component_rescue_fraction']}"
+        )
+    print(
+        "Screening only: a component rescue rate does not establish an AP gain; "
+        "false positives must be checked separately."
+    )
+    return verdict
 
 
 def main():
@@ -602,6 +838,7 @@ def main():
     }
     selection_accumulator = make_selection_accumulator()
     component_accumulator = make_component_accumulator()
+    complementarity_accumulator = make_complementarity_accumulator()
     occupancy = {
         "images": 0,
         "unique_queries": [],
@@ -684,6 +921,41 @@ def main():
                     for class_id in top_class_ids.tolist()
                 )
 
+                image_vlm_logits = (
+                    roi_features[local_index]
+                    @ model.vlm_content_query_embedding.t()
+                    * float(model.vlm_temperature)
+                )
+                image_vlm_probabilities = image_vlm_logits.softmax(dim=-1)
+                recomputed_fused_scores = fuse_detector_vlm_scores(
+                    detector_logits[local_index].float(),
+                    image_vlm_logits,
+                    novel_mask,
+                    fusion="power",
+                    base_weight=float(model.alpha),
+                    novel_weight=float(model.beta),
+                    novel_scale=float(model.novel_scale),
+                ).exp()
+                fusion_max_error = max(
+                    fusion_max_error,
+                    float((recomputed_fused_scores - image_scores).abs().max().item()),
+                )
+                scale_by_class = torch.where(
+                    novel_mask,
+                    image_scores.new_tensor(float(model.novel_scale)),
+                    image_scores.new_tensor(1.0),
+                )
+                detector_component_scores = (
+                    detector_logits[local_index].float().sigmoid() * scale_by_class
+                )
+                vlm_component_scores = image_vlm_probabilities * scale_by_class
+                detector_top_ids = detector_component_scores.reshape(-1).topk(
+                    min(args.image_topk, detector_component_scores.numel())
+                ).indices
+                vlm_top_ids = vlm_component_scores.reshape(-1).topk(
+                    min(args.image_topk, vlm_component_scores.numel())
+                ).indices
+
                 record = records_by_id[model_input["image_id"]]
                 annotations = record.get("annotations", [])
                 if not annotations:
@@ -716,6 +988,48 @@ def main():
                 overlaps = box_iou(gt_boxes, predicted)
                 best_iou, best_query = overlaps.max(dim=1)
                 valid = best_iou >= args.min_iou
+                semantic_valid, semantic_queries, _ = semantic_best_queries(
+                    overlaps,
+                    gt_classes,
+                    image_scores,
+                    args.min_iou,
+                )
+                if not torch.equal(valid, semantic_valid):
+                    raise RuntimeError("proposal-valid masks disagree")
+
+                current_hits, current_matched_queries = greedy_gt_topk_matches(
+                    overlaps,
+                    gt_classes,
+                    top_flat_ids,
+                    image_scores.shape[-1],
+                    args.min_iou,
+                )
+                detector_hits, _ = greedy_gt_topk_matches(
+                    overlaps,
+                    gt_classes,
+                    detector_top_ids,
+                    image_scores.shape[-1],
+                    args.min_iou,
+                )
+                vlm_hits, _ = greedy_gt_topk_matches(
+                    overlaps,
+                    gt_classes,
+                    vlm_top_ids,
+                    image_scores.shape[-1],
+                    args.min_iou,
+                )
+                all_frequencies = [
+                    frequencies_by_class[class_id]
+                    for class_id in gt_classes.tolist()
+                ]
+                update_complementarity_accumulator(
+                    complementarity_accumulator,
+                    valid=valid,
+                    current_hits=current_hits,
+                    detector_hits=detector_hits,
+                    vlm_hits=vlm_hits,
+                    frequencies=all_frequencies,
+                )
                 if not valid.any():
                     continue
 
@@ -752,67 +1066,66 @@ def main():
                     )
 
                 fused_selected_scores = image_scores[selected_queries]
-                fused_ranks = update_ranking_stats(
+                update_ranking_stats(
                     ranking["fused_current"],
                     fused_selected_scores,
                     selected_classes,
                     selected_frequencies,
                 )
-                true_pair_ids = (
-                    selected_queries * image_scores.shape[-1] + selected_classes
-                )
-                survives_global_topk = (
-                    true_pair_ids[:, None] == top_flat_ids[None, :]
-                ).any(dim=1)
+
+                semantic_classes = gt_classes[semantic_valid]
+                semantic_frequencies = [
+                    frequencies_by_class[class_id]
+                    for class_id in semantic_classes.tolist()
+                ]
+                # Use the actual one-to-one matched query for TPs and the
+                # strongest localization-valid true-class query for misses.
+                analysis_queries = semantic_queries.clone()
+                hit_among_valid = current_hits[semantic_valid]
+                analysis_queries[hit_among_valid] = current_matched_queries[
+                    semantic_valid
+                ][hit_among_valid]
+                valid_rows = torch.nonzero(
+                    semantic_valid, as_tuple=False
+                ).flatten()
+                analysis_ious = overlaps[valid_rows, analysis_queries]
+                semantic_scores = image_scores[analysis_queries]
+                semantic_true_scores = semantic_scores.gather(
+                    1, semantic_classes[:, None]
+                ).squeeze(1)
+                semantic_ranks = 1 + (
+                    semantic_scores > semantic_true_scores[:, None]
+                ).sum(dim=-1)
+                survives_global_topk = current_hits[semantic_valid]
                 update_selection_accumulator(
                     selection_accumulator,
-                    fused_ranks,
+                    semantic_ranks,
                     survives_global_topk,
-                    selected_frequencies,
+                    semantic_frequencies,
                     args.category_rank_cutoff,
                 )
 
-                image_vlm_logits = (
-                    roi_features[local_index]
-                    @ model.vlm_content_query_embedding.t()
-                    * float(model.vlm_temperature)
-                )
-                image_vlm_probabilities = image_vlm_logits.softmax(dim=-1)
-                recomputed_fused_scores = fuse_detector_vlm_scores(
-                    detector_logits[local_index].float(),
-                    image_vlm_logits,
-                    novel_mask,
-                    fusion="power",
-                    base_weight=float(model.alpha),
-                    novel_weight=float(model.beta),
-                    novel_scale=float(model.novel_scale),
-                ).exp()
-                fusion_max_error = max(
-                    fusion_max_error,
-                    float((recomputed_fused_scores - image_scores).abs().max().item()),
-                )
                 row_ids = torch.arange(
-                    selected_classes.numel(), device=selected_classes.device
+                    semantic_classes.numel(), device=semantic_classes.device
                 )
-                detector_true_probabilities = current_logits.sigmoid()[
-                    row_ids, selected_classes
+                detector_true_probabilities = detector_logits[
+                    local_index, analysis_queries
+                ].float().sigmoid()[
+                    row_ids, semantic_classes
                 ]
                 vlm_true_probabilities = image_vlm_probabilities[
-                    selected_queries, selected_classes
-                ]
-                fused_true_scores = fused_selected_scores[
-                    row_ids, selected_classes
+                    analysis_queries, semantic_classes
                 ]
                 update_component_accumulator(
                     component_accumulator,
                     detector_probabilities=detector_true_probabilities,
                     vlm_probabilities=vlm_true_probabilities,
-                    fused_scores=fused_true_scores,
+                    fused_scores=semantic_true_scores,
                     topk_threshold=float(top_values[-1]),
-                    best_ious=best_iou[valid],
-                    category_ranks=fused_ranks,
+                    selected_ious=analysis_ious,
+                    category_ranks=semantic_ranks,
                     survives=survives_global_topk,
-                    frequencies=selected_frequencies,
+                    frequencies=semantic_frequencies,
                 )
 
                 weights = true_class_mode_weights(
@@ -859,6 +1172,12 @@ def main():
     )
     component_verdict["fusion_recompute_max_abs_error"] = fusion_max_error
     print_component_report(component_report, component_verdict)
+    complementarity_report = finalize_complementarity_accumulator(
+        complementarity_accumulator
+    )
+    complementarity_result = print_complementarity_report(
+        complementarity_report
+    )
     total_pairs = sum(occupancy["frequency_pair_counts"].values())
     occupancy_report = {
         "images": occupancy["images"],
@@ -967,6 +1286,8 @@ def main():
         "selection_verdict": ranking_verdict,
         "score_components": component_report,
         "score_component_verdict": component_verdict,
+        "complementarity": complementarity_report,
+        "complementarity_verdict": complementarity_result,
         "topk_occupancy": occupancy_report,
         "mode_utilization": mode_report,
         "verdict": verdict,
