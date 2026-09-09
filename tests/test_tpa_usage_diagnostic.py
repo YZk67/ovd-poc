@@ -1,13 +1,18 @@
 from collections import defaultdict
 
+import pytest
 import torch
 
 from tools.diagnose_tpa_usage import (
+    component_branch_verdict,
+    finalize_component_accumulator,
     finalize_ranking_stats,
     finalize_selection_accumulator,
     make_selection_accumulator,
+    make_component_accumulator,
     select_dataset_records,
     update_ranking_stats,
+    update_component_accumulator,
     update_selection_accumulator,
 )
 
@@ -61,3 +66,32 @@ def test_rare_sampling_keeps_every_rare_image_when_num_images_is_zero():
         frequencies=["r", "f"],
     )
     assert [record["image_id"] for record in selected] == [1, 3]
+
+
+def test_component_report_separates_hit_and_miss_branch_scores():
+    accumulator = make_component_accumulator()
+    update_component_accumulator(
+        accumulator,
+        detector_probabilities=torch.tensor([0.8, 0.2]),
+        vlm_probabilities=torch.tensor([0.4, 0.1]),
+        fused_scores=torch.tensor([0.5, 0.05]),
+        topk_threshold=0.1,
+        best_ious=torch.tensor([0.8, 0.6]),
+        category_ranks=torch.tensor([1, 10]),
+        survives=torch.tensor([True, False]),
+        frequencies=["r", "r"],
+    )
+    report = finalize_component_accumulator(accumulator)
+    assert report["r"]["hit"]["detector_probability"]["median"] == pytest.approx(0.8)
+    assert report["r"]["miss"]["detector_probability"]["median"] == pytest.approx(0.2)
+    assert report["r"]["hit"]["log_score_margin"]["median"] == pytest.approx(
+        torch.log(torch.tensor(5.0)).item()
+    )
+
+    verdict = component_branch_verdict(
+        report, detector_weight=0.7, vlm_weight=0.3
+    )
+    assert verdict["verdict"] == "DETECTOR_COMPONENT_DOMINANT"
+    assert verdict["detector_weighted_log_separation"] > verdict[
+        "vlm_weighted_log_separation"
+    ]

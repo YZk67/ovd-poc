@@ -34,6 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from lami_dino.diagnostic_ops import (  # noqa: E402
+    fuse_detector_vlm_scores,
     prototype_variant_logits,
     true_class_mode_weights,
 )
@@ -65,6 +66,16 @@ def install_capture_hooks(model, capture):
         return result
 
     classifier._compute_tpa_logits = capture_logits
+
+    original_extract = model.extract_region_feature
+
+    def capture_region_feature(features, bbox, layer_name):
+        result = original_extract(features, bbox, layer_name)
+        if layer_name == "p3":
+            capture["roi_features"] = result.detach()
+        return result
+
+    model.extract_region_feature = capture_region_feature
 
     original_inference = model.inference
 
@@ -316,6 +327,186 @@ def print_selection_report(report, topk, cutoff):
     return verdict
 
 
+def make_component_accumulator():
+    metrics = (
+        "detector_probability",
+        "vlm_probability",
+        "fused_score",
+        "topk_threshold",
+        "score_margin",
+        "log_score_margin",
+        "best_iou",
+        "category_rank",
+    )
+    return {
+        split: {
+            status: {metric: [] for metric in metrics}
+            for status in ("hit", "miss", "all")
+        }
+        for split in ("all", "r", "c", "f")
+    }
+
+
+def update_component_accumulator(
+    accumulator,
+    *,
+    detector_probabilities,
+    vlm_probabilities,
+    fused_scores,
+    topk_threshold,
+    best_ious,
+    category_ranks,
+    survives,
+    frequencies,
+):
+    eps = torch.finfo(torch.float32).tiny
+    thresholds = fused_scores.new_full(fused_scores.shape, float(topk_threshold))
+    values_by_metric = {
+        "detector_probability": detector_probabilities,
+        "vlm_probability": vlm_probabilities,
+        "fused_score": fused_scores,
+        "topk_threshold": thresholds,
+        "score_margin": fused_scores - thresholds,
+        "log_score_margin": fused_scores.clamp_min(eps).log()
+        - thresholds.clamp_min(eps).log(),
+        "best_iou": best_ious,
+        "category_rank": category_ranks.float(),
+    }
+    cpu_values = {
+        key: values.detach().float().cpu().tolist()
+        for key, values in values_by_metric.items()
+    }
+    for index, (survived, frequency) in enumerate(
+        zip(survives.tolist(), frequencies)
+    ):
+        status = "hit" if survived else "miss"
+        for split in ("all", frequency):
+            for metric, values in cpu_values.items():
+                value = float(values[index])
+                accumulator[split][status][metric].append(value)
+                accumulator[split]["all"][metric].append(value)
+
+
+def distribution_summary(values):
+    if not values:
+        return {"count": 0}
+    array = np.asarray(values, dtype=np.float64)
+    return {
+        "count": int(array.size),
+        "mean": float(array.mean()),
+        "p10": float(np.percentile(array, 10)),
+        "median": float(np.median(array)),
+        "p90": float(np.percentile(array, 90)),
+    }
+
+
+def correlation(x_values, y_values):
+    if len(x_values) < 2 or len(y_values) != len(x_values):
+        return None
+    x = np.asarray(x_values, dtype=np.float64)
+    y = np.asarray(y_values, dtype=np.float64)
+    if np.std(x) == 0.0 or np.std(y) == 0.0:
+        return None
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def ordinal_ranks(values):
+    values = np.asarray(values, dtype=np.float64)
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty(values.size, dtype=np.float64)
+    ranks[order] = np.arange(values.size, dtype=np.float64)
+    return ranks
+
+
+def finalize_component_accumulator(accumulator):
+    report = {}
+    for split, statuses in accumulator.items():
+        split_report = {
+            status: {
+                metric: distribution_summary(values)
+                for metric, values in metrics.items()
+            }
+            for status, metrics in statuses.items()
+        }
+        all_values = statuses["all"]
+        split_report["correlation"] = {
+            "pearson_iou_log_margin": correlation(
+                all_values["best_iou"], all_values["log_score_margin"]
+            ),
+            "spearman_iou_log_margin": correlation(
+                ordinal_ranks(all_values["best_iou"]),
+                ordinal_ranks(all_values["log_score_margin"]),
+            ),
+        }
+        report[split] = split_report
+    return report
+
+
+def component_branch_verdict(report, *, detector_weight, vlm_weight):
+    rare = report["r"]
+    hit = rare["hit"]
+    miss = rare["miss"]
+    if not hit["detector_probability"].get("count") or not miss[
+        "detector_probability"
+    ].get("count"):
+        return {
+            "verdict": "INSUFFICIENT_RARE_HIT_MISS_SAMPLES",
+            "detector_weighted_log_separation": None,
+            "vlm_weighted_log_separation": None,
+        }
+
+    eps = np.finfo(np.float64).tiny
+    detector_separation = float(detector_weight) * (
+        math.log(max(hit["detector_probability"]["median"], eps))
+        - math.log(max(miss["detector_probability"]["median"], eps))
+    )
+    vlm_separation = float(vlm_weight) * (
+        math.log(max(hit["vlm_probability"]["median"], eps))
+        - math.log(max(miss["vlm_probability"]["median"], eps))
+    )
+    positive_detector = max(detector_separation, 0.0)
+    positive_vlm = max(vlm_separation, 0.0)
+    if positive_detector > 1.25 * max(positive_vlm, 1e-12):
+        verdict = "DETECTOR_COMPONENT_DOMINANT"
+    elif positive_vlm > 1.25 * max(positive_detector, 1e-12):
+        verdict = "CLIP_COMPONENT_DOMINANT"
+    else:
+        verdict = "MIXED_DETECTOR_AND_CLIP_COMPONENTS"
+    return {
+        "verdict": verdict,
+        "detector_weighted_log_separation": detector_separation,
+        "vlm_weighted_log_separation": vlm_separation,
+    }
+
+
+def print_component_report(report, verdict):
+    print("\n=== Correct-pair score components: hit vs miss ===")
+    print("A hit means the best-IoU query/true-class pair survives image top-k.")
+    print(
+        f"{'split':>6} {'status':>6} {'N':>6} {'det-med':>10} {'vlm-med':>10} "
+        f"{'fused-med':>11} {'thr-med':>10} {'logmargin-med':>14} {'IoU-med':>9}"
+    )
+    for split in ("all", "r", "c", "f"):
+        for status in ("hit", "miss"):
+            row = report[split][status]
+            count = row["fused_score"].get("count", 0)
+            if not count:
+                continue
+            print(
+                f"{split:>6} {status:>6} {count:6d} "
+                f"{row['detector_probability']['median']:10.6f} "
+                f"{row['vlm_probability']['median']:10.6f} "
+                f"{row['fused_score']['median']:11.6f} "
+                f"{row['topk_threshold']['median']:10.6f} "
+                f"{row['log_score_margin']['median']:14.4f} "
+                f"{row['best_iou']['median']:9.4f}"
+            )
+    print("\n=== Rare score-component verdict ===")
+    for key, value in verdict.items():
+        print(f"{key}: {value}")
+    print("rare_iou_margin_correlation:", report["r"]["correlation"])
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -410,6 +601,7 @@ def main():
         )
     }
     selection_accumulator = make_selection_accumulator()
+    component_accumulator = make_component_accumulator()
     occupancy = {
         "images": 0,
         "unique_queries": [],
@@ -426,6 +618,8 @@ def main():
     matched_count = 0
     gt_count = 0
     lme_max_error = 0.0
+    fusion_max_error = 0.0
+    novel_mask = model.novel_idx.to(device=device)
 
     print(
         f"[run] {len(records)} images, sampling={args.sampling}, "
@@ -442,6 +636,7 @@ def main():
                 "prompt_features",
                 "query_boxes",
                 "final_scores",
+                "roi_features",
             }
             missing = required - set(capture)
             if missing:
@@ -453,6 +648,7 @@ def main():
             prototypes = capture["prototypes"]
             prompts = capture["prompt_features"]
             final_scores = capture["final_scores"].float()
+            roi_features = capture["roi_features"].float()
             if final_scores.shape != detector_logits.shape:
                 raise RuntimeError(
                     "final fused score shape does not match detector logits: "
@@ -462,7 +658,9 @@ def main():
             for local_index, model_input in enumerate(batched_inputs):
                 image_scores = final_scores[local_index]
                 selected_count = min(args.image_topk, image_scores.numel())
-                top_flat_ids = image_scores.reshape(-1).topk(selected_count).indices
+                top_values, top_flat_ids = image_scores.reshape(-1).topk(
+                    selected_count
+                )
                 top_query_ids = torch.div(
                     top_flat_ids, image_scores.shape[-1], rounding_mode="floor"
                 )
@@ -574,6 +772,49 @@ def main():
                     args.category_rank_cutoff,
                 )
 
+                image_vlm_logits = (
+                    roi_features[local_index]
+                    @ model.vlm_content_query_embedding.t()
+                    * float(model.vlm_temperature)
+                )
+                image_vlm_probabilities = image_vlm_logits.softmax(dim=-1)
+                recomputed_fused_scores = fuse_detector_vlm_scores(
+                    detector_logits[local_index].float(),
+                    image_vlm_logits,
+                    novel_mask,
+                    fusion="power",
+                    base_weight=float(model.alpha),
+                    novel_weight=float(model.beta),
+                    novel_scale=float(model.novel_scale),
+                ).exp()
+                fusion_max_error = max(
+                    fusion_max_error,
+                    float((recomputed_fused_scores - image_scores).abs().max().item()),
+                )
+                row_ids = torch.arange(
+                    selected_classes.numel(), device=selected_classes.device
+                )
+                detector_true_probabilities = current_logits.sigmoid()[
+                    row_ids, selected_classes
+                ]
+                vlm_true_probabilities = image_vlm_probabilities[
+                    selected_queries, selected_classes
+                ]
+                fused_true_scores = fused_selected_scores[
+                    row_ids, selected_classes
+                ]
+                update_component_accumulator(
+                    component_accumulator,
+                    detector_probabilities=detector_true_probabilities,
+                    vlm_probabilities=vlm_true_probabilities,
+                    fused_scores=fused_true_scores,
+                    topk_threshold=float(top_values[-1]),
+                    best_ious=best_iou[valid],
+                    category_ranks=fused_ranks,
+                    survives=survives_global_topk,
+                    frequencies=selected_frequencies,
+                )
+
                 weights = true_class_mode_weights(
                     selected_features,
                     prototypes,
@@ -610,6 +851,14 @@ def main():
         args.image_topk,
         args.category_rank_cutoff,
     )
+    component_report = finalize_component_accumulator(component_accumulator)
+    component_verdict = component_branch_verdict(
+        component_report,
+        detector_weight=1.0 - float(model.beta),
+        vlm_weight=float(model.beta),
+    )
+    component_verdict["fusion_recompute_max_abs_error"] = fusion_max_error
+    print_component_report(component_report, component_verdict)
     total_pairs = sum(occupancy["frequency_pair_counts"].values())
     occupancy_report = {
         "images": occupancy["images"],
@@ -716,6 +965,8 @@ def main():
         "ranking": finalized,
         "selection": selection_report,
         "selection_verdict": ranking_verdict,
+        "score_components": component_report,
+        "score_component_verdict": component_verdict,
         "topk_occupancy": occupancy_report,
         "mode_utilization": mode_report,
         "verdict": verdict,
