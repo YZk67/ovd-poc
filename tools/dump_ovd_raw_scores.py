@@ -18,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -80,6 +81,14 @@ def build_profiles(model):
             "novel_weight": 1.0,
             "novel_scale": 1.0,
         },
+        {
+            "name": "vlm_scaled",
+            "detector_source": "logmeanexp",
+            "fusion": "power",
+            "base_weight": 1.0,
+            "novel_weight": 1.0,
+            "novel_scale": novel_scale,
+        },
     ]
     for weight in (0.1, 0.3, 0.5, 1.0):
         profiles.append(
@@ -93,6 +102,44 @@ def build_profiles(model):
             }
         )
     return profiles
+
+
+def novel_only_component_pairs(detector_logits, vlm_logits, novel_mask, topk):
+    """Top novel pairs for each isolated branch used by rescue gates.
+
+    Full-profile top-k pools may be occupied by base classes.  Explicitly
+    caching the novel-only detector and CLIP pools makes later gates that leave
+    base scores unchanged exact rather than approximate.
+    """
+    if detector_logits.shape != vlm_logits.shape or detector_logits.ndim != 2:
+        raise ValueError("detector and VLM logits must share shape [Q,C]")
+    if novel_mask.ndim != 1 or novel_mask.numel() != detector_logits.shape[-1]:
+        raise ValueError("novel_mask must match the class dimension")
+    novel_count = int(novel_mask.sum())
+    if novel_count == 0:
+        raise ValueError("novel-only candidate pools require at least one novel class")
+    count = min(int(topk), detector_logits.shape[0] * novel_count)
+    if count < 1:
+        raise ValueError("topk must be positive")
+
+    base_mask = ~novel_mask[None, :]
+    branch_scores = {
+        "detector_scaled_novel_only": F.logsigmoid(detector_logits).masked_fill(
+            base_mask, -torch.inf
+        ),
+        "vlm_scaled_novel_only": F.log_softmax(vlm_logits, dim=-1).masked_fill(
+            base_mask, -torch.inf
+        ),
+    }
+    num_classes = detector_logits.shape[-1]
+    result = {}
+    for name, scores in branch_scores.items():
+        flat_ids = scores.reshape(-1).topk(count).indices
+        result[name] = (
+            torch.div(flat_ids, num_classes, rounding_mode="floor"),
+            flat_ids % num_classes,
+        )
+    return result
 
 
 def install_capture_hooks(model, capture):
@@ -276,9 +323,35 @@ def dump_worker(args):
                     candidate_flat_ids.append(
                         profile_query_ids * num_classes + profile_class_ids
                     )
+                novel_component_pairs = novel_only_component_pairs(
+                    detector_variants["logmeanexp"][local_index],
+                    vlm_logits[local_index],
+                    novel_mask,
+                    args.topk,
+                )
+                for profile_query_ids, profile_class_ids in (
+                    novel_component_pairs.values()
+                ):
+                    candidate_flat_ids.append(
+                        profile_query_ids * num_classes + profile_class_ids
+                    )
                 flat_ids = torch.unique(torch.cat(candidate_flat_ids), sorted=True)
                 query_ids = torch.div(flat_ids, num_classes, rounding_mode="floor")
                 class_ids = flat_ids % num_classes
+                detector_top_probabilities, detector_top_classes = (
+                    detector_variants["logmeanexp"][local_index]
+                    .sigmoid()
+                    .topk(2, dim=-1)
+                )
+                vlm_log_normalizer = torch.logsumexp(
+                    vlm_logits[local_index], dim=-1
+                )
+                vlm_top_logits, vlm_top_classes = vlm_logits[local_index].topk(
+                    2, dim=-1
+                )
+                vlm_top_probabilities = (
+                    vlm_top_logits - vlm_log_normalizer[:, None]
+                ).exp()
                 payload = {
                     "schema_version": 1,
                     "image_id": int(model_input["image_id"]),
@@ -292,9 +365,13 @@ def dump_worker(args):
                         for name, logits in detector_variants.items()
                     },
                     "vlm_logits": vlm_logits[local_index, query_ids, class_ids].cpu(),
-                    "vlm_log_normalizer": torch.logsumexp(
-                        vlm_logits[local_index], dim=-1
-                    ).cpu(),
+                    "vlm_log_normalizer": vlm_log_normalizer.cpu(),
+                    "component_query_summary": {
+                        "detector_top_probabilities": detector_top_probabilities.cpu(),
+                        "detector_top_classes": detector_top_classes.to(torch.int16).cpu(),
+                        "vlm_top_probabilities": vlm_top_probabilities.cpu(),
+                        "vlm_top_classes": vlm_top_classes.to(torch.int16).cpu(),
+                    },
                 }
                 temporary = output_path.with_suffix(".tmp")
                 torch.save(payload, temporary)
@@ -320,6 +397,10 @@ def dump_worker(args):
             "num_dataset_images": len(records),
             "topk_per_profile": args.topk,
             "profiles": profiles,
+            "candidate_pool_extensions": [
+                "detector_scaled_novel_only",
+                "vlm_scaled_novel_only",
+            ],
             "novel_class_ids": torch.nonzero(model.novel_idx, as_tuple=False)
             .flatten()
             .tolist(),

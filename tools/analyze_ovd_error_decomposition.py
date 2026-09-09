@@ -132,6 +132,7 @@ def classify_rare_detections(
     not_exhaustive_classes,
     iou_threshold,
     background_iou,
+    initially_matched_gt=None,
 ):
     """Greedily classify score-ordered rare detections into TP/FP reasons.
 
@@ -151,7 +152,17 @@ def classify_rare_detections(
 
     order = detection_scores.argsort(descending=True)
     overlaps = pairwise_iou(detection_boxes, gt_boxes)
-    matched_gt = set()
+    if initially_matched_gt is None:
+        matched_gt = set()
+    else:
+        if (
+            initially_matched_gt.ndim != 1
+            or initially_matched_gt.numel() != gt_classes.numel()
+        ):
+            raise ValueError("initially_matched_gt must match the GT dimension")
+        matched_gt = set(
+            torch.nonzero(initially_matched_gt, as_tuple=False).flatten().tolist()
+        )
     positive_classes = set(gt_classes.tolist())
     results = []
     for detection_index in order.tolist():

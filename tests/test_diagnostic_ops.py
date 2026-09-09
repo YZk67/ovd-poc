@@ -9,6 +9,7 @@ from lami_dino.diagnostic_ops import (
     sparse_fusion_candidate_pairs,
     true_class_mode_weights,
 )
+from tools.dump_ovd_raw_scores import novel_only_component_pairs
 
 
 def test_power_fusion_matches_probability_formula():
@@ -119,6 +120,35 @@ def test_sparse_pool_can_union_different_detector_sources():
         top = scores.flatten().topk(8).indices
         expected = set(zip((top // 7).tolist(), (top % 7).tolist()))
         assert expected <= pairs
+
+
+def test_novel_only_component_pool_excludes_base_and_keeps_branch_topk():
+    detector = torch.tensor(
+        [
+            [10.0, 9.0, 0.1, 0.2],
+            [8.0, 7.0, 3.0, 2.0],
+        ]
+    )
+    vlm = torch.tensor(
+        [
+            [10.0, 9.0, 1.0, 4.0],
+            [8.0, 7.0, 3.0, 2.0],
+        ]
+    )
+    novel = torch.tensor([False, False, True, True])
+    pools = novel_only_component_pairs(detector, vlm, novel, topk=2)
+
+    for queries, classes in pools.values():
+        assert queries.numel() == 2
+        assert set(classes.tolist()) <= {2, 3}
+    assert set(zip(*[value.tolist() for value in pools["detector_scaled_novel_only"]])) == {
+        (1, 2),
+        (1, 3),
+    }
+    assert set(zip(*[value.tolist() for value in pools["vlm_scaled_novel_only"]])) == {
+        (0, 3),
+        (1, 2),
+    }
 
 
 def test_duplicate_prototypes_make_lme_and_prototype_mean_identical():
