@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 
 from lami_dino.diagnostic_ops import (
+    detection_stage_hits,
     fuse_detector_vlm_scores,
     fuse_sparse_detector_vlm_scores,
     prototype_variant_logits,
@@ -154,3 +155,36 @@ def test_mode_weights_select_matching_true_class_mode():
     assert weights[0].argmax().item() == 0
     assert weights[1].argmax().item() == 1
     assert torch.all(weights.max(dim=-1).values > 0.99)
+
+
+def test_detection_stage_hits_separates_proposals_best_pair_and_any_pair():
+    gt_boxes = torch.tensor(
+        [[0.0, 0.0, 10.0, 10.0], [20.0, 20.0, 30.0, 30.0]]
+    )
+    gt_classes = torch.tensor([0, 1])
+    query_boxes = torch.tensor(
+        [
+            [0.0, 0.0, 10.0, 10.0],
+            [20.0, 20.0, 30.0, 30.0],
+            [21.0, 21.0, 29.0, 29.0],
+        ]
+    )
+    # The second GT has a correct-class selected query at IoU=.64, but its
+    # best-IoU query/class pair is not selected.
+    selected_queries = torch.tensor([0, 2])
+    selected_classes = torch.tensor([0, 1])
+
+    best_iou, stages = detection_stage_hits(
+        query_boxes,
+        gt_boxes,
+        gt_classes,
+        selected_queries,
+        selected_classes,
+        thresholds=[0.5, 0.75],
+    )
+
+    torch.testing.assert_close(best_iou, torch.ones(2))
+    assert stages[0.5]["proposal"].tolist() == [True, True]
+    assert stages[0.5]["best_query_pair"].tolist() == [True, False]
+    assert stages[0.5]["class_aware_topk"].tolist() == [True, True]
+    assert stages[0.75]["class_aware_topk"].tolist() == [True, False]
