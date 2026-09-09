@@ -34,6 +34,7 @@ from detectron2.structures import Boxes, ImageList, Instances
 from detectron2.utils.logger import setup_logger
 from detectron2.utils.events import get_event_storage
 from lami_dino.checkpoint_init import load_trusted_torch_file
+from lami_dino.inference_ops import select_query_class_topk
 from lami_dino.prototype_ops import prototype_task_view
 from lami_dino.models import teacher_routed_mode_alignment
 
@@ -63,6 +64,9 @@ class DINO(nn.Module):
         aux_loss (bool): Whether to calculate auxiliary loss in criterion. Default: True.
         select_box_nums_for_evaluation (int): the number of topk candidates
             slected at postprocess for evaluation. Default: 300.
+        inference_query_class_topk (int): maximum categories retained per query
+            before the image-level top-k. Zero preserves the original global
+            query/category selection. Default: 0.
         device (str): Training device. Default: "cuda".
     """
 
@@ -84,6 +88,7 @@ class DINO(nn.Module):
         pixel_std: List[float] = [58.395, 57.120, 57.375],
         aux_loss: bool = True,
         select_box_nums_for_evaluation: int = 300,
+        inference_query_class_topk: int = 0,
         device="cuda",
         dn_number: int = 100,
         label_noise_ratio: float = 0.2,
@@ -127,6 +132,9 @@ class DINO(nn.Module):
         self.alpha = alpha
         self.beta = beta
         self.novel_scale = novel_scale
+        if inference_query_class_topk < 0:
+            raise ValueError("inference_query_class_topk must be non-negative")
+        self.inference_query_class_topk = int(inference_query_class_topk)
         self.use_soft_attention = use_soft_attention
         self.soft_attention_tau = soft_attention_tau
         if soft_category_topk < 1:
@@ -1298,12 +1306,11 @@ class DINO(nn.Module):
             prob = box_cls
         else:
             prob = box_cls.sigmoid()
-        topk_values, topk_indexes = torch.topk(
-            prob.view(box_cls.shape[0], -1), self.select_box_nums_for_evaluation, dim=1
+        scores, topk_boxes, labels = select_query_class_topk(
+            prob,
+            max_detections=self.select_box_nums_for_evaluation,
+            per_query_class_topk=self.inference_query_class_topk,
         )
-        scores = topk_values
-        topk_boxes = torch.div(topk_indexes, box_cls.shape[2], rounding_mode="floor")
-        labels = topk_indexes % box_cls.shape[2]
 
         boxes = torch.gather(box_pred, 1, topk_boxes.unsqueeze(-1).repeat(1, 1, 4))
 

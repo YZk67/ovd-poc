@@ -163,6 +163,9 @@ model = L(DINO)(
     pixel_mean=[123.675, 116.280, 103.530],
     pixel_std=[58.395, 57.120, 57.375],
     device="cuda",
+    # Zero reproduces the original global Q*C top-k. Positive values cap the
+    # number of category hypotheses contributed by each decoder query first.
+    inference_query_class_topk=0,
     clip_head_path='./pretrained_models/clip_convnext_large_head.pth',
     # Eqs. (3)-(4): keep several plausible encoder categories before fusing
     # their most compatible prototypes into the initial decoder query.
