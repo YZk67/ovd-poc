@@ -8,6 +8,8 @@ detector, transformer, and prototype modules necessarily keep their fresh
 initialization.
 """
 
+from __future__ import annotations
+
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Union
