@@ -18,6 +18,7 @@ import os
 import sys
 import time
 import warnings
+from contextlib import nullcontext
 import numpy as np
 import torch
 
@@ -74,6 +75,7 @@ class Trainer(SimpleTrainer):
         separate_tpa_grad_clip=False,
         tpa_conflict_projection=False,
         lr_scheduler_max_iter=None,
+        gradient_accumulation_steps=1,
         grad_scaler=None,
     ):
         super().__init__(model=model, data_loader=dataloader, optimizer=optimizer)
@@ -102,6 +104,11 @@ class Trainer(SimpleTrainer):
             if lr_scheduler_max_iter is not None
             else None
         )
+        if int(gradient_accumulation_steps) != gradient_accumulation_steps:
+            raise ValueError("gradient_accumulation_steps must be an integer")
+        self.gradient_accumulation_steps = int(gradient_accumulation_steps)
+        if self.gradient_accumulation_steps < 1:
+            raise ValueError("gradient_accumulation_steps must be at least 1")
 
         self._last_tpa_grad_norm_pre_clip = float("nan")
         self._last_tpa_grad_norm_post_clip = float("nan")
@@ -118,6 +125,7 @@ class Trainer(SimpleTrainer):
         state = super().state_dict()
         if self.lr_scheduler_max_iter is not None:
             state["lr_scheduler_max_iter"] = self.lr_scheduler_max_iter
+        state["gradient_accumulation_steps"] = self.gradient_accumulation_steps
         if self.amp:
             state["grad_scaler"] = self.grad_scaler.state_dict()
         return state
@@ -135,6 +143,15 @@ class Trainer(SimpleTrainer):
                 f"current={self.lr_scheduler_max_iter}. Change train.max_iter "
                 "only when train.lr_scheduler_max_iter remains fixed."
             )
+        saved_accumulation_steps = int(
+            state_dict.get("gradient_accumulation_steps", 1)
+        )
+        if saved_accumulation_steps != self.gradient_accumulation_steps:
+            raise ValueError(
+                "Cannot resume with different gradient accumulation: "
+                f"checkpoint={saved_accumulation_steps}, "
+                f"current={self.gradient_accumulation_steps}."
+            )
         super().load_state_dict(state_dict)
         # Older checkpoints did not persist AMP state, so keep their resume
         # path valid while making all newly produced checkpoints complete.
@@ -149,54 +166,118 @@ class Trainer(SimpleTrainer):
         assert torch.cuda.is_available(), "[Trainer] CUDA is required for AMP training!"
         from torch.cuda.amp import autocast
 
-        start = time.perf_counter()
-        """
-        If you want to do something with the data, you can wrap the dataloader.
-        """
-        data = next(self._data_loader_iter)
-        data_time = time.perf_counter() - start
-
-        """
-        If you want to do something with the losses, you can wrap the model.
-        """
-        loss_dict = self.model(data)
-        with autocast(enabled=self.amp):
-            if isinstance(loss_dict, torch.Tensor):
-                losses = loss_dict
-                loss_dict = {"total_loss": loss_dict}
-            else:
-                losses = sum(v for k, v in loss_dict.items() if k.startswith("loss"))
-
-        """
-        If you need to accumulate gradients or do something similar, you can
-        wrap the optimizer with your custom `zero_grad()` method.
-        """
         self.optimizer.zero_grad()
-        apr_gradients = self._compute_apr_gradients(loss_dict)
+        accumulated_apr_gradients = None
+        averaged_loss_dict = {}
+        data_time = 0.0
+
+        for micro_step in range(self.gradient_accumulation_steps):
+            start = time.perf_counter()
+            data = next(self._data_loader_iter)
+            data_time += time.perf_counter() - start
+
+            is_last_micro_step = (
+                micro_step + 1 == self.gradient_accumulation_steps
+            )
+            sync_context = (
+                self.model.no_sync()
+                if isinstance(self.model, DistributedDataParallel)
+                and not is_last_micro_step
+                else nullcontext()
+            )
+            with sync_context:
+                self._set_tpa_step_advance(is_last_micro_step)
+                loss_dict = self.model(data)
+                with autocast(enabled=self.amp):
+                    if isinstance(loss_dict, torch.Tensor):
+                        losses = loss_dict
+                        loss_dict = {"total_loss": loss_dict}
+                    else:
+                        losses = sum(
+                            value
+                            for key, value in loss_dict.items()
+                            if key.startswith("loss")
+                        )
+                    scaled_losses = losses / self.gradient_accumulation_steps
+
+                apr_gradients = self._compute_apr_gradients(
+                    loss_dict,
+                    gradient_scale=1.0 / self.gradient_accumulation_steps,
+                )
+                accumulated_apr_gradients = self._accumulate_gradient_tuples(
+                    accumulated_apr_gradients,
+                    apr_gradients,
+                )
+                self._accumulate_loss_metrics(
+                    averaged_loss_dict,
+                    loss_dict,
+                    weight=1.0 / self.gradient_accumulation_steps,
+                )
+
+                if self.amp:
+                    self.grad_scaler.scale(scaled_losses).backward()
+                else:
+                    scaled_losses.backward()
+
+        # Leave direct/evaluation forwards with the historical default.
+        self._set_tpa_step_advance(True)
 
         if self.amp:
-            self.grad_scaler.scale(losses).backward()
-            # Unscale before both diagnostics and clipping. GradScaler.step()
-            # accepts an optimizer that has already been unscaled.
+            # Unscale only after every micro-batch has contributed. GradScaler
+            # permits exactly one unscale per optimizer update.
             self.grad_scaler.unscale_(self.optimizer)
-            self._route_tpa_gradients(apr_gradients)
-            self._capture_tpa_optimization_metrics(before_clip=True)
-            if self.clip_grad_params is not None:
-                self.clip_model_grads()
-            self._capture_tpa_optimization_metrics(before_clip=False)
+
+        self._route_tpa_gradients(accumulated_apr_gradients)
+        self._capture_tpa_optimization_metrics(before_clip=True)
+        if self.clip_grad_params is not None:
+            self.clip_model_grads()
+        self._capture_tpa_optimization_metrics(before_clip=False)
+
+        if self.amp:
             self.grad_scaler.step(self.optimizer)
             self.grad_scaler.update()
         else:
-            losses.backward()
-            self._route_tpa_gradients(apr_gradients)
-            self._capture_tpa_optimization_metrics(before_clip=True)
-            if self.clip_grad_params is not None:
-                self.clip_model_grads()
-            self._capture_tpa_optimization_metrics(before_clip=False)
             self.optimizer.step()
 
-        self._write_metrics(loss_dict, data_time)
+        self._write_metrics(averaged_loss_dict, data_time)
         self._write_tpa_metrics()
+
+    def _set_tpa_step_advance(self, advance):
+        """Advance TPA's internal schedule once per optimizer update."""
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        model.tpa_advance_step = bool(advance)
+
+    @staticmethod
+    def _accumulate_loss_metrics(target, loss_dict, *, weight):
+        """Accumulate detached micro-batch losses for effective-batch logging."""
+        for key, value in loss_dict.items():
+            detached = value.detach() * float(weight)
+            if key in target:
+                target[key] = target[key] + detached
+            else:
+                target[key] = detached
+
+    @staticmethod
+    def _accumulate_gradient_tuples(accumulated, current):
+        """Sum optional APR gradients across micro-batches."""
+        if current is None:
+            return accumulated
+        if accumulated is None:
+            return tuple(
+                None if gradient is None else gradient.detach().clone()
+                for gradient in current
+            )
+        if len(accumulated) != len(current):
+            raise RuntimeError("APR gradient set changed between micro-batches")
+        merged = []
+        for previous, gradient in zip(accumulated, current):
+            if gradient is None:
+                merged.append(previous)
+            elif previous is None:
+                merged.append(gradient.detach().clone())
+            else:
+                merged.append(previous + gradient.detach())
+        return tuple(merged)
 
     def _get_tpa(self):
         model = self.model.module if hasattr(self.model, "module") else self.model
@@ -205,7 +286,7 @@ class Trainer(SimpleTrainer):
         except (AttributeError, IndexError):
             return None
 
-    def _compute_apr_gradients(self, loss_dict):
+    def _compute_apr_gradients(self, loss_dict, *, gradient_scale=1.0):
         """Differentiate APR separately so conflicting task gradients are known."""
         model = self.model.module if hasattr(self.model, "module") else self.model
         if (
@@ -220,7 +301,7 @@ class Trainer(SimpleTrainer):
             return None
         parameters = list(tpa.parameters())
         return torch.autograd.grad(
-            loss_dict["loss_apr"],
+            loss_dict["loss_apr"] * float(gradient_scale),
             parameters,
             retain_graph=True,
             allow_unused=True,
@@ -528,6 +609,7 @@ def do_train(args, cfg):
                 init_checkpoint_scope (str): ``full`` or ``backbone_only``
                 amp.enabled (bool)
                 max_iter (int)
+                gradient_accumulation_steps (int)
                 eval_period, log_period (int)
                 device (str)
                 checkpointer (dict)
@@ -605,6 +687,18 @@ def do_train(args, cfg):
         scheduler_horizon,
     )
 
+    accumulation_steps = int(
+        getattr(cfg.train, "gradient_accumulation_steps", 1)
+    )
+    physical_global_batch = int(cfg.dataloader.train.total_batch_size)
+    logger.info(
+        "Gradient accumulation: %d micro-batch(es) per optimizer update; "
+        "physical global batch=%d; effective global batch=%d",
+        accumulation_steps,
+        physical_global_batch,
+        physical_global_batch * accumulation_steps,
+    )
+
     train_loader = instantiate(cfg.dataloader.train)
 
     model = create_ddp_model(model, **cfg.train.ddp)
@@ -618,6 +712,7 @@ def do_train(args, cfg):
         separate_tpa_grad_clip=getattr(cfg.train, "separate_tpa_grad_clip", False),
         tpa_conflict_projection=getattr(cfg.train, "tpa_conflict_projection", False),
         lr_scheduler_max_iter=scheduler_horizon,
+        gradient_accumulation_steps=accumulation_steps,
     )
 
     checkpointer = DetectionCheckpointer(
@@ -705,6 +800,7 @@ def main(args):
     if args.ddebug:
         cfg.train.max_iter = 8
         cfg.train.lr_scheduler_max_iter = 8
+        cfg.train.gradient_accumulation_steps = 1
         cfg.train.eval_period = 8
         cfg.train.log_period = 4
         cfg.train.checkpointer.period = 8

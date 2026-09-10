@@ -41,14 +41,16 @@ train.backbone_trainable_scope = "output_norm_only"
 # Use a CLI override for each ablation, e.g. train.output_dir=output/..._k1.
 train.output_dir = "./output/instructdet_clip_convnext_large_12ep_lvis"
 
-# The LVIS RepeatFactorTrainingSampler yields about 7,100 iterations per epoch
-# at total batch size 16. Keep max_iter identical to the 12-epoch scheduler's
-# endpoint; the previous 92,300 value silently added roughly one extra epoch.
+# Match the released LaMI-DETR optimization protocol: 85,200 optimizer updates
+# with an effective global batch of 32. The physical four-GPU micro-batch below
+# is 16, so each update averages two micro-batches without increasing memory.
+# The previous 92,300 value silently extended the released schedule.
 iterations_per_epoch = 7100
 train.max_iter = 12 * iterations_per_epoch
 # Keep the LR timeline explicit and checkpointed. Short screening configs
 # inherit this 12ep horizon even when they stop at an intermediate checkpoint.
 train.lr_scheduler_max_iter = 12 * iterations_per_epoch
+train.gradient_accumulation_steps = 2
 
 # run evaluation every ~4 epochs (28400 ≈ 4 × 7100)
 # was 99999999 (never) — without intermediate eval there is no signal that the
@@ -89,7 +91,8 @@ model.eval_query_path = "dataset/metadata/lvis_claude_prompts_convnextl.npy"
 # modify optimizer config
 # was: base_lr * world_size with world_size=1.5 (= 1.5e-4) — the 1.5 was a hand-tuned
 # multiplier with no clear linear-scaling justification and made auxiliary losses
-# more likely to blow up early. Use the LaMI-DETR default 1e-4 for total_batch_size=16.
+# more likely to blow up early. Use the released LaMI-DETR 1e-4 learning rate
+# at effective total batch size 32.
 base_lr = 1e-4
 optimizer.lr = base_lr
 optimizer.betas = (0.9, 0.999)
@@ -121,12 +124,11 @@ optimizer.params.lr_factor_func = _lr_factor
 # Start with conservative setting, can be increased if stable
 dataloader.train.num_workers = 4  # 1 worker per GPU for 4GPU training
 
-# please notice that this is total batch size.
-# surpose you're using 4 gpus for training and the batch size for
-# each gpu is 16/4 = 4
+# This is the physical global micro-batch: 4 GPUs x 4 images. Two micro-batches
+# are accumulated above, restoring the released effective global batch of 32.
 # Note: Using Option 3 (averaged embeddings), batch_size can remain at 4
 # If using Option 2 (6015 queries), reduce to batch_size=1
-dataloader.train.total_batch_size = 16  # Can use 4 with Option 3
+dataloader.train.total_batch_size = 16
 
 # dump the testing results into output_dir for visualization
 dataloader.evaluator.output_dir = train.output_dir

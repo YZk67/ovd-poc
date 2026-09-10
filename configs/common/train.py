@@ -12,6 +12,10 @@ train = dict(
     # Short screening runs can set this to the final formal-run horizon so that
     # their LR curve is an exact prefix of the long run.
     lr_scheduler_max_iter=None,
+    # Number of dataloader micro-batches averaged into one optimizer update.
+    # Scheduler iterations, checkpoint iterations, and warm-up schedules count
+    # optimizer updates rather than micro-batches.
+    gradient_accumulation_steps=1,
     # options for Automatic Mixed Precision
     amp=dict(enabled=False),
     # options for DistributedDataParallel

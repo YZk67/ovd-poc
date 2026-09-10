@@ -794,7 +794,9 @@ class DINO(nn.Module):
             # computed once and cached; do not rerun TPA for every image.
             if self.training:
                 shared_prototypes, shared_apr_loss = text_classifier.tpa(
-                    text_feats, with_loss=True
+                    text_feats,
+                    with_loss=True,
+                    advance_step=getattr(self, "tpa_advance_step", True),
                 )
             else:
                 cached = text_classifier._cached_eval

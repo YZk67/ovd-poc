@@ -80,6 +80,10 @@ change one item mid-run and compare the resulting checkpoint with another row.
   receiving a twelve-epoch training budget. The four-epoch LR protocol must be
   fixed in advance and identical across candidates; a run whose `max_iter` was
   changed during resume is diagnostic only.
+- The released LaMI-DETR LVIS recipe uses effective global batch 32. On four
+  GPUs, use physical global micro-batch 16 (4 images/GPU) and two-step gradient
+  accumulation. The 28,400/85,200 iteration budgets count optimizer updates,
+  not micro-batches; the LR scheduler advances once per optimizer update.
 - The rare-class promotion band is `APr=39.5--40.5`: candidates below 39.5 do
   not advance, candidates in `[39.5, 40.0)` advance only with supporting gains
   in the other metrics, and candidates at or above 40.0 are preferred for a
