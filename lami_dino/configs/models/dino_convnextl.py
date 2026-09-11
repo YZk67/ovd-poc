@@ -173,6 +173,9 @@ model = L(DINO)(
     soft_category_tau=1.0,
     tpa_stabilization_steps=0,
     tpa_task_gradient_scale=1.0,
+    # Inference-only causal control. One keeps the trained modes; zero makes
+    # every class's K prototypes equal to their centroid.
+    tpa_eval_mode_scale=1.0,
 )
 
 # set aux loss weight dict

@@ -3,10 +3,47 @@ import torch.nn.functional as F
 
 from lami_dino.prototype_ops import (
     calibrated_logmeanexp_similarity,
+    prototype_eval_mode_view,
     prototype_task_view,
     route_conflicting_task_gradient,
     soft_category_prototype_fusion,
 )
+
+
+def test_prototype_eval_mode_view_endpoints_and_centroid():
+    prototypes = torch.tensor(
+        [
+            [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+            [[-1.0, 2.0], [3.0, 0.0], [1.0, -2.0]],
+        ]
+    )
+    centroid = prototypes.mean(dim=1, keepdim=True)
+
+    native = prototype_eval_mode_view(prototypes, 1.0)
+    collapsed = prototype_eval_mode_view(prototypes, 0.0)
+    halfway = prototype_eval_mode_view(prototypes, 0.5)
+
+    assert native is prototypes
+    torch.testing.assert_close(collapsed, centroid.expand_as(prototypes))
+    torch.testing.assert_close(halfway.mean(dim=1, keepdim=True), centroid)
+    torch.testing.assert_close(
+        halfway - centroid,
+        0.5 * (prototypes - centroid),
+    )
+
+
+def test_prototype_eval_mode_view_rejects_invalid_inputs():
+    for prototypes, scale in (
+        (torch.randn(3, 4), 0.5),
+        (torch.randn(3, 2, 4), -0.1),
+        (torch.randn(3, 2, 4), 1.1),
+    ):
+        try:
+            prototype_eval_mode_view(prototypes, scale)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected invalid prototype eval view to fail")
 
 
 def test_prototype_stabilization_blocks_only_task_gradient():

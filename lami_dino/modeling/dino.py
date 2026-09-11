@@ -35,7 +35,7 @@ from detectron2.utils.logger import setup_logger
 from detectron2.utils.events import get_event_storage
 from lami_dino.checkpoint_init import load_trusted_torch_file
 from lami_dino.inference_ops import select_query_class_topk
-from lami_dino.prototype_ops import prototype_task_view
+from lami_dino.prototype_ops import prototype_eval_mode_view, prototype_task_view
 from lami_dino.models import teacher_routed_mode_alignment
 
 logger_rpsa = setup_logger()  # 用于RPSA日志输出
@@ -115,6 +115,7 @@ class DINO(nn.Module):
         soft_category_tau: float = 1.0,
         tpa_stabilization_steps: int = 0,
         tpa_task_gradient_scale: float = 1.0,
+        tpa_eval_mode_scale: float = 1.0,
         teacher_rpsa: bool = False,
         teacher_rpsa_num_proposals: int = 64,
         teacher_rpsa_category_topk: int = 3,
@@ -149,6 +150,9 @@ class DINO(nn.Module):
             raise ValueError("tpa_task_gradient_scale must be within [0, 1]")
         self.tpa_stabilization_steps = int(tpa_stabilization_steps)
         self.tpa_task_gradient_scale = float(tpa_task_gradient_scale)
+        if not 0.0 <= tpa_eval_mode_scale <= 1.0:
+            raise ValueError("tpa_eval_mode_scale must be within [0, 1]")
+        self.tpa_eval_mode_scale = float(tpa_eval_mode_scale)
         self.tpa_stabilizing = False
         self.tpa_active_task_gradient_scale = 1.0
         self.teacher_rpsa = bool(teacher_rpsa)
@@ -813,6 +817,14 @@ class DINO(nn.Module):
                 else:
                     shared_prototypes = cached
                 shared_apr_loss = None
+
+                # Same-checkpoint counterfactual: scale zero makes every
+                # class's K slots identical for both query fusion and final
+                # classification; scale one is the untouched trained model.
+                shared_prototypes = prototype_eval_mode_view(
+                    shared_prototypes,
+                    self.tpa_eval_mode_scale,
+                )
 
             current_iter = 0
             if self.training:

@@ -14,6 +14,29 @@ import torch
 import torch.nn.functional as F
 
 
+def prototype_eval_mode_view(
+    prototypes: torch.Tensor,
+    mode_scale: float,
+) -> torch.Tensor:
+    """Interpolate prototype modes toward their per-class centroid at eval.
+
+    ``mode_scale=1`` preserves the learned K-prototype bank, while
+    ``mode_scale=0`` makes all K slots identical without changing tensor shape.
+    This is an inference-only causal control: detector weights and the number
+    of prototype slots remain fixed.
+    """
+    if prototypes.ndim != 3:
+        raise ValueError(
+            f"prototypes must have shape [C,K,D], got {prototypes.shape}"
+        )
+    if not 0.0 <= float(mode_scale) <= 1.0:
+        raise ValueError("mode_scale must be within [0, 1]")
+    if float(mode_scale) == 1.0:
+        return prototypes
+    centroid = prototypes.mean(dim=1, keepdim=True)
+    return centroid + float(mode_scale) * (prototypes - centroid)
+
+
 def route_conflicting_task_gradient(
     total_gradient: torch.Tensor,
     apr_gradient: torch.Tensor,
