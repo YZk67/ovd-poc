@@ -1,8 +1,11 @@
+import math
+
 import torch
 import torch.nn.functional as F
 
 from lami_dino.prototype_ops import (
     calibrated_logmeanexp_similarity,
+    legacy_uncalibrated_logsumexp_similarity,
     prototype_eval_mode_view,
     prototype_task_view,
     route_conflicting_task_gradient,
@@ -168,6 +171,27 @@ def test_logmeanexp_k1_reduces_to_scaled_cosine():
     )
     expected = 17.0 * torch.einsum("bqd,cd->bqc", features, prototypes[:, 0])
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_legacy_logsumexp_adds_log_k_for_duplicate_prototypes():
+    torch.manual_seed(11)
+    features = F.normalize(torch.randn(2, 3, 8), dim=-1)
+    single = F.normalize(torch.randn(4, 1, 8), dim=-1)
+    duplicated = single.expand(-1, 5, -1).contiguous()
+
+    logits_k1 = legacy_uncalibrated_logsumexp_similarity(
+        features, single, logit_scale=50.0
+    )
+    logits_k5 = legacy_uncalibrated_logsumexp_similarity(
+        features, duplicated, logit_scale=50.0
+    )
+
+    torch.testing.assert_close(
+        logits_k5 - logits_k1,
+        torch.full_like(logits_k1, math.log(5.0)),
+        atol=1e-5,
+        rtol=1e-5,
+    )
 
 
 def test_soft_fusion_keeps_top_r_categories_and_normalized_weights():

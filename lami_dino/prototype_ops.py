@@ -159,6 +159,35 @@ def calibrated_logmeanexp_similarity(
     return float(logit_scale) * float(temperature) * log_mean_exp
 
 
+def legacy_uncalibrated_logsumexp_similarity(
+    features: torch.Tensor,
+    prototypes: torch.Tensor,
+    *,
+    logit_scale: float,
+) -> torch.Tensor:
+    """Replay the historical K-biased TPA classifier for diagnosis.
+
+    The legacy implementation computed ``logsumexp(s * cosine)`` directly.
+    Consequently K identical prototypes add ``log(K)`` to every category
+    logit.  This helper is intentionally separate from the paper-aligned
+    implementation so the historical calibration artifact can be measured
+    without changing training behavior.
+    """
+    if features.ndim < 2:
+        raise ValueError(f"features must have shape [..., D], got {features.shape}")
+    if prototypes.ndim != 3:
+        raise ValueError(f"prototypes must have shape [C, K, D], got {prototypes.shape}")
+    if features.shape[-1] != prototypes.shape[-1]:
+        raise ValueError(
+            "feature/prototype dimensions differ: "
+            f"{features.shape[-1]} vs {prototypes.shape[-1]}"
+        )
+    if prototypes.shape[1] < 1:
+        raise ValueError("at least one prototype per category is required")
+    similarities = torch.einsum("...d,ckd->...ck", features, prototypes)
+    return torch.logsumexp(float(logit_scale) * similarities, dim=-1)
+
+
 def soft_category_prototype_fusion(
     region_features: torch.Tensor,
     category_logits: torch.Tensor,

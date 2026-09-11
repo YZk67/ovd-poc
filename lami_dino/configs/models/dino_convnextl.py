@@ -144,6 +144,9 @@ model = L(DINO)(
         tpa_prototype_mode_strength=0.0,
         tpa_identity_value_init=False,
         tpa_log_interval=200,
+        # Inference-only historical controls; both are no-ops during training.
+        tpa_eval_legacy_logsumexp=False,
+        tpa_eval_logit_bias=0.0,
     ),
     query_path="dataset/metadata/coco_clip_convnextl_a+cname.npy",
     eval_query_path="dataset/metadata/coco_clip_convnextl_a+cname.npy",

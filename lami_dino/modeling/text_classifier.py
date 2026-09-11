@@ -6,7 +6,10 @@ from detectron2.layers import ShapeSpec
 from typing import Optional
 
 from lami_dino.models import TextPrototypeAggregator
-from lami_dino.prototype_ops import calibrated_logmeanexp_similarity
+from lami_dino.prototype_ops import (
+    calibrated_logmeanexp_similarity,
+    legacy_uncalibrated_logsumexp_similarity,
+)
 
 
 class TextClassifier(nn.Module):
@@ -40,6 +43,8 @@ class TextClassifier(nn.Module):
         tpa_identity_value_init: bool = False,
         tpa_log_interval: int = 200,
         tpa_warmup_steps: Optional[int] = None,
+        tpa_eval_legacy_logsumexp: bool = False,
+        tpa_eval_logit_bias: float = 0.0,
     ) -> None:
         super().__init__()
 
@@ -59,6 +64,8 @@ class TextClassifier(nn.Module):
         if tpa_cls_tau <= 0:
             raise ValueError(f"tpa_cls_tau must be positive, got {tpa_cls_tau}")
         self.tpa_cls_tau = float(tpa_cls_tau)
+        self.tpa_eval_legacy_logsumexp = bool(tpa_eval_legacy_logsumexp)
+        self.tpa_eval_logit_bias = float(tpa_eval_logit_bias)
 
         if self.use_tpa:
             train_feats = self._load_text_embeddings(text_embed_path or zs_weight_path)
@@ -239,12 +246,21 @@ class TextClassifier(nn.Module):
         # prediction-invariant.
         features = F.normalize(x, p=2, dim=-1) if self.norm_weight else x
         logit_scale = self.norm_temperature if self.norm_weight else 1.0
-        logits = calibrated_logmeanexp_similarity(
-            features,
-            prototypes,
-            temperature=self.tpa_cls_tau,
-            logit_scale=logit_scale,
-        )
+        if not self.training and self.tpa_eval_legacy_logsumexp:
+            logits = legacy_uncalibrated_logsumexp_similarity(
+                features,
+                prototypes,
+                logit_scale=logit_scale,
+            )
+        else:
+            logits = calibrated_logmeanexp_similarity(
+                features,
+                prototypes,
+                temperature=self.tpa_cls_tau,
+                logit_scale=logit_scale,
+            )
+        if not self.training and self.tpa_eval_logit_bias:
+            logits = logits + self.tpa_eval_logit_bias
 
         if additional_class is not None:
             additional = additional_class.to(device=features.device, dtype=features.dtype)
