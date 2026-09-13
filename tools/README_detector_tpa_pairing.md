@@ -204,6 +204,39 @@ set -o pipefail
 这些统计用于区分 PR 排序和不同 IoU 下的召回变化，不直接证明训练原因；不要
 仅凭首个 TP 的排名或相同的终点 TP 数推断完整 AP。
 
+## 查出排在 rare TP 前面的具体误检（纯 CPU）
+
+上一节生成 `complete=True` 的 `ranking_comparison.json` 后，读取同一份完整验证集
+的旧/新预测及 LVIS 标注，复现官方按类别排序，并逐项核对上次报告的 TP/FP 数、
+每个 TP 的排名和分数。输入预测与标注还须通过上次补算记录的 SHA256；路径从
+对比文件读取，搬迁过文件时可用 `--old-predictions`、`--new-predictions`、
+`--annotations` 指定新路径。两边每图 300 个候选的截断发生在按类别筛选之前。
+
+```bash
+cd ~/LaMI-DETR
+set -o pipefail
+
+/root/miniconda3/envs/lami/bin/python -u tools/inspect_rare_pre_tp_fps.py \
+  --comparison /root/autodl-tmp/k5_12ep_rare_pr/ranking_comparison.json \
+  --output /root/autodl-tmp/k5_12ep_rare_pr/pre_tp_fp_details.json \
+  2>&1 | tee /root/autodl-tmp/k5_12ep_rare_pr/pre_tp_fp_details.log
+```
+
+默认分析对比文件中的十个类别，在终端列出旧/新首个和最后一个 TP 前的 FP 数、
+新模型的几何重叠类型，并打印 `koala`、`roller_skate`、`joystick` 在 IoU 0.5
+下排在 TP 前的具体预测。JSON 保留两边在 IoU 0.5/0.75 下所有排在最后一个
+TP 前的 FP，包括类内排名、检测 ID、图像 ID/文件名、框和分数、最近同类 GT
+及其他已标注类别 GT 的 IoU。没有 TP 时，对应“TP 前 FP 数”是 `null`。
+
+“与其他已标注类别重叠”只描述框与标注的几何关系，不能单凭它断言物体被错认。
+LVIS 未完整标注所有物体；未标注区域也不能直接称作背景。检测 ID 是这次官方
+重播的局部编号，跨 checkpoint 不表示同一个 query。
+
+```bash
+PYTHONPATH=. python -m pytest -q --rootdir=tests --confcutdir=tests \
+  tests/test_inspect_rare_pre_tp_fps.py
+```
+
 ```bash
 python -m pytest -q --rootdir=tests --confcutdir=tests \
   tests/test_rare_pr_comparison_ops.py \
