@@ -9,10 +9,12 @@ compares the true-class ranking of three detector-side text representations:
 * ``prompt_mean``: the original prompt bank averaged into one vector.
 
 It additionally measures the exact 1203-way category rank after the current
-detector/CLIP fusion. Recall-side hits use score-ordered one-to-one GT matching;
-misses use the highest-scoring true-class query among *all* queries whose IoU
-reaches the threshold. This avoids assuming that the best-IoU query is also the
-semantic best query.
+detector/CLIP fusion. For each branch (detector, CLIP, fused), a GT's oracle
+rank is measured on that branch's highest-true-class-scoring query among *all*
+queries whose IoU reaches the threshold. Recall-side hits use score-ordered
+one-to-one GT matching. This avoids assuming that the best-IoU query is also
+the semantic best query, and avoids forcing both score branches to use one
+branch's preferred query.
 
 It also measures posterior sharpness and slot usage for the true class. This
 separates "the prototype vectors have high rank" from "visual instances
@@ -164,6 +166,52 @@ def true_class_topk_hits(eligible, class_ids, flat_topk_ids, num_classes):
     ).any(dim=1)
 
 
+def update_rare_recall_accumulator(
+    accumulator, frequencies, eligible_box, pair_in_topk, one_to_one_hit
+):
+    """Count mutually nested rare GT events, keeping pair and matching distinct."""
+    if not (
+        len(frequencies)
+        == eligible_box.numel()
+        == pair_in_topk.numel()
+        == one_to_one_hit.numel()
+    ):
+        raise ValueError("rare recall masks have different GT dimensions")
+    if (one_to_one_hit & ~pair_in_topk).any() or (
+        pair_in_topk & ~eligible_box
+    ).any():
+        raise ValueError("rare recall masks are not nested")
+    rare_gt = torch.tensor(
+        [frequency == "r" for frequency in frequencies],
+        dtype=torch.bool,
+        device=eligible_box.device,
+    )
+    accumulator["rare_gt"] += int(rare_gt.sum())
+    accumulator["eligible_box"] += int((rare_gt & eligible_box).sum())
+    accumulator["true_pair_in_topk"] += int((rare_gt & pair_in_topk).sum())
+    accumulator["one_to_one_hit"] += int((rare_gt & one_to_one_hit).sum())
+
+
+def finalize_rare_recall_accumulator(accumulator, min_iou, image_topk):
+    rare_gt = accumulator["rare_gt"]
+    eligible_box = accumulator["eligible_box"]
+    true_pair_in_topk = accumulator["true_pair_in_topk"]
+    one_to_one_hit = accumulator["one_to_one_hit"]
+    if not (0 <= one_to_one_hit <= true_pair_in_topk <= eligible_box <= rare_gt):
+        raise ValueError("rare recall counts are not nested")
+    return {
+        "rare_gt": rare_gt,
+        "eligible_box": eligible_box,
+        "no_eligible_box": rare_gt - eligible_box,
+        "true_pair_in_topk": true_pair_in_topk,
+        "eligible_but_pair_below_topk": eligible_box - true_pair_in_topk,
+        "pair_in_topk_but_one_to_one_miss": true_pair_in_topk - one_to_one_hit,
+        "one_to_one_hit": one_to_one_hit,
+        "image_topk": image_topk,
+        "min_iou": min_iou,
+    }
+
+
 def greedy_gt_topk_matches(
     overlaps,
     class_ids,
@@ -213,6 +261,7 @@ def update_ranking_stats(accumulator, logits, class_ids, frequencies):
             row["top20"] += int(rank <= 20)
             row["reciprocal_rank"] += 1.0 / float(rank)
             row["rank_sum"] += int(rank)
+            row.setdefault("ranks", []).append(int(rank))
     return ranks
 
 
@@ -232,6 +281,8 @@ def finalize_ranking_stats(accumulator):
             "top20": row["top20"] / count,
             "mrr": row["reciprocal_rank"] / count,
             "mean_rank": row["rank_sum"] / count,
+            "median_rank": float(np.median(row["ranks"])),
+            "p90_rank": float(np.percentile(row["ranks"], 90)),
         }
     return result
 
@@ -270,6 +321,31 @@ def print_ranking_table(results):
                 f"{format_percent(row['top10']):>8} "
                 f"{format_percent(row['top20']):>8} "
                 f"{row['mrr']:8.4f} {row['mean_rank']:11.2f}"
+            )
+
+
+def print_semantic_branch_ranking(results):
+    """Show exact rare ranks on each branch's own best IoU-valid query."""
+    print("\n=== Rare true-class ranks on branch-best eligible queries ===")
+    print(
+        "For each rare GT, each branch selects its own highest-true-class-score "
+        "query with sufficient IoU. These are optimistic classification "
+        "upper bounds, not final detection AP."
+    )
+    print(
+        f"{'branch':>9} {'status':>12} {'N':>6} {'top1%':>8} "
+        f"{'top5%':>8} {'median':>8} {'p90':>8} {'mean':>9}"
+    )
+    for branch in ("detector", "clip", "fused"):
+        for status in ("all", "current_hit", "current_miss"):
+            row = results[branch][status]["r"]
+            if not row.get("count"):
+                continue
+            print(
+                f"{branch:>9} {status:>12} {row['count']:6d} "
+                f"{100 * row['top1']:8.2f} {100 * row['top5']:8.2f} "
+                f"{row['median_rank']:8.1f} {row['p90_rank']:8.1f} "
+                f"{row['mean_rank']:9.2f}"
             )
 
 
@@ -380,7 +456,7 @@ def print_selection_report(report, topk, cutoff):
     )
     print(
         f"{'split':>6} {'N':>7} {'median-rank':>12} {'p90-rank':>10} "
-        f"{'pair-topk%':>11} {'miss-rank>k%':>13} {'miss-rank<=k%':>14}"
+        f"{'1-to-1%':>11} {'miss-rank>k%':>13} {'miss-rank<=k%':>14}"
     )
     for split in ("all", "r", "c", "f"):
         row = report[split]
@@ -403,7 +479,7 @@ def print_selection_report(report, topk, cutoff):
     if category_fraction > 0.6:
         verdict = "WITHIN_QUERY_CATEGORY_RANK_DOMINANT"
     elif global_fraction > 0.6:
-        verdict = "IMAGE_LEVEL_TOPK_DOMINANT"
+        verdict = "IMAGE_TOPK_OR_MATCHING_DOMINANT"
     else:
         verdict = "MIXED_CATEGORY_AND_GLOBAL_RANKING"
     print(f"verdict: {verdict}")
@@ -411,7 +487,8 @@ def print_selection_report(report, topk, cutoff):
         f"Among genuinely missed localization-valid pairs, "
         f"{100.0 * category_fraction:.2f}% have "
         f"true-class rank > {cutoff}; {100.0 * global_fraction:.2f}% are already "
-        f"within top-{cutoff} but are displaced at image-level top-k."
+        f"within top-{cutoff} but miss after image-level top-k and one-to-one "
+        "matching. The rare recall partition below separates those two cases."
     )
     return verdict
 
@@ -800,10 +877,17 @@ def main():
     DetectionCheckpointer(model).load(args.checkpoint)
     if not getattr(model, "score_ensemble", False):
         raise ValueError("exact fused-rank diagnosis requires model.score_ensemble=True")
+    if int(model.inference_query_class_topk) != 0:
+        raise ValueError("diagnostic requires uncapped per-query class selection")
+    if int(model.select_box_nums_for_evaluation) != args.image_topk:
+        raise ValueError(
+            "--image-topk must match model.select_box_nums_for_evaluation"
+        )
     fusion_protocol = {
         "alpha": float(model.alpha),
         "beta": float(model.beta),
         "novel_scale": float(model.novel_scale),
+        "tpa_eval_mode_scale": float(model.tpa_eval_mode_scale),
         "vlm_temperature": float(model.vlm_temperature),
     }
     print(f"[protocol] {fusion_protocol}")
@@ -836,6 +920,14 @@ def main():
             "prompt_mean",
         )
     }
+    semantic_branch_ranking = {
+        branch: {
+            status: defaultdict(lambda: defaultdict(float))
+            for status in ("all", "current_hit", "current_miss")
+        }
+        for branch in ("detector", "clip", "fused")
+    }
+    rare_recall = Counter()
     selection_accumulator = make_selection_accumulator()
     component_accumulator = make_component_accumulator()
     complementarity_accumulator = make_complementarity_accumulator()
@@ -1022,6 +1114,15 @@ def main():
                     frequencies_by_class[class_id]
                     for class_id in gt_classes.tolist()
                 ]
+                pair_in_topk = true_class_topk_hits(
+                    overlaps >= args.min_iou,
+                    gt_classes,
+                    top_flat_ids,
+                    image_scores.shape[-1],
+                )
+                update_rare_recall_accumulator(
+                    rare_recall, all_frequencies, valid, pair_in_topk, current_hits
+                )
                 update_complementarity_accumulator(
                     complementarity_accumulator,
                     valid=valid,
@@ -1078,6 +1179,36 @@ def main():
                     frequencies_by_class[class_id]
                     for class_id in semantic_classes.tolist()
                 ]
+                current_hit_valid = current_hits[semantic_valid]
+                branch_scores = {
+                    "detector": detector_logits[local_index].float(),
+                    "clip": image_vlm_logits,
+                    "fused": image_scores,
+                }
+                for branch, scores in branch_scores.items():
+                    branch_valid, branch_queries, _ = semantic_best_queries(
+                        overlaps, gt_classes, scores, args.min_iou
+                    )
+                    if not torch.equal(branch_valid, semantic_valid):
+                        raise RuntimeError(f"{branch} proposal-valid mask disagrees")
+                    branch_logits = scores[branch_queries]
+                    for status, mask in (
+                        ("all", torch.ones_like(current_hit_valid)),
+                        ("current_hit", current_hit_valid),
+                        ("current_miss", ~current_hit_valid),
+                    ):
+                        update_ranking_stats(
+                            semantic_branch_ranking[branch][status],
+                            branch_logits[mask],
+                            semantic_classes[mask],
+                            [
+                                frequency
+                                for frequency, selected in zip(
+                                    semantic_frequencies, mask.tolist()
+                                )
+                                if selected
+                            ],
+                        )
                 # Use the actual one-to-one matched query for TPs and the
                 # strongest localization-valid true-class query for misses.
                 analysis_queries = semantic_queries.clone()
@@ -1155,6 +1286,25 @@ def main():
         name: finalize_ranking_stats(stats) for name, stats in ranking.items()
     }
     print_ranking_table(finalized)
+    semantic_branch_report = {
+        branch: {
+            status: finalize_ranking_stats(stats)
+            for status, stats in statuses.items()
+        }
+        for branch, statuses in semantic_branch_ranking.items()
+    }
+    print_semantic_branch_ranking(semantic_branch_report)
+
+    rare_recall_report = finalize_rare_recall_accumulator(
+        rare_recall, args.min_iou, args.image_topk
+    )
+    print("\n=== Rare GT failure accounting ===")
+    print(
+        f"IoU>={args.min_iou:g}, image top-{args.image_topk}; "
+        "top-k pair coverage and one-to-one matching are distinct."
+    )
+    for key, value in rare_recall_report.items():
+        print(f"{key}: {value}")
 
     selection_report = finalize_selection_accumulator(
         selection_accumulator, args.category_rank_cutoff
@@ -1282,6 +1432,8 @@ def main():
         "min_iou": args.min_iou,
         "fusion_protocol": fusion_protocol,
         "ranking": finalized,
+        "semantic_branch_ranking": semantic_branch_report,
+        "rare_recall": rare_recall_report,
         "selection": selection_report,
         "selection_verdict": ranking_verdict,
         "score_components": component_report,

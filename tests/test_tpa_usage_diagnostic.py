@@ -1,4 +1,4 @@
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 import pytest
 import torch
@@ -9,6 +9,7 @@ from tools.diagnose_tpa_usage import (
     finalize_complementarity_accumulator,
     finalize_component_accumulator,
     finalize_ranking_stats,
+    finalize_rare_recall_accumulator,
     finalize_selection_accumulator,
     greedy_gt_topk_matches,
     make_complementarity_accumulator,
@@ -20,6 +21,7 @@ from tools.diagnose_tpa_usage import (
     update_complementarity_accumulator,
     update_component_accumulator,
     update_ranking_stats,
+    update_rare_recall_accumulator,
     update_selection_accumulator,
 )
 
@@ -41,6 +43,8 @@ def test_fused_rank_and_global_selection_partition():
     finalized_ranking = finalize_ranking_stats(ranking)
     assert finalized_ranking["r"]["top1"] == 0.25
     assert finalized_ranking["r"]["top5"] == 1.0
+    assert finalized_ranking["r"]["median_rank"] == 2.5
+    assert finalized_ranking["r"]["p90_rank"] == 3.0
 
     selection = make_selection_accumulator()
     update_selection_accumulator(
@@ -126,6 +130,49 @@ def test_semantic_best_uses_highest_true_score_among_iou_valid_queries():
     # Query 0 has the best IoU, but query 1 has the strongest true-class score.
     assert queries.tolist() == [1]
     assert selected_ious.tolist() == pytest.approx([0.7])
+
+
+def test_detector_and_clip_select_their_own_best_eligible_query():
+    overlaps = torch.tensor([[0.8, 0.7, 0.2]])
+    classes = torch.tensor([1])
+    detector = torch.tensor([[0.1, 0.9], [0.8, 0.2], [0.0, 1.0]])
+    clip = torch.tensor([[0.9, 0.1], [0.2, 0.8], [0.0, 1.0]])
+    det_valid, det_queries, _ = semantic_best_queries(
+        overlaps, classes, detector, min_iou=0.5
+    )
+    clip_valid, clip_queries, _ = semantic_best_queries(
+        overlaps, classes, clip, min_iou=0.5
+    )
+    assert det_valid.tolist() == clip_valid.tolist() == [True]
+    assert det_queries.tolist() == [0]
+    assert clip_queries.tolist() == [1]
+
+
+def test_rare_failure_partition_distinguishes_topk_from_one_to_one():
+    accumulator = Counter()
+    update_rare_recall_accumulator(
+        accumulator,
+        frequencies=["r", "r", "r", "r", "f"],
+        eligible_box=torch.tensor([False, True, True, True, True]),
+        pair_in_topk=torch.tensor([False, False, True, True, True]),
+        one_to_one_hit=torch.tensor([False, False, False, True, True]),
+    )
+    report = finalize_rare_recall_accumulator(
+        accumulator, min_iou=0.5, image_topk=300
+    )
+    assert report["rare_gt"] == 4
+    assert report["no_eligible_box"] == 1
+    assert report["eligible_but_pair_below_topk"] == 1
+    assert report["pair_in_topk_but_one_to_one_miss"] == 1
+    assert report["one_to_one_hit"] == 1
+    with pytest.raises(ValueError, match="not nested"):
+        update_rare_recall_accumulator(
+            accumulator,
+            frequencies=["r"],
+            eligible_box=torch.tensor([False]),
+            pair_in_topk=torch.tensor([True]),
+            one_to_one_hit=torch.tensor([False]),
+        )
 
 
 def test_true_class_topk_hits_and_complementarity_partition_actual_misses():
