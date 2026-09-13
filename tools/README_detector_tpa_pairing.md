@@ -156,3 +156,58 @@ python -m pytest -q --rootdir=tests --confcutdir=tests \
   tests/test_rare_transition_ops.py \
   tests/test_rare_gt_transitions_cli.py
 ```
+
+## 完整验证集 AP50/AP75 与 TP 前的 FP（纯 CPU）
+
+`compare_rare_pr_reports.py` 先比较两份完整验证集报告的逐类 AP、AP50、AP75。
+默认关注之前下降最大的十类（包括 koala、cocoa_(beverage)、joystick、
+roller_skate）；可用 `--focus` 显式指定其他类别。选择用于诊断，不是按验证集
+类别结果调整模型或逐类融合参数。
+
+原报告的 `per_class` 保存全部 rare 类的 AP 指标，但 `focus` 只保存当时
+指定类别的原始 PR。缺失曲线会明确标记 `MISSING_CURVE`，不视作零 FP。
+仅报告模式若缺曲线，仍保存 AP 比较，`complete=false`，CLI 退出码为 2。
+
+加 `--fill-missing-curves` 后，若缺曲线，读取报告中记录的完整预测 JSON：
+每边只为缺失的目标类别执行一次官方 CPU LVIS 评估。全验证集图片（含负样本）
+都参与，完整类别预测先执行每图 top-300，再限制分析类别。**不使用 450 图
+panel 代替完整验证集、不运行模型、不读 checkpoint、不用 GPU、不改原报告。**
+补算的逐类 AP/AP50/AP75/AR 必须与原报告一致，否则拒绝混用数据。实际预测和
+标注哈希写入输出；旧报告没有原始哈希时，补算一致不能追溯证明整个旧报告的
+文件身份，也不会把目标类别均值冒充完整 APr。
+
+```bash
+cd ~/LaMI-DETR
+set -o pipefail
+
+/root/miniconda3/envs/lami/bin/python -u tools/compare_rare_pr_reports.py \
+  --old-report /root/autodl-tmp/k5_12ep_rare_pr/kang_current_protocol_report.json \
+  --new-report /root/autodl-tmp/k5_12ep_rare_pr/report.json \
+  --expected-old-apr 45.2037 \
+  --expected-new-apr 41.5932 \
+  --fill-missing-curves \
+  --output /root/autodl-tmp/k5_12ep_rare_pr/ranking_comparison.json \
+  2>&1 | tee /root/autodl-tmp/k5_12ep_rare_pr/ranking_comparison.log
+```
+
+如果预测文件搬了位置，加 `--old-predictions` / `--new-predictions` 指定新路径。
+原生预测应是各自完整验证集的全类别结果，不是 `old_old_predictions.json` 等
+抽样 panel 文件。已保存曲线齐全时即使带补算开关，也不会重评测。未对服务器
+实测耗时；载入大 JSON、匹配、累积各阶段会即时打印进度。
+
+输出含每个 IoU/类别的 TP、FP、最大召回、首个 TP 的 1-based 排名、首个 TP 前
+的 FP 数，以及每个 TP 前的累计 FP。排名是**同一类别在全部验证图上的分数
+顺序**，不是单图 top-300 的位置；忽略项不计排名，分数并列保留原评估顺序。
+第 k 个 TP 只表示分数顺序，不能跨 checkpoint 当成同一 GT。没有 TP 时返回
+`NO_TP`/null，而不是 `FP before first TP=0`。
+
+这些统计用于区分 PR 排序和不同 IoU 下的召回变化，不直接证明训练原因；不要
+仅凭首个 TP 的排名或相同的终点 TP 数推断完整 AP。
+
+```bash
+python -m pytest -q --rootdir=tests --confcutdir=tests \
+  tests/test_rare_pr_comparison_ops.py \
+  tests/test_rare_pr_curve_replay.py \
+  tests/test_compare_rare_pr_reports_cli.py \
+  tests/test_lvis_rare_pr.py
+```
