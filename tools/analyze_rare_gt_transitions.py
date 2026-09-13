@@ -20,8 +20,9 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+# Editable Detectron2 installations also expose a top-level ``tools`` package.
+# The repo can already be on sys.path *behind* it, so membership is not enough.
+sys.path.insert(0, str(ROOT))
 
 
 def sha256_file(path):

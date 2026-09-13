@@ -1,6 +1,7 @@
 from copy import deepcopy
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -200,3 +201,27 @@ def test_help_does_not_require_model_dependencies():
     result = subprocess.run([sys.executable, "-S", str(script), "--help"], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert "--source-json" in result.stdout and "--old-ap-report" in result.stdout
+
+
+def test_direct_script_prioritizes_repo_over_another_tools_package(inputs):
+    path, _, _ = inputs
+    repo = Path(__file__).resolve().parents[1]
+    foreign = path / "foreign"
+    package = foreign / "tools"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text('"""Unrelated installed tools package."""\n')
+    env = dict(os.environ)
+    # The repo is present already, but is behind an unrelated same-name package.
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(foreign), str(repo), env.get("PYTHONPATH", "")]
+    )
+    result = subprocess.run([
+        sys.executable, str(repo / "tools/analyze_rare_gt_transitions.py"),
+        "--source-json", str(path / "report.json"),
+        "--annotations", str(path / "annotations.json"),
+        "--old-ap-report", str(path / "old_ap.json"),
+        "--new-ap-report", str(path / "new_ap.json"),
+        "--output", str(path / "subprocess_transitions.json"),
+    ], cwd=path, env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads((path / "subprocess_transitions.json").read_text())["complete"]
