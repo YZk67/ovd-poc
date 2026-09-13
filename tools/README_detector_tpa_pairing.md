@@ -105,3 +105,54 @@ python -m pytest -q --rootdir=tests --confcutdir=tests \
 
 未安装 LVIS 时相关集成测试会跳过，其余张量测试可在没有 Detectron2/GPU 的环境运行。
 完整 checkpoint 前向仍须在服务器的 Detectron2/Detrex 环境验证。
+
+## 已保存结果：官方 GT 命中转移分解（纯 CPU）
+
+`analyze_rare_gt_transitions.py` 不加载 checkpoint、特征缓存、PyTorch 或
+Detectron2；只读取上述已完成的 `report.json`、`old_old_predictions.json`、
+`new_new_predictions.json` 和 LVIS 标注。不会再次运行模型或改动原缓存。
+
+官方 LVIS 的全类别 top-300、ignore 和逐图逐类一对一匹配决定每个 GT 的 TP/FN。
+对“旧 TP → 新 FN”分解新模型的失败侧，对“旧 FN → 新 TP”也分解旧模型的
+失败侧，两者相减必须与原报告的净 TP 变化闭合。正常三种原因是：
+
+- `no_eligible_query`：全部原始 query 中没有满足指定 IoU 的框。
+- `correct_pair_below_topk`：有合格框，但没有正确类别的合格候选进入全图 top-k。
+- `matching_competition`：正确候选已进入保存结果，但被官方匹配分配给另一个 GT。
+
+缓存覆盖与实际保存候选不一致等情况单列，不强行塞进这三种原因。几何覆盖不是
+一对一召回；query 编号不能跨模型对应，脚本按原始 annotation ID 对应。
+各原因还报告类别等权的 **macro recall 百分点贡献**，避免 GT 多的类别支配结论。
+这不是 APr 归因：逐类正式 `ΔAP` 从完整验证集报告独立关联，不按漏检数量摊分。
+只能定位输出侧的失败环节，不能单凭此结果归罪于 APR、训练初始化等因素。
+
+默认检查原 `pairing_cache/manifest.json` 的标注 SHA256 与报告 fingerprint；若
+manifest 不在，会明确警告无法验证原始标注哈希。无论如何，两边重新匹配的每类
+GT/TP、FP、ignore 和完整分数排序 PR 曲线必须与原报告一致，否则拒绝输出完成报告。
+修改这里的独立脚本不会改变原模型缓存的代码指纹。
+
+服务器同步新增代码后运行（不需要分配 GPU）：
+
+```bash
+cd ~/LaMI-DETR
+set -o pipefail
+
+/root/miniconda3/envs/lami/bin/python -u tools/analyze_rare_gt_transitions.py \
+  --source-json /root/autodl-tmp/detector_tpa_pairing/report.json \
+  --old-ap-report /root/autodl-tmp/k5_12ep_rare_pr/kang_current_protocol_report.json \
+  --new-ap-report /root/autodl-tmp/k5_12ep_rare_pr/report.json \
+  --output /root/autodl-tmp/detector_tpa_pairing/gt_transitions.json \
+  2>&1 | tee /root/autodl-tmp/detector_tpa_pairing/gt_transitions.log
+```
+
+原生预测 JSON 默认从 `--source-json` 同目录读取；搬动过文件可显式传入
+`--old-predictions`、`--new-predictions`。只需分析召回原因时可同时省略两个
+`--*-ap-report`，此时不会输出正式逐类 AP 关联。运行时间取决于 CPU/磁盘，
+本地未对服务器数据计时；开始、旧模型匹配、新模型匹配、保存各阶段即时打印。
+
+```bash
+python -m pytest -q --rootdir=tests --confcutdir=tests \
+  tests/test_lvis_gt_matching.py \
+  tests/test_rare_transition_ops.py \
+  tests/test_rare_gt_transitions_cli.py
+```
