@@ -143,6 +143,30 @@ def summarize_group(rows):
     return result
 
 
+def summarize_fused_best_components(rows):
+    """Summarize true-class scores on each GT's fused-best eligible query."""
+    if not rows:
+        return {"count": 0}
+    return {
+        "count": len(rows),
+        "detector_true_probability": distribution(
+            row["inferred_detector_probability"] for row in rows
+        ),
+        "clip_true_probability": distribution(
+            row["fused_query_clip_true_probability"] for row in rows
+        ),
+        "score_over_top300_threshold": distribution(
+            row["score_over_top300_threshold"] for row in rows
+        ),
+        "clip_best_roi_top5_fraction": sum(
+            row["clip_best_query_rank"] <= 5 for row in rows
+        ) / len(rows),
+        "near_top300_threshold_count": sum(
+            row["score_over_top300_threshold"] >= 0.8 for row in rows
+        ),
+    }
+
+
 def analyze(rows, protocol, *, class_names=None, seen_class_ids=None):
     if not rows or len({(r["image_id"], r["gt_index"]) for r in rows}) != len(rows):
         raise ValueError("expected nonempty, uniquely identified per-GT rows")
@@ -203,6 +227,7 @@ def analyze(rows, protocol, *, class_names=None, seen_class_ids=None):
 
     category_table = []
     for category_id, category_rows in by_category.items():
+        category_hits = [r for r in category_rows if r["status"] == "current_hit"]
         category_misses = [r for r in category_rows if r["status"] == "current_miss"]
         if not category_misses:
             continue
@@ -215,6 +240,7 @@ def analyze(rows, protocol, *, class_names=None, seen_class_ids=None):
                     else None
                 ),
                 "rare_gt_in_selected_images": len(category_rows),
+                "hit_count": len(category_hits),
                 "miss_count": len(category_misses),
                 "miss_fraction": len(category_misses) / len(category_rows),
                 "miss_gt_roi_top5": sum(r["gt_rank"] <= 5 for r in category_misses)
@@ -222,6 +248,15 @@ def analyze(rows, protocol, *, class_names=None, seen_class_ids=None):
                 "miss_clip_best_roi_top5": sum(
                     r["clip_best_query_rank"] <= 5 for r in category_misses
                 ) / len(category_misses),
+                "hit_fused_best_components": summarize_fused_best_components(
+                    category_hits
+                ),
+                "miss_fused_best_components": summarize_fused_best_components(
+                    category_misses
+                ),
+                "miss_semantic_partition": dict(
+                    Counter(r["semantic_partition"] for r in category_misses)
+                ),
             }
         )
     category_table.sort(key=lambda x: (-x["miss_count"], x["category_id"]))
@@ -335,6 +370,29 @@ def print_report(report):
             f"  {label}: miss {row['miss_count']}/{row['rare_gt_in_selected_images']}, "
             f"GT-ROI top5={row['miss_gt_roi_top5']*100:.1f}%, "
             f"query-ROI top5={row['miss_clip_best_roi_top5']*100:.1f}%"
+        )
+    print("\nPer-class fused-best true-class components (hit/miss medians):")
+    print(
+        "class              H   M   det H/M       CLIP H/M       "
+        "score/threshold H/M  miss neither-top5  miss near-thr"
+    )
+    def median(group, field):
+        return group.get(field, {}).get("median", float("nan"))
+
+    for row in report["categories_with_misses"][:10]:
+        hit = row["hit_fused_best_components"]
+        miss = row["miss_fused_best_components"]
+        label = row["name"] or str(row["category_id"])
+        print(
+            f"{label[:17]:17} {row['hit_count']:3d} {row['miss_count']:3d} "
+            f"{median(hit, 'detector_true_probability'):.4g}/"
+            f"{median(miss, 'detector_true_probability'):.4g}  "
+            f"{median(hit, 'clip_true_probability'):.4g}/"
+            f"{median(miss, 'clip_true_probability'):.4g}  "
+            f"{median(hit, 'score_over_top300_threshold'):.2f}/"
+            f"{median(miss, 'score_over_top300_threshold'):.2f}  "
+            f"{row['miss_semantic_partition'].get('neither_topk', 0):3d}  "
+            f"{miss['near_top300_threshold_count']:3d}"
         )
     seen_fraction = report["wrong_clip_top1_seen_fraction"]
     if seen_fraction is not None:

@@ -84,6 +84,15 @@ def test_analysis_counts_paired_roi_states_and_thresholds(capsys):
     assert report["by_area"]["medium"]["miss_fraction"] == 0.5
     assert report["detector_inversion_unavailable"] == 0
     assert report["wrong_clip_top1_seen_fraction"] == 1.0
+    category = report["categories_with_misses"][0]
+    assert category["hit_count"] == 1
+    assert category["miss_fused_best_components"]["count"] == 2
+    assert category["miss_fused_best_components"]["near_top300_threshold_count"] == 1
+    assert category["hit_fused_best_components"]["score_over_top300_threshold"]["median"] == pytest.approx(1.5)
+    assert category["miss_semantic_partition"] == {
+        "gt_only_topk": 1,
+        "neither_topk": 1,
+    }
     print_report(report)
     assert "Rare ROI-path failure analysis" in capsys.readouterr().out
 
