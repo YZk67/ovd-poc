@@ -4,6 +4,8 @@ import pytest
 import torch
 
 from tools.diagnose_tpa_usage import (
+    absolute_xyxy_to_normalized_cxcywh,
+    collect_rare_gt_roi_rows,
     complementarity_verdict,
     component_branch_verdict,
     finalize_complementarity_accumulator,
@@ -17,6 +19,8 @@ from tools.diagnose_tpa_usage import (
     make_selection_accumulator,
     select_dataset_records,
     semantic_best_queries,
+    summarize_gt_roi_comparison,
+    true_class_clip_stats,
     true_class_topk_hits,
     update_complementarity_accumulator,
     update_component_accumulator,
@@ -146,6 +150,65 @@ def test_detector_and_clip_select_their_own_best_eligible_query():
     assert det_valid.tolist() == clip_valid.tolist() == [True]
     assert det_queries.tolist() == [0]
     assert clip_queries.tolist() == [1]
+
+
+def test_gt_box_normalization_and_exact_clip_class_stats():
+    boxes = torch.tensor([[10.0, 20.0, 30.0, 60.0]])
+    normalized = absolute_xyxy_to_normalized_cxcywh(boxes, width=100, height=80)
+    assert normalized[0].tolist() == pytest.approx([0.2, 0.5, 0.2, 0.5])
+    ranks, probabilities = true_class_clip_stats(
+        torch.tensor([[0.0, 2.0, 1.0], [2.0, 0.0, 1.0]]),
+        torch.tensor([1, 1]),
+    )
+    assert ranks.tolist() == [1, 3]
+    assert probabilities[0] > probabilities[1]
+
+
+def test_gt_roi_pairing_uses_same_clip_head_and_preserves_no_box_case():
+    class DummyModel:
+        vlm_content_query_embedding = torch.eye(2)
+        vlm_temperature = 1.0
+        alpha = 0.0
+        beta = 0.3
+        novel_scale = 3.0
+
+        def extract_region_feature(self, features, bbox, layer_name):
+            assert layer_name == "p3"
+            assert bbox.shape == (1, 2, 4)
+            return torch.tensor([[[0.0, 5.0], [0.0, 5.0]]])
+
+    capture = {}
+    rows = collect_rare_gt_roi_rows(
+        model=DummyModel(),
+        capture=capture,
+        p3_features=torch.zeros((1, 2, 10, 10)),
+        image_input={"image": torch.zeros((3, 100, 100))},
+        record={"image_id": 7, "width": 100, "height": 100},
+        gt_boxes=torch.tensor([[10.0, 10.0, 60.0, 60.0], [70.0, 70.0, 90.0, 90.0]]),
+        gt_classes=torch.tensor([1, 1]),
+        predicted_boxes=torch.tensor([[10.0, 10.0, 60.0, 60.0], [20.0, 20.0, 70.0, 70.0]]),
+        overlaps=torch.tensor([[0.8, 0.6], [0.1, 0.2]]),
+        detector_logits=torch.tensor([[0.0, 0.0], [0.0, 0.0]]),
+        image_vlm_logits=torch.tensor([[2.0, 0.0], [0.0, 1.0]]),
+        fused_scores=torch.tensor([[0.3, 0.03], [0.1, 0.05]]),
+        current_hits=torch.tensor([False, False]),
+        frequencies=["r", "r"],
+        novel_mask=torch.tensor([False, True]),
+        min_iou=0.5,
+        topk_threshold=0.1,
+    )
+    assert capture["diagnostic_gt_roi_active"] is False
+    assert [row["status"] for row in rows] == ["current_miss", "no_eligible_box"]
+    assert rows[0]["fused_query_id"] == 1
+    assert rows[0]["clip_best_query_id"] == 1
+    assert rows[0]["gt_rank"] == 1
+    assert rows[0]["gt_true_probability"] > rows[0]["clip_best_query_true_probability"]
+    assert rows[0]["gt_clip_counterfactual_fused_score"] > 0.1
+    assert "fused_query_id" not in rows[1]
+    summary = summarize_gt_roi_comparison(rows)
+    assert summary["current_miss"]["count"] == 1
+    assert summary["no_eligible_box"]["count"] == 1
+    assert summary["current_miss"]["counterfactual_crosses_fixed_topk_threshold"] == 1
 
 
 def test_rare_failure_partition_distinguishes_topk_from_one_to_one():

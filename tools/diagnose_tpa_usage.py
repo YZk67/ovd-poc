@@ -75,8 +75,9 @@ def install_capture_hooks(model, capture):
 
     def capture_region_feature(features, bbox, layer_name):
         result = original_extract(features, bbox, layer_name)
-        if layer_name == "p3":
+        if layer_name == "p3" and not capture.get("diagnostic_gt_roi_active", False):
             capture["roi_features"] = result.detach()
+            capture["roi_feature_maps"] = {"p3": features["p3"].detach()}
         return result
 
     model.extract_region_feature = capture_region_feature
@@ -106,6 +107,307 @@ def box_cxcywh_to_xyxy(boxes):
         (cx - 0.5 * width, cy - 0.5 * height, cx + 0.5 * width, cy + 0.5 * height),
         dim=-1,
     )
+
+
+def absolute_xyxy_to_normalized_cxcywh(boxes, width, height):
+    """Map resize-only validation GT boxes to the ROI extractor's box format."""
+    if boxes.ndim != 2 or boxes.shape[-1] != 4:
+        raise ValueError("GT boxes must have shape [G,4]")
+    if width <= 0 or height <= 0:
+        raise ValueError("image width and height must be positive")
+    scale = boxes.new_tensor([width, height, width, height])
+    xyxy = (boxes / scale).clamp(0.0, 1.0)
+    left_top = xyxy[:, :2]
+    right_bottom = xyxy[:, 2:]
+    return torch.cat(((left_top + right_bottom) * 0.5, right_bottom - left_top), dim=-1)
+
+
+def true_class_clip_stats(logits, class_ids):
+    """Return exact vocabulary rank and softmax probability of each true class."""
+    if logits.ndim != 2 or class_ids.ndim != 1 or logits.shape[0] != class_ids.numel():
+        raise ValueError("expected CLIP logits [G,C] and classes [G]")
+    true_logits = logits.gather(1, class_ids[:, None])
+    ranks = 1 + (logits > true_logits).sum(dim=-1)
+    true_probabilities = logits.softmax(dim=-1).gather(1, class_ids[:, None]).squeeze(1)
+    return ranks, true_probabilities
+
+
+def summarize_gt_roi_comparison(rows):
+    """Aggregate paired rare-GT diagnostics without converting them into AP."""
+    report = {}
+    for status in ("all", "no_eligible_box", "current_hit", "current_miss"):
+        selected = rows if status == "all" else [row for row in rows if row["status"] == status]
+        if not selected:
+            report[status] = {"count": 0}
+            continue
+        result = {
+            "count": len(selected),
+            "gt_top1": sum(row["gt_rank"] == 1 for row in selected) / len(selected),
+            "gt_top5": sum(row["gt_rank"] <= 5 for row in selected) / len(selected),
+            "gt_median_rank": float(np.median([row["gt_rank"] for row in selected])),
+            "gt_median_true_probability": float(
+                np.median([row["gt_true_probability"] for row in selected])
+            ),
+        }
+        paired = [row for row in selected if row["status"] != "no_eligible_box"]
+        if paired:
+            n = len(paired)
+            result.update(
+                {
+                    "paired_count": n,
+                    "fused_query_clip_top5": sum(row["fused_query_clip_rank"] <= 5 for row in paired) / n,
+                    "clip_best_query_top5": sum(row["clip_best_query_rank"] <= 5 for row in paired) / n,
+                    "gt_top5_on_paired": sum(row["gt_rank"] <= 5 for row in paired) / n,
+                    "fused_query_clip_median_rank": float(
+                        np.median([row["fused_query_clip_rank"] for row in paired])
+                    ),
+                    "clip_best_query_median_rank": float(
+                        np.median([row["clip_best_query_rank"] for row in paired])
+                    ),
+                    "gt_rescues_clip_best_top5": sum(
+                        row["clip_best_query_rank"] > 5 and row["gt_rank"] <= 5
+                        for row in paired
+                    ),
+                    "gt_worse_than_clip_best_top5": sum(
+                        row["clip_best_query_rank"] <= 5 and row["gt_rank"] > 5
+                        for row in paired
+                    ),
+                    "fused_query_clip_median_probability": float(
+                        np.median([row["fused_query_clip_true_probability"] for row in paired])
+                    ),
+                    "clip_best_query_median_probability": float(
+                        np.median([row["clip_best_query_true_probability"] for row in paired])
+                    ),
+                    "gt_median_probability_on_paired": float(
+                        np.median([row["gt_true_probability"] for row in paired])
+                    ),
+                    "median_gt_minus_clip_best_log_probability": float(
+                        np.median(
+                            [
+                                math.log(max(row["gt_true_probability"], 1e-12))
+                                - math.log(max(row["clip_best_query_true_probability"], 1e-12))
+                                for row in paired
+                            ]
+                        )
+                    ),
+                    "counterfactual_crosses_fixed_topk_threshold": sum(
+                        row["gt_clip_counterfactual_fused_score"] > row["image_topk_threshold"]
+                        for row in paired
+                    ),
+                }
+            )
+        report[status] = result
+    return report
+
+
+def print_gt_roi_comparison(report):
+    print("\n=== Rare GT-box vs predicted-box CLIP ROI comparison ===")
+    print(
+        "Prediction boxes are existing IoU-valid queries; GT boxes are diagnostic "
+        "only. CLIP-best is an oracle among eligible predictions. The fixed "
+        "top-k counterfactual is not a deployable detector or an AP estimate."
+    )
+    print(
+        f"{'status':>16} {'N':>5} {'fused-q top5%':>14} "
+        f"{'CLIP-best top5%':>16} {'GT top5%':>10} "
+        f"{'GT rescues':>10} {'fixed-topk cross':>16}"
+    )
+    for status in ("current_hit", "current_miss", "no_eligible_box"):
+        row = report[status]
+        if not row["count"]:
+            continue
+        if status == "no_eligible_box":
+            print(f"{status:>16} {row['count']:5d} {'-':>14} {'-':>16} {100 * row['gt_top5']:10.2f} {'-':>10} {'-':>16}")
+        else:
+            print(
+                f"{status:>16} {row['count']:5d} "
+                f"{100 * row['fused_query_clip_top5']:14.2f} "
+                f"{100 * row['clip_best_query_top5']:16.2f} "
+                f"{100 * row['gt_top5_on_paired']:10.2f} "
+                f"{row['gt_rescues_clip_best_top5']:10d} "
+                f"{row['counterfactual_crosses_fixed_topk_threshold']:16d}"
+            )
+    print(
+        f"{'status':>16} {'fused-q p-med':>13} {'CLIP-best p-med':>16} "
+        f"{'GT p-med':>12} {'GT worse top5':>13}"
+    )
+    for status in ("current_hit", "current_miss", "no_eligible_box"):
+        row = report[status]
+        if not row["count"]:
+            continue
+        if status == "no_eligible_box":
+            print(
+                f"{status:>16} {'-':>13} {'-':>16} "
+                f"{row['gt_median_true_probability']:12.6f} {'-':>13}"
+            )
+        else:
+            print(
+                f"{status:>16} "
+                f"{row['fused_query_clip_median_probability']:13.6f} "
+                f"{row['clip_best_query_median_probability']:16.6f} "
+                f"{row['gt_median_probability_on_paired']:12.6f} "
+                f"{row['gt_worse_than_clip_best_top5']:13d}"
+            )
+    print("Median true-class rank (fused-query / CLIP-best query / GT box):")
+    for status in ("current_hit", "current_miss"):
+        row = report[status]
+        if row["count"]:
+            print(
+                f"  {status}: {row['fused_query_clip_median_rank']:.1f} / "
+                f"{row['clip_best_query_median_rank']:.1f} / "
+                f"{row['gt_median_rank']:.1f}"
+            )
+
+
+def collect_rare_gt_roi_rows(
+    *,
+    model,
+    capture,
+    p3_features,
+    image_input,
+    record,
+    gt_boxes,
+    gt_classes,
+    predicted_boxes,
+    overlaps,
+    detector_logits,
+    image_vlm_logits,
+    fused_scores,
+    current_hits,
+    frequencies,
+    novel_mask,
+    min_iou,
+    topk_threshold,
+):
+    """Compare frozen CLIP on rare GT boxes and matched predicted ROIs.
+
+    The test mapper must be resize-only. GT boxes are never fed to the detector
+    or its inference selection; they are used only for this diagnostic pass.
+    """
+    original_width = int(record["width"])
+    original_height = int(record["height"])
+    input_height, input_width = image_input["image"].shape[-2:]
+    x_scale = input_width / original_width
+    y_scale = input_height / original_height
+    if abs(math.log(x_scale / y_scale)) > 0.01:
+        raise ValueError("test image geometry is not resize-only")
+    rare_indices = [
+        index for index, frequency in enumerate(frequencies) if frequency == "r"
+    ]
+    if not rare_indices:
+        return []
+    rare_index_tensor = torch.tensor(rare_indices, device=gt_classes.device)
+    rare_boxes = gt_boxes[rare_index_tensor]
+    rare_classes = gt_classes[rare_index_tensor]
+    rare_overlaps = overlaps[rare_index_tensor]
+    rare_hits = current_hits[rare_index_tensor]
+    normalized_boxes = absolute_xyxy_to_normalized_cxcywh(
+        rare_boxes, original_width, original_height
+    )
+    capture["diagnostic_gt_roi_active"] = True
+    try:
+        gt_roi_features = model.extract_region_feature(
+            {"p3": p3_features}, normalized_boxes[None], "p3"
+        )[0]
+    finally:
+        capture["diagnostic_gt_roi_active"] = False
+    gt_vlm_logits = (
+        gt_roi_features.float()
+        @ model.vlm_content_query_embedding.t()
+        * float(model.vlm_temperature)
+    )
+    gt_ranks, gt_true_probs = true_class_clip_stats(gt_vlm_logits, rare_classes)
+    clip_valid, clip_queries, _ = semantic_best_queries(
+        rare_overlaps, rare_classes, image_vlm_logits, min_iou
+    )
+    fused_valid, fused_queries, _ = semantic_best_queries(
+        rare_overlaps, rare_classes, fused_scores, min_iou
+    )
+    if not torch.equal(clip_valid, fused_valid):
+        raise RuntimeError("CLIP/fused GT-box comparison validity disagrees")
+
+    rows = []
+    gt_ranks_list = gt_ranks.tolist()
+    gt_probs_list = gt_true_probs.tolist()
+    gt_top1_list = gt_vlm_logits.argmax(dim=-1).tolist()
+    gt_boxes_list = rare_boxes.tolist()
+    valid_list = clip_valid.tolist()
+    hits_list = rare_hits.tolist()
+    rare_classes_list = rare_classes.tolist()
+    for rare_offset, gt_index in enumerate(rare_indices):
+        xyxy = gt_boxes_list[rare_offset]
+        area_fraction = (
+            max(xyxy[2] - xyxy[0], 0.0)
+            * max(xyxy[3] - xyxy[1], 0.0)
+            / (original_width * original_height)
+        )
+        rows.append(
+            {
+                "image_id": int(record["image_id"]),
+                "gt_index": int(gt_index),
+                "category_id": int(rare_classes_list[rare_offset]),
+                "status": (
+                    "current_hit"
+                    if hits_list[rare_offset]
+                    else "current_miss"
+                    if valid_list[rare_offset]
+                    else "no_eligible_box"
+                ),
+                "gt_xyxy": xyxy,
+                "gt_area_fraction": area_fraction,
+                "gt_rank": int(gt_ranks_list[rare_offset]),
+                "gt_true_probability": float(gt_probs_list[rare_offset]),
+                "gt_top1_category_id": int(gt_top1_list[rare_offset]),
+            }
+        )
+
+    if not clip_valid.any():
+        return rows
+    valid_rare_indices = torch.nonzero(clip_valid, as_tuple=False).flatten()
+    valid_classes = rare_classes[clip_valid]
+    fused_query_clip_logits = image_vlm_logits[fused_queries]
+    clip_best_query_logits = image_vlm_logits[clip_queries]
+    fused_query_ranks, fused_query_probs = true_class_clip_stats(
+        fused_query_clip_logits, valid_classes
+    )
+    clip_best_ranks, clip_best_probs = true_class_clip_stats(
+        clip_best_query_logits, valid_classes
+    )
+    fused_true_scores = fused_scores[fused_queries, valid_classes]
+    counterfactual_scores = fuse_detector_vlm_scores(
+        detector_logits[fused_queries],
+        gt_vlm_logits[clip_valid],
+        novel_mask,
+        fusion="power",
+        base_weight=float(model.alpha),
+        novel_weight=float(model.beta),
+        novel_scale=float(model.novel_scale),
+    ).exp().gather(1, valid_classes[:, None]).squeeze(1)
+    fused_query_ious = rare_overlaps[valid_rare_indices, fused_queries]
+    predicted_xyxy = predicted_boxes[fused_queries].tolist()
+    for paired_offset, rare_offset in enumerate(valid_rare_indices.tolist()):
+        rows[rare_offset].update(
+            {
+                "fused_query_id": int(fused_queries[paired_offset]),
+                "clip_best_query_id": int(clip_queries[paired_offset]),
+                "fused_query_xyxy": predicted_xyxy[paired_offset],
+                "fused_query_iou": float(fused_query_ious[paired_offset]),
+                "fused_query_clip_rank": int(fused_query_ranks[paired_offset]),
+                "fused_query_clip_true_probability": float(fused_query_probs[paired_offset]),
+                "fused_query_clip_top1_category_id": int(
+                    fused_query_clip_logits[paired_offset].argmax()
+                ),
+                "clip_best_query_rank": int(clip_best_ranks[paired_offset]),
+                "clip_best_query_true_probability": float(clip_best_probs[paired_offset]),
+                "clip_best_query_top1_category_id": int(
+                    clip_best_query_logits[paired_offset].argmax()
+                ),
+                "fused_true_score": float(fused_true_scores[paired_offset]),
+                "gt_clip_counterfactual_fused_score": float(counterfactual_scores[paired_offset]),
+                "image_topk_threshold": float(topk_threshold),
+            }
+        )
+    return rows
 
 
 def box_iou(boxes1, boxes2):
@@ -841,6 +1143,11 @@ def main():
     )
     parser.add_argument("--image-topk", type=int, default=300)
     parser.add_argument("--category-rank-cutoff", type=int, default=5)
+    parser.add_argument(
+        "--compare-gt-roi",
+        action="store_true",
+        help="compare CLIP on rare GT boxes and the existing predicted boxes",
+    )
     parser.add_argument("--output", default=None, help="optional JSON report path")
     parser.add_argument(
         "opts",
@@ -863,6 +1170,17 @@ def main():
 
     cfg = LazyConfig.load(args.config_file)
     cfg = LazyConfig.apply_overrides(cfg, args.opts)
+    if args.compare_gt_roi:
+        augmentations = cfg.dataloader.test.mapper.augmentation
+        resize_only = (
+            len(augmentations) == 1
+            and "ResizeShortestEdge" in str(augmentations[0]._target_)
+            and cfg.dataloader.test.mapper.augmentation_with_crop is None
+        )
+        if not resize_only:
+            raise ValueError(
+                "GT ROI comparison requires resize-only test augmentation"
+            )
     dataset_name = cfg.dataloader.test.dataset.names
     if not isinstance(dataset_name, str):
         if len(dataset_name) != 1:
@@ -927,6 +1245,7 @@ def main():
         }
         for branch in ("detector", "clip", "fused")
     }
+    gt_roi_rows = []
     rare_recall = Counter()
     selection_accumulator = make_selection_accumulator()
     component_accumulator = make_component_accumulator()
@@ -967,6 +1286,8 @@ def main():
                 "final_scores",
                 "roi_features",
             }
+            if args.compare_gt_roi:
+                required.add("roi_feature_maps")
             missing = required - set(capture)
             if missing:
                 raise RuntimeError(f"capture hooks missed: {sorted(missing)}")
@@ -978,6 +1299,7 @@ def main():
             prompts = capture["prompt_features"]
             final_scores = capture["final_scores"].float()
             roi_features = capture["roi_features"].float()
+            roi_feature_maps = capture.get("roi_feature_maps")
             if final_scores.shape != detector_logits.shape:
                 raise RuntimeError(
                     "final fused score shape does not match detector logits: "
@@ -1123,6 +1445,28 @@ def main():
                 update_rare_recall_accumulator(
                     rare_recall, all_frequencies, valid, pair_in_topk, current_hits
                 )
+                if args.compare_gt_roi:
+                    gt_roi_rows.extend(
+                        collect_rare_gt_roi_rows(
+                            model=model,
+                            capture=capture,
+                            p3_features=roi_feature_maps["p3"][local_index : local_index + 1],
+                            image_input=model_input,
+                            record=record,
+                            gt_boxes=gt_boxes,
+                            gt_classes=gt_classes,
+                            predicted_boxes=predicted,
+                            overlaps=overlaps,
+                            detector_logits=detector_logits[local_index].float(),
+                            image_vlm_logits=image_vlm_logits,
+                            fused_scores=image_scores,
+                            current_hits=current_hits,
+                            frequencies=all_frequencies,
+                            novel_mask=novel_mask,
+                            min_iou=args.min_iou,
+                            topk_threshold=float(top_values[-1]),
+                        )
+                    )
                 update_complementarity_accumulator(
                     complementarity_accumulator,
                     valid=valid,
@@ -1305,6 +1649,12 @@ def main():
     )
     for key, value in rare_recall_report.items():
         print(f"{key}: {value}")
+    gt_roi_report = None
+    if args.compare_gt_roi:
+        if len(gt_roi_rows) != rare_recall_report["rare_gt"]:
+            raise RuntimeError("rare GT ROI comparison row count disagrees")
+        gt_roi_report = summarize_gt_roi_comparison(gt_roi_rows)
+        print_gt_roi_comparison(gt_roi_report)
 
     selection_report = finalize_selection_accumulator(
         selection_accumulator, args.category_rank_cutoff
@@ -1434,6 +1784,7 @@ def main():
         "ranking": finalized,
         "semantic_branch_ranking": semantic_branch_report,
         "rare_recall": rare_recall_report,
+        "gt_roi_comparison": gt_roi_report,
         "selection": selection_report,
         "selection_verdict": ranking_verdict,
         "score_components": component_report,
@@ -1445,6 +1796,8 @@ def main():
         "verdict": verdict,
         "top1_gain_over_best_one_vector": gain,
     }
+    if args.compare_gt_roi:
+        report["gt_roi_rare_instances"] = gt_roi_rows
     if args.output:
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
