@@ -350,3 +350,67 @@ query fusion 和预测框。旧新对应框仍各用自己的特征，不是共�
 ```bash
 python -m pytest -q --rootdir=tests --confcutdir=tests tests/test_rare_logit_decomposition.py
 ```
+
+## 第一步：同一 checkpoint 的固定半径前向几何审计
+
+`audit_tpa_geometry.py` 默认只审计 **new checkpoint**。加载一次可信的本地 checkpoint，
+仅在 CPU 上重建文本侧 TPA，复用上一节区域报告中的 query/box/CLIP 缓存。
+**不运行 detector 或图像前向，不做梯度审计，不训练，不重新评测 AP。**
+它不会修改 checkpoint、缓存、训练配置或模型代码。
+
+```bash
+cd ~/LaMI-DETR
+set -o pipefail
+
+/root/miniconda3/envs/lami/bin/python -u tools/audit_tpa_geometry.py \
+  --source-json /root/autodl-tmp/k5_12ep_fp_regions/report.json \
+  --side new \
+  --prompt-bank dataset/metadata/lvis_claude_prompts_convnextl.npy \
+  --output /root/autodl-tmp/k5_12ep_fp_regions/geometry_audit.json \
+  2>&1 | tee /root/autodl-tmp/k5_12ep_fp_regions/geometry_audit.log
+```
+
+checkpoint 路径从区域报告读取；如仅移动了文件，可用 `--checkpoint` 指定新路径，
+但 SHA256 必须一致。脚本同时核验 prompt 张量身份、类别顺序、共享 TPA 权重别名、
+缓存来源、原生 prototype 重建误差和所选 query 的原生分数。
+CPU/GPU 浮点容差明确保存在报告中；不匹配直接报错，不自动生成新缓存。
+`--side old` 可单独用于旧 checkpoint 的零强度对照，但不自动追加执行。
+
+严格区分以下三个均值：
+
+```text
+c = mean(value_proj(prompts))                  # 投影后的 prompt 均值
+a = mean(attention-weighted prototypes)        # 固定半径变换前的 slot 均值
+b = mean(fixed-radius prototypes)              # 固定半径变换后的 slot 均值
+
+u_k = (p_k - c) / clamp(norm(p_k - c), min=1e-6)
+r = mode_strength * clamp(norm(c), min=1e-6)
+q_k = c + r * u_k                              # strength > 0 时
+b = c + r * mean(u_k)                          # 不保证 b=c，也不保证 b=a
+```
+
+变换前后的权重、slot prior、attention 和 query 完全相同，只在局部分类重放中
+绕过/应用现有固定半径变换。`before` 不是“从未使用防坍塌训练”的模型，也不是
+重新初始化的 TPA，更不等于把变换后的 prototypes 压成单中心的 `mode_scale=0`。
+
+输出分为三部分：
+
+- 全词表及 rare/common/frequent 分组：中心位移、中心方向夹角、逐 slot 范数、
+  单位 slot 均值的长度和方向、变换前后的 rank/cosine。JSON 保留全部类别，
+  不只查看事后挑出的失败类别。
+- 固定原生 query/box/CLIP：FP 与 TP 的 `after-before` logit 变化，拆分为中心响应、
+  center-to-mean 校正和 LME 增量；也保留投影后 prompt 中心 `c` 的固定响应。
+- 所选 FP/TP 的融合分数顺序，不重新筛选全图 top-300、不重新匹配 FP/TP。
+  不确定 query 身份的区域仅明细列出，不进入汇总；相同 query 去重。
+
+零中心/接近零残差会单独标记；被 clamp 的残差实际半径不必等于目标半径。
+几何摘要是类别等权的描述统计，不是 LVIS APr（其中还包括没有验证 GT 的类别）。
+
+这一步能隔离**固定半径前向变换在当前已训练权重下的直接影响**。
+若它同时抬高 FP 和 TP，或中心偏移并未解释误排序，不能简单删掉该变换。
+即使观察到 FP 受益，也不能据此判定是哪项训练修改造成了最终权重差异，或承诺
+回退后提高 APr；APR、梯度投影、初始化的训练归因仍需后续独立对照。
+
+```bash
+python -m pytest -q --rootdir=tests --confcutdir=tests tests/test_tpa_geometry_audit.py
+```
