@@ -414,3 +414,90 @@ b = c + r * mean(u_k)                          # 不保证 b=c，也不保证 b=
 ```bash
 python -m pytest -q --rootdir=tests --confcutdir=tests tests/test_tpa_geometry_audit.py
 ```
+
+## 第二步：检测任务 / APR / 冲突投影的局部梯度审计
+
+`audit_tpa_gradients.py` 读取第一步完整 `geometry_audit.json`，只审计同一新 checkpoint。
+**需要短暂使用一张 GPU 求真实训练损失的梯度，但不创建 optimizer/scheduler，
+不执行参数更新，不保存新模型 checkpoint，也不训练任何 epoch。**
+缓存特征没有检测损失计算图，因此不能用 CPU 分类代理损失冒充真实任务梯度。
+
+```bash
+cd ~/LaMI-DETR
+set -o pipefail
+
+CUDA_VISIBLE_DEVICES=0 /root/miniconda3/envs/lami/bin/python -u tools/audit_tpa_gradients.py \
+  --geometry-json /root/autodl-tmp/k5_12ep_fp_regions/geometry_audit.json \
+  --config-file lami_dino/configs/dino_convnext_large_4scale_12ep_lvis.py \
+  --windows 2 --microbatches 8 --batch-size 4 \
+  --output /root/autodl-tmp/k5_12ep_fp_regions/gradient_audit.json \
+  2>&1 | tee /root/autodl-tmp/k5_12ep_fp_regions/gradient_audit.log
+```
+
+默认预算是 **2 个独立窗口 × 8 个 micro-batch × 4 张图 = 64 次训练图像曝光**，
+每个窗口平均 32 张图的梯度，但所有窗口始终停留在同一 checkpoint，不连续更新。
+重复采样可能重复图像，不能声称是 64 张不同图片。脚本硬限制最多 128 次曝光。
+如显存不足，可改为 `--batch-size 2 --microbatches 16`，同时使用新的输出路径；
+这会改变 FedLoss 子集和局部 batch 构成，不是严格等价的梯度。
+
+先检查已有 query 缓存，再加载完整 checkpoint，使用配置原有的
+`lvis_v1_train_norare`、训练增强、RepeatFactor sampler、dropout、denoising、匹配和
+加权损失。固定随机种子，worker 数为零；iteration 和 APR 内部计数保持 checkpoint
+位置，不重启 warmup。只请求 TPA 参数的偏导，其他参数作为常量，检测前向保持
+training 模式。每个窗口检查所有模型参数与持久 buffer 未被写入，`.grad` 未填充。
+不支持含训练态 BatchNorm 的其他模型，避免混入不同统计口径。
+
+每个 micro-batch 在**同一个前向图**上分别求：
+
+```text
+g_detector = ∇(全部加权检测损失，包括分类、框、GIoU、辅助层、encoder、denoising)
+g_rpsa     = ∇(已加权、已应用 schedule 的 RPSA)
+g_apr      = ∇(原模型返回的完整加权 APR)
+
+各项先跨 micro-batch 平均：
+g_task   = g_detector + g_rpsa
+g_total  = g_task + g_apr
+g_routed = 原训练器使用的 route_conflicting_task_gradient(g_total, g_apr)
+```
+
+**不能先投影每个 micro-batch 再平均。** JSON 保留图像 ID、增强后尺寸、FedLoss
+类别子集、各损失、未连接的参数项，以及梯度范数、余弦和各参数块范数。
+单卡 FedLoss 只从本地 batch 收集 GT；虽有相同的图像曝光数，仍不是原四卡 batch
+的精确重放，也未恢复当时的数据/随机数状态。
+
+GPU 求导结束先保存 `gradient_audit.gradients.pt`，随后 CPU 计算文本侧 JVP。
+如果分析中断，或只需再次打印结果，给**同一命令**加 `--reuse-gradients`，
+会核验缓存身份并跳过所有图像/GPU 工作；不要删除梯度缓存重跑。
+缺失或不匹配的源文件直接报错，不补算图像，不自动覆盖已有梯度缓存。
+
+### 如何读方向审计
+
+针对 detector、RPSA、task、APR、未投影总梯度、投影后 task、最终 routed 和
+投影新增项，分别计算 `J[-g/||g||]`：它是沿**单位参数空间下降方向**的局部导数。
+这不是实际更新，也不是把 APR 梯度当作 prototype 的直接梯度；它经过完整文本侧
+key/value/query 参数化和固定半径变换的 Jacobian。
+
+- `d_shift`：固定半径变换前后中心偏移比的变化；正值表示局部增大。
+- `d_spread`：变换前残差相对 prompt 中心的分散程度变化。
+- `d_unit_mean`：变换后单位原型平均向量长度变化。
+- `d_cos`：变换后 pairwise cosine 变化；不能把更低 cosine 直接解释为更高 AP。
+- `value-center angular-speed`：投影后 prompt 中心方向的转动速率，**无正负**，
+  不代表向正确或错误语义转动。零中心方向标记为未定义，不纳入该均值。
+- 固定验证 query 的分类 logit 导数：中心、mean-correction、LME 增量、总 logit。
+  这些验证标签只对诊断结果分 FP/TP，绝不用于训练损失。
+
+单位方向归一化去掉了梯度量级，**不能仅比较两行单位导数就说谁主导了训练**。
+报告同时给原始梯度范数，以及统一采用最终 routed 梯度裁剪系数后的
+`common-clip logit` 导数。后者保留各分量量级，可作加性分解，但仍没有乘 LR，
+也没有 AdamW 动量、预条件和 weight decay；它不是 optimizer 实际位移。
+
+全词表/频次分组统计为描述性均值，包括没有验证 GT 的类；选定 FP/TP 分数导数
+只改变 TPA，固定 decoder query、框和 CLIP，不重新运行 query fusion 或选 top-300。
+梯度来自训练态前向（包含 dropout），几何/分数 JVP 则读取无 dropout 的推理态
+文本原型，衡量这些训练梯度对推理表示的局部影响。
+结果只能说明**当前训练位置、这些 batch 上的局部趋势**，不能证明整个训练历史的
+因果关系，也不能承诺改动后恢复旧模型 APr。
+
+```bash
+python -m pytest -q --rootdir=tests --confcutdir=tests tests/test_tpa_gradient_audit.py
+```
