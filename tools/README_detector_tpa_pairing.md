@@ -601,3 +601,97 @@ grep -E 'copypaste: [0-9]' \
 
 本组不自动满足 12ep 启动条件；仍按约定用正式 4ep APr（优先 40 以上）与 rank
 一起决策，不因 loss 下降、rank 变高或几个事后选中类别改善而自动延长训练。
+
+## 第四步：已完成的 no-radius 4ep，只续到 8ep 验证
+
+当前 no-radius 4ep：AP=33.1235、APr=39.7325；全词表 rank=4.7135、
+pairwise cosine=0.19964、mode strength=0。相比原生同阶段 APr +2.0252、
+AP -0.7381。这是继续验证的依据，不代表已达到 12ep 的目标 APr。
+
+新配置 `dino_convnext_large_4scale_8ep_lvis_no_radius.py` **只改变停止点**：
+
+| 项目 | 4→8ep 续训 |
+| --- | --- |
+| 恢复 / 停止 | 从 iteration=28400 开始，到 56799 完成；新增 28,400 次 optimizer updates |
+| LR 时间线 | 仍为 85,200，继承原 scheduler；不重启 warmup、不把衰减提前到 8ep |
+| batch / 结构 / loss | physical batch=16、累积 2 次；radius=0；APR、投影、RPSA 不变 |
+| 推理 | alpha=0、beta=0.3、novel_scale=3；其余完全继承 no-radius 4ep |
+| 保存 / 评测 | 每 14,200 updates 保存；6ep=42599；8ep=56799 并正式评测，然后停止 |
+
+**不要改用原生 12ep 配置，也不要新建空输出目录后直接写 `--resume`。**
+原训练器找不到 `last_checkpoint` 会回退到从头初始化。下面的 CPU 预检先检查
+真实指针、iteration、完整 optimizer/LRScheduler 状态、85,200 horizon、累积次数，
+以及 checkpoint 内每个 TPA 的 K=5、slot prior=0.2、radius=0；不加载 detector/GPU。
+检查失败就停下查原因，不跳过检查改成 weights-only 初始化。
+
+### 首次从 4ep 续训
+
+先同步本提交。确认该目录没有训练/评测进程在写入，然后运行：
+
+```bash
+cd ~/LaMI-DETR
+/root/miniconda3/envs/lami/bin/python -m pytest -q --rootdir=tests --confcutdir=tests \
+  tests/test_no_radius_resume.py tests/test_tpa_radius_ablation.py \
+  tests/test_lr_scheduler_horizon.py tests/test_gradient_accumulation.py
+```
+
+下面用 `&&` 保证预检/快照成功后才会启动训练：
+
+```bash
+cd ~/LaMI-DETR
+/root/miniconda3/envs/lami/bin/python -u tools/prepare_no_radius_8ep_resume.py \
+  --output-dir /root/autodl-tmp/instructdet_k5_no_radius_bs32_4ep_seed42 \
+  --snapshot && \
+CUDA_VISIBLE_DEVICES=0,1,2,3 /root/miniconda3/envs/lami/bin/python -u tools/train_net.py \
+  --config-file lami_dino/configs/dino_convnext_large_4scale_8ep_lvis_no_radius.py \
+  --num-gpus 4 --resume \
+  train.output_dir=/root/autodl-tmp/instructdet_k5_no_radius_bs32_4ep_seed42 \
+  dataloader.evaluator.output_dir=/root/autodl-tmp/instructdet_k5_no_radius_bs32_4ep_seed42
+```
+
+`--snapshot` 将指针指向的 4ep checkpoint、`last_checkpoint`、`config.yaml`、
+`metrics.json`、`log.txt`、预测 JSON **独立复制**到本目录的 `four_ep_snapshot/`，
+保存大小与 SHA256。需要这些文件总大小的额外磁盘空间；不会使用会随覆盖而损坏
+的硬链接。训练期间当前 `model_final.pth`、配置和预测结果可能被覆盖；原始 4ep
+证据在快照中保留。不改任何 checkpoint 内容，不移动或删除源文件。
+源数据未变时可重复执行准备；已有快照不一致则拒绝覆盖。复制失败时保留临时目录，
+报告其路径，不自动清理用户数据。不带 `--snapshot` 时只校验、不写文件。
+
+该准备步骤仅适用于 **iteration=28399 的首次阶段转换**。如 4→8ep 途中中断，
+不要用更晚 checkpoint 重建“4ep 快照”；直接重跑上面的 `train_net.py` 命令部分，
+同一 8ep no-radius 配置、同一输出目录和 `--resume`。保留正确的 `last_checkpoint`。
+恢复完整优化器和 scheduler，但不是 bitwise 连续重放的数据顺序/RNG 保证。
+
+启动后应看到 `Resuming training from iteration 28400`（首次续训）；
+LR horizon=85200、effective batch=32。该阶段 detector LR=1e-4、TPA LR=1e-3，
+RPSA scale=1、`tpa/prototype_mode_strength=0`。若看到 `Starting ... iteration 0`、
+累积变 1、radius=1.5 或 LR 时间线变化，先停止检查，不继续消耗算力。
+
+### 8ep 结束后
+
+```bash
+cd ~/LaMI-DETR
+/root/miniconda3/envs/lami/bin/python - <<'PY'
+import json
+from pathlib import Path
+root = Path('/root/autodl-tmp/instructdet_k5_no_radius_bs32_4ep_seed42')
+rows = [json.loads(line) for line in (root / 'metrics.json').read_text().splitlines() if line.strip()]
+# Final EvalHook may write at 56800, after optimizer iteration 56799 finished.
+evaluations = [row for row in rows if row.get('iteration') in (56799, 56800) and 'bbox/APr' in row]
+if not evaluations:
+    raise SystemExit('No 8ep bbox/APr at iteration 56799/56800: check eval/log before treating the last result as 8ep.')
+row = evaluations[-1]
+print({key: row.get(key) for key in ('iteration', 'bbox/AP', 'bbox/APr', 'bbox/APc', 'bbox/APf')})
+print('Native-radius 8ep reference: AP=40.6867, APr=40.4466')
+print('delta_APr:', row['bbox/APr'] - 40.4466)
+PY
+/root/miniconda3/envs/lami/bin/python tools/check_tpa_rank.py \
+  /root/autodl-tmp/instructdet_k5_no_radius_bs32_4ep_seed42/model_final.pth \
+  dataset/metadata/lvis_claude_prompts_convnextl.npy
+```
+
+原生参照是 **8ep / iteration=56799**，即使旧评测目录名曾误写为 `5ep`，也不要
+按目录名混用 5ep 的 AP=37.3383、APr=40.3582。比较正式 AP/APr 与全词表 rank，
+检查 4ep 的 rare 收益是否延续及整体 AP 代价；之后再决定是否续至 12ep。
+8ep 尚未到原 LR 衰减点，单个阶段结果不是最终 12ep 收益的保证或否定。
+本配置到 8ep 即停止，不自动启动任何新消融或 12ep 续训。
