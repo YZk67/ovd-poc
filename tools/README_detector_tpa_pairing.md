@@ -604,6 +604,9 @@ grep -E 'copypaste: [0-9]' \
 
 ## 第四步：已完成的 no-radius 4ep，只续到 8ep 验证
 
+此节保留原 8ep 停止方案。**当前已改为文末“当前启动方案：一次恢复至 12ep”**，
+8ep 照常评测，但不主动结束进程，避免多一次 sampler/RNG 重建。
+
 当前 no-radius 4ep：AP=33.1235、APr=39.7325；全词表 rank=4.7135、
 pairwise cosine=0.19964、mode strength=0。相比原生同阶段 APr +2.0252、
 AP -0.7381。这是继续验证的依据，不代表已达到 12ep 的目标 APr。
@@ -695,3 +698,66 @@ PY
 检查 4ep 的 rare 收益是否延续及整体 AP 代价；之后再决定是否续至 12ep。
 8ep 尚未到原 LR 衰减点，单个阶段结果不是最终 12ep 收益的保证或否定。
 本配置到 8ep 即停止，不自动启动任何新消融或 12ep 续训。
+
+## 当前启动方案：一次恢复至 12ep，8ep 评测后继续
+
+已确认当前 4ep 后尚未启动续训。本次改为**只恢复一次、剩余 8ep 连续执行**。
+使用 `dino_convnext_large_4scale_12ep_lvis_no_radius.py`，不是原生有半径的
+`dino_convnext_large_4scale_12ep_lvis.py`。新配置从 no-radius 4ep 继承一切，
+只把 `train.max_iter` 改成 85,200；不引入新训练方法或改变 APR/投影/RPSA。
+
+| 位置 | 行为 |
+| --- | --- |
+| 28,400 | 从原目录的 no-radius 4ep checkpoint 恢复模型、optimizer 和 scheduler |
+| 56,799（8ep） | 保存 `model_0056799.pth`，正式评测，结束后同一进程继续训练 |
+| 78,100 | 按原 12ep 时间线衰减 LR；不是在 8ep 提前衰减 |
+| 85,199（12ep） | 保存最终 checkpoint；最终评测后退出 |
+
+physical batch=16、累积=2、effective batch=32、seed=42、radius=0、slot prior=0.2、
+K=5、推理 alpha=0/beta=0.3/novel_scale=3 均不变。继承 checkpoint period=14,200
+（6/8/10/12ep 保存）和 eval period=28,400（恢复后在 8/12ep 评测）。
+
+边界：这是**减少一次计划中的进程重启**，不是从 iteration=0 到 12ep 的严格
+等价重放。已有 checkpoint 没有保存 RNG、sampler 游标或 worker/预取状态，
+首次 resume 仍会重新创建这些状态；这次不尝试事后恢复它们，不承诺 APr 无波动。
+现有预检验证的是优化器/LR/模型状态，不是完整随机训练轨迹的等价性。
+
+### 服务器启动命令（替代上面的 8ep 命令）
+
+先同步包含新配置的提交。保持原输出目录，确认没有其他训练/评测进程向它写入。
+CPU 预检沿用工具名 `prepare_no_radius_8ep_resume.py`，但显式指定 `--target-epochs 12`。
+如果原 8ep 准备步骤已生成 4ep 快照，校验源文件和 SHA256 一致后直接复用；
+不会修改该快照的旧 manifest，也不会重新复制大文件。
+
+```bash
+cd ~/LaMI-DETR
+PYTHONPATH=. /root/miniconda3/envs/lami/bin/python -m pytest -q \
+  --rootdir=tests --confcutdir=tests \
+  tests/test_no_radius_resume.py tests/test_tpa_radius_ablation.py \
+  tests/test_lr_scheduler_horizon.py tests/test_gradient_accumulation.py && \
+/root/miniconda3/envs/lami/bin/python -u tools/prepare_no_radius_8ep_resume.py \
+  --output-dir /root/autodl-tmp/instructdet_k5_no_radius_bs32_4ep_seed42 \
+  --target-epochs 12 --snapshot && \
+CUDA_VISIBLE_DEVICES=0,1,2,3 /root/miniconda3/envs/lami/bin/python -u tools/train_net.py \
+  --config-file lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_no_radius.py \
+  --num-gpus 4 --resume \
+  train.output_dir=/root/autodl-tmp/instructdet_k5_no_radius_bs32_4ep_seed42 \
+  dataloader.evaluator.output_dir=/root/autodl-tmp/instructdet_k5_no_radius_bs32_4ep_seed42
+```
+
+必须核对日志：`Resuming training from iteration 28400`、stop=85200、LR horizon=85200、
+effective batch=32；radius monitor=0。当前目录的名字仍含 `4ep` 是为沿用恢复指针，
+不代表现在只训练 4ep。预检或测试失败不要绕过 `&&` 直接开始训练。
+
+8ep 评测期间日志暂时没有训练 loss 是正常的；评测后应出现 iteration≥56800 的
+训练记录。无需杀进程或另起 eval-only。用原生 8ep AP=40.6867/APr=40.4466 作参照，
+如果决定继续，让当前进程运行即可，不再执行一次 `--resume`。
+
+8ep 的 AP 记录在日志/metrics，checkpoint 是 `model_0056799.pth`，**不要用
+当时仍可能属于 4ep 的 `model_final.pth` 检查 8ep rank**。结束 12ep 后，
+`model_final.pth` 才会被新的最终权重覆盖。预测 JSON 在下一次评测会被覆盖，
+如果要留 8ep 的逐框结果，在下一次评测之前独立复制 `lvis_instances_results.json`；
+这次不改变 evaluator 的输出行为。4ep 原始证据继续由 `four_ep_snapshot/` 保存。
+
+如意外中断，只重跑上面的训练命令部分（仍是 12ep no-radius 配置、同一目录、
+`--resume`）；不要让更晚 checkpoint 再通过仅针对 4ep 的准备步骤或覆盖 4ep 快照。

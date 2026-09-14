@@ -1,4 +1,4 @@
-"""CPU-only guards for the bounded no-radius 4 -> 8ep continuation."""
+"""CPU-only guards for no-radius 4 -> 8ep / continuous 4 -> 12ep resume."""
 
 import ast
 import copy
@@ -42,16 +42,23 @@ def make_run(tmp_path):
     return run
 
 
-def test_checkpoint_preflight_preserves_state_and_12ep_lr_horizon():
+@pytest.mark.parametrize("target_epochs,stop", [(8, 56800), (12, 85200)])
+def test_checkpoint_preflight_preserves_state_and_12ep_lr_horizon(target_epochs, stop):
     ckpt = checkpoint()
-    report = validate_checkpoint(ckpt)
+    report = validate_checkpoint(ckpt, target_epochs=target_epochs)
     assert report["resume_iteration"] == 28400
-    assert report["stop_iteration"] == 56800
+    assert report["stop_iteration"] == stop
     assert report["lr_scheduler_max_iter"] == 85200
     assert report["gradient_accumulation_steps"] == 2
     assert report["optimizer_lrs"] == [1e-4, 1e-3]
     assert ckpt["trainer"]["hooks"]["LRScheduler"]["last_epoch"] == 28400
     assert torch.equal(ckpt["trainer"]["optimizer"]["state"][0]["exp_avg"], torch.ones(1))
+
+
+@pytest.mark.parametrize("target_epochs", [4, 10, 16])
+def test_unsupported_continuation_target_is_rejected(target_epochs):
+    with pytest.raises(ValueError, match="target_epochs must be 8 or 12"):
+        validate_checkpoint(checkpoint(), target_epochs=target_epochs)
 
 
 @pytest.mark.parametrize("key,value", [
@@ -168,6 +175,29 @@ def test_missing_marker_and_wrong_run_pointer_fail_before_writes(tmp_path):
     assert not (run / "four_ep_snapshot").exists()
 
 
+def test_twelve_epoch_target_reuses_identical_four_epoch_snapshot_without_writing(tmp_path):
+    run = make_run(tmp_path)
+    prepare(run, snapshot=True)
+    archive = run / "four_ep_snapshot"
+    before = {p.name: p.read_bytes() for p in archive.iterdir()}
+    report = prepare(run, snapshot=True, target_epochs=12)
+    assert report["stop_iteration"] == 85200
+    assert {p.name: p.read_bytes() for p in archive.iterdir()} == before
+    # Ignoring the future stop must NOT accept a changed source identity.
+    manifest = json.loads((archive / "manifest.json").read_text())
+    manifest["resume"]["gradient_accumulation_steps"] = 1
+    (archive / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="different source"):
+        prepare(run, snapshot=True, target_epochs=12)
+
+
+def test_new_snapshot_records_twelve_epoch_plan(tmp_path):
+    run = make_run(tmp_path)
+    prepare(run, snapshot=True, target_epochs=12)
+    manifest = json.loads((run / "four_ep_snapshot/manifest.json").read_text())
+    assert manifest["resume"]["stop_iteration"] == manifest["resume"]["lr_scheduler_max_iter"] == 85200
+
+
 def test_snapshot_requires_evidence_and_free_space(tmp_path, monkeypatch):
     from tools import prepare_no_radius_8ep_resume as module
 
@@ -182,11 +212,13 @@ def test_snapshot_requires_evidence_and_free_space(tmp_path, monkeypatch):
     assert not (run / "four_ep_snapshot").exists()
 
 
-def test_eight_epoch_config_changes_only_stopping_point(monkeypatch):
+@pytest.mark.parametrize("target_epochs,stop", [(8, 56800), (12, 85200)])
+def test_continuation_config_changes_only_stopping_point(monkeypatch, target_epochs, stop):
     module_name = "_resume_test_package.dino_convnext_large_4scale_4ep_lvis_no_radius"
     base = ModuleType(module_name)
     base.train = SimpleNamespace(max_iter=28400, lr_scheduler_max_iter=85200,
-                                 output_dir="original_4ep_run", gradient_accumulation_steps=2)
+                                 output_dir="original_4ep_run", gradient_accumulation_steps=2,
+                                 eval_period=28400, checkpointer=SimpleNamespace(period=14200))
     base.model = SimpleNamespace(classifier=SimpleNamespace(tpa_prototype_mode_strength=0.0))
     base.dataloader = SimpleNamespace(evaluator=SimpleNamespace(output_dir="original_4ep_run"))
     base.optimizer = SimpleNamespace(lr=1e-4)
@@ -194,14 +226,42 @@ def test_eight_epoch_config_changes_only_stopping_point(monkeypatch):
     base.iterations_per_epoch = 7100
     before = copy.deepcopy(vars(base.train))
     monkeypatch.setitem(sys.modules, module_name, base)
-    path = Path(__file__).resolve().parents[1] / "lami_dino/configs/dino_convnext_large_4scale_8ep_lvis_no_radius.py"
+    path = Path(__file__).resolve().parents[1] / f"lami_dino/configs/dino_convnext_large_4scale_{target_epochs}ep_lvis_no_radius.py"
     source = path.read_text()
-    namespace = {"__package__": "_resume_test_package", "__name__": "_resume_test_package.eight_ep"}
+    namespace = {"__package__": "_resume_test_package", "__name__": "_resume_test_package.continuation"}
     exec(compile(source, str(path), "exec"), namespace)
-    assert vars(base.train) == dict(before, max_iter=56800)
+    assert vars(base.train) == dict(before, max_iter=stop)
+    assert 56800 % base.train.checkpointer.period == 0
+    assert 56800 % base.train.eval_period == 0
     assert base.model.classifier.tpa_prototype_mode_strength == 0.0
     for name in ("dataloader", "model", "optimizer", "lr_multiplier", "train"):
         assert namespace[name] is getattr(base, name)
     statements = ast.parse(source).body
     assert [ast.unparse(s.targets[0]) for s in statements if isinstance(s, ast.Assign)] == ["train.max_iter"]
     assert all(isinstance(s, (ast.Expr, ast.ImportFrom, ast.Assign)) for s in statements)
+
+
+def test_actual_eval_hook_keeps_eight_epoch_eval_inside_twelve_epoch_run():
+    # Exercise real hook control flow without importing Detectron2/CUDA. This
+    # checks timing, not RNG/data-stream equivalence across a process restart.
+    path = Path(__file__).resolve().parents[1] / "detectron2/detectron2/engine/hooks.py"
+    node = next(n for n in ast.parse(path.read_text()).body
+                if isinstance(n, ast.ClassDef) and n.name == "EvalHook")
+    namespace = {"HookBase": object}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
+    calls = []
+    hook = namespace["EvalHook"](28400, lambda: calls.append(hook.trainer.iter))
+    hook.trainer = SimpleNamespace(iter=56799, max_iter=85200)
+    hook._do_eval = hook._func  # Avoid evaluator side effects; test scheduling only.
+    hook.after_step()
+    assert calls == [56799] and callable(hook._func)
+    hook.trainer.iter = 56800
+    hook.after_step()
+    assert calls == [56799]
+    hook.trainer.iter = 85199
+    hook.after_step()
+    assert calls == [56799]
+    hook.trainer.iter = 85200
+    hook.after_train()
+    assert calls == [56799, 85200]
+    assert not hasattr(hook, "_func")
