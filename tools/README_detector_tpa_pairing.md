@@ -293,3 +293,60 @@ Checkpoint 路径默认读取原 manifest；搬迁后用 `--old-checkpoint` / `-
 ```bash
 python -m pytest -q --rootdir=tests --confcutdir=tests tests/test_rare_region_pairing.py
 ```
+
+## 固定 query 的中心 / 多原型 / 偏置分解
+
+`analyze_rare_fp_logits.py` 读取上一节已完成的 `report.json`，直接复用它记录的
+原缓存和补充 `region_cache`。**只用 CPU，不加载 detector/checkpoint、不读取图片，
+也不会补算缺失缓存。** 不修改原报告、缓存、训练配置或推理协议。
+
+```bash
+cd ~/LaMI-DETR
+set -o pipefail
+
+/root/miniconda3/envs/lami/bin/python -u tools/analyze_rare_fp_logits.py \
+  --source-json /root/autodl-tmp/k5_12ep_fp_regions/report.json \
+  --output /root/autodl-tmp/k5_12ep_fp_regions/logit_decomposition.json \
+  2>&1 | tee /root/autodl-tmp/k5_12ep_fp_regions/logit_decomposition.log
+```
+
+对于已固定的 post-linear query 特征 `x` 和目标类别原始 prototypes `p_k`：
+
+```text
+u_k = dot(normalize(x), normalize(p_k))
+center = scale * dot(normalize(x), normalize(mean(p_k)))
+native_logit = scale * tau * log(mean(exp(u_k / tau))) + bias
+mode_delta = native_logit - bias - center
+
+mean_slot = scale * mean(u_k)
+center_to_mean_correction = mean_slot - center
+dispersion_uplift = native_logit - bias - mean_slot
+
+native_logit = center + mode_delta + bias
+mode_delta = center_to_mean_correction + dispersion_uplift
+```
+
+`mode_delta` 是相对**先平均原始 prototype、再归一化**的单中心分类器的净变化，
+可以正也可以负。只有 `dispersion_uplift`（相对平均 cosine 的 LME 增量）保证非负；
+不能忽略中心归一化和平均方式造成的校正项，把它直接当成多原型净收益。
+若中心向量为零/接近零，JSON 会标记方向未定义，并保留与现有归一化实现一致的数值。
+
+脚本逐条核验框、原生 detector/CLIP 分数和融合分数，检查加性分解闭合，再输出：
+
+- 来源 FP/TP、另一模型的最近框和区域内最高分框的三项 logit，以及两个子项。
+- 以新模型 FP/TP 区域为组的旧新差值均值；旧模型 TP 参照不重复纳入主汇总。
+- 保持 query、框、CLIP 不变，只把末端分类器变为单中心时，选中 FP/TP 的分数顺序。
+- JSON 额外保存每个 slot 的 cosine、后验权重、prototype 范数、偏置及重算误差。
+
+这是 **logit** 的加性分解；sigmoid 概率和最终融合分数不能这样相加。
+固定 query 的单中心分类器也**不等于全模型 `mode_scale=0`**：后者还可能改变前面的
+query fusion 和预测框。旧新对应框仍各用自己的特征，不是共享特征的跨模型因果对照。
+
+主汇总中的旧端点只继承新来源区域的分组，不代表它已被正式匹配为旧模型 FP/TP。
+重叠 FP 和被多次选中的旧 query 不独立，脚本报告 unique query 数；样本为事后选中。
+分数顺序检查不重新选择 top-300、不重新匹配 TP/FP，也不计算或预测正式 AP。
+不自动给出“修改哪项损失能提高 APr”的结论。
+
+```bash
+python -m pytest -q --rootdir=tests --confcutdir=tests tests/test_rare_logit_decomposition.py
+```
