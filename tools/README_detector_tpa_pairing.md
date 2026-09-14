@@ -244,3 +244,52 @@ python -m pytest -q --rootdir=tests --confcutdir=tests \
   tests/test_compare_rare_pr_reports_cli.py \
   tests/test_lvis_rare_pr.py
 ```
+
+## 对具体 FP 区域比较两路分数和框重叠
+
+`diagnose_rare_fp_regions.py` 读取 `pre_tp_fp_details.json`，默认选 `koala`、
+`roller_skate`、`joystick` 的新模型前置 FP，并加入这三类旧/新模型的 TP 作为参照。
+打印实际选中的图像 ID；默认最多 20 张。已有 `pairing_cache` 保持只读。
+
+缓存中可能没有全部负样本图。带 `--fill-missing` 时，只对缺少的图片和 checkpoint
+各补一次原生前向，写入新输出目录下的 `region_cache`；完整缓存不启动模型。
+补算前检查 checkpoint、模型代码、配置和文本库的原始哈希，补算的 prototype
+bank 必须与原缓存一致（浮点最大误差不超过 `1e-6`）。每张图断点续跑可复用。
+
+```bash
+cd ~/LaMI-DETR
+mkdir -p /root/autodl-tmp/k5_12ep_fp_regions
+set -o pipefail
+
+CUDA_VISIBLE_DEVICES=0 /root/miniconda3/envs/lami/bin/python -u \
+  tools/diagnose_rare_fp_regions.py \
+  --fp-details /root/autodl-tmp/k5_12ep_rare_pr/pre_tp_fp_details.json \
+  --pairing-cache /root/autodl-tmp/detector_tpa_pairing/pairing_cache \
+  --output /root/autodl-tmp/k5_12ep_fp_regions/report.json \
+  --fill-missing --dump-device cuda:0 --device cpu \
+  2>&1 | tee /root/autodl-tmp/k5_12ep_fp_regions/run.log
+```
+
+Checkpoint 路径默认读取原 manifest；搬迁后用 `--old-checkpoint` / `--new-checkpoint`
+覆盖路径，文件内容哈希仍须相同。去掉 `--fill-missing` 可先纯 CPU 检查缓存；若
+缺失则保存图片清单和 `complete=false`，退出码 2。模型前向需要服务器的 lami
+环境；本地测试验证了缓存重算和缺失图片调度，没有执行真实 checkpoint 前向。
+
+每个来源 FP/TP 先通过原像素框和融合分数找回来源 query（容差 `0.05` 像素、
+`5e-5` 分数）；找不到会中止，多解会输出全部候选并标记 `ambiguous`。
+另一 checkpoint 按几何对应，分别输出最高 IoU 框，以及 IoU≥0.5 的框中该类别
+融合分数最高者，同时记录两边区域内进入全图 top-300 的同类候选数。
+
+输出包括 detector sigmoid 概率、CLIP 全词表 softmax 概率、目标类别在各分支全词表中的排名、
+融合分数、框坐标、图像 top-300 状态及阈值。与其他标注类别重叠时，也报告该
+标注类别的两路分数（例如 roller_skate 区域的 skateboard 分数）。新模型同图
+同类前置 FP 的完整两两 IoU 矩阵可核实是否集中在同一物体上。
+
+另一模型的 detector query 与来源框一般并不完全重合；这里是两个原生框的
+区域对照，**不是把同一 ROI 强行送入两个 detector 分类器的因果实验**。
+区域内最高分的选择由分数决定，几何最高 IoU 的对照独立列出。加权 log 分数
+变化只做代数分解，不据此直接归因于某项训练修改，也不估算 APr 增益。
+
+```bash
+python -m pytest -q --rootdir=tests --confcutdir=tests tests/test_rare_region_pairing.py
+```
