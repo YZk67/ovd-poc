@@ -501,3 +501,103 @@ key/value/query 参数化和固定半径变换的 Jacobian。
 ```bash
 python -m pytest -q --rootdir=tests --confcutdir=tests tests/test_tpa_gradient_audit.py
 ```
+
+## 第三步：只移除固定半径参数化的 4ep 训练消融
+
+配置：`lami_dino/configs/dino_convnext_large_4scale_4ep_lvis_no_radius.py`。
+这次是**新的训练实验，需要 GPU，耗时接近此前 effective-bs32 的 4ep run**；
+不是继续做 CPU 重放，也不自动启动第二组训练或延长到 12ep。
+
+唯一训练变量是 `model.classifier.tpa_prototype_mode_strength: 1.5 -> 0.0`。
+已有实现中，零强度直接保留 attention 聚合的五个原型，绕过固定半径变换。
+不增加新方法、不改初始化函数、不改 APR/投影。与原生配置使用同一种子时，
+所有初始可训练张量和随机数消耗相同，只有这个持久 buffer 不同。
+**初始输出原型不保证相同**：变换在第一次 forward 就不同，这正是消融变量。
+这也不等于 `model.tpa_eval_mode_scale=0`，后者把原型收缩到均值；本实验保持该值为 1。
+
+继承 `4ep_lvis_screen` 的其余设置，不缩短 LR 时间线：
+
+| 项目 | 固定设置 |
+| --- | --- |
+| 初始化 | CLIP backbone-only；detector/TPA 从头初始化；seed=42 |
+| batch | 4 卡，physical global batch=16，累积 2 次，effective batch=32 |
+| 时长 | 28,400 次 optimizer updates（项目的 4ep 标签）；LR horizon=85,200 |
+| LR | 基础 detector=1e-4，TPA=1e-3；继承原 LR warmup，不额外冻结或压缩时间线 |
+| TPA | K=5，slot prior=0.2，identity value init，dropout=0.1 |
+| APR/投影 | barrier 和 balance 权重 0.10/0.03；冲突投影开启；独立裁剪 0.5 |
+| RPSA | 原版 RPSA，weight=0.05，20,000 开始、8,000 ramp；不是 teacher RPSA |
+| 推理 | alpha=0、beta=0.3、novel_scale=3；Eq.1 tau=0.004375，Eq.2 tau=0.07，top-3 |
+| 保存/评测 | checkpoint 每 14,200 次更新；正式评测只在 28,400 结束时 |
+
+参照已有**同阶段、同 batch/protocol**的原生 K=5 结果：
+`instructdet_k5_effective_bs32_4ep_seed42/model_0028399.pth`（如果仍保留），
+AP=33.8616、APr=37.7073、rank=4.7566。
+该目录后续已续训：**现在的 model_final.pth、预测 JSON 和最后一条 log 不是 4ep 对照**。
+不要与旧 bs16 的 4ep 或现在的 12ep 数值作匹配因果比较。已有参照避免默认多跑一组；
+但历史参照未在本提交重新训练，多种子波动、当时代码/资产身份仍需单独说明。
+
+### 运行
+
+拉取包含该配置的提交后，先运行纯 CPU 回归测试和资产检查：
+
+```bash
+cd ~/LaMI-DETR
+/root/miniconda3/envs/lami/bin/python -m pytest -q --rootdir=tests --confcutdir=tests \
+  tests/test_tpa_radius_ablation.py tests/test_text_prototype_aggregator.py \
+  tests/test_prototype_ops.py tests/test_checkpoint_init.py \
+  tests/test_lr_scheduler_horizon.py tests/test_gradient_accumulation.py
+/root/miniconda3/envs/lami/bin/python tools/preflight_instructdet.py --hash
+```
+
+使用全新目录、**不加 `--resume`、不加载现有 detector checkpoint**。下面的目录检查
+用于避免混入旧 run 或覆盖日志；检查失败时先确认目录内容，不要直接删除重跑。
+
+```bash
+cd ~/LaMI-DETR
+if [ -e /root/autodl-tmp/instructdet_k5_no_radius_bs32_4ep_seed42 ]; then
+  echo "Output already exists; inspect it before starting or resuming."
+else
+  CUDA_VISIBLE_DEVICES=0,1,2,3 /root/miniconda3/envs/lami/bin/python tools/train_net.py \
+    --config-file lami_dino/configs/dino_convnext_large_4scale_4ep_lvis_no_radius.py \
+    --num-gpus 4 \
+    train.output_dir=/root/autodl-tmp/instructdet_k5_no_radius_bs32_4ep_seed42 \
+    dataloader.evaluator.output_dir=/root/autodl-tmp/instructdet_k5_no_radius_bs32_4ep_seed42
+fi
+```
+
+只有本组因中断需要恢复时，使用**同一 no_radius 配置、同一新目录**加 `--resume`。
+强度是 checkpoint buffer：从原生模型 resume 会把 1.5 重新加载回来，
+仅在命令行写 0 不足以抵消它，且这种续训也不是从头训练消融。
+
+启动后核对日志为 iteration=0、stop=28400、LR horizon=85200、effective batch=32。
+`metrics.json` 新增的 `tpa/prototype_mode_strength` 和 `tpa/fixed_radius_enabled`
+应始终为 0；`tpa/task_gradient_scale` 应为 1。同时观察已有的 APR、冲突投影、
+梯度和 rank/cosine 指标；不要因 rank 下降临时改 LR、APR 或 strength。
+
+### 结束后提取结果
+
+```bash
+cd ~/LaMI-DETR
+printf '%s\n' 'AP,AP50,AP75,APs,APm,APl,APr,APc,APf'
+grep -E 'copypaste: [0-9]' \
+  /root/autodl-tmp/instructdet_k5_no_radius_bs32_4ep_seed42/log.txt \
+  | tail -n 1 | sed 's/.*copypaste: //'
+/root/miniconda3/envs/lami/bin/python tools/check_tpa_rank.py \
+  /root/autodl-tmp/instructdet_k5_no_radius_bs32_4ep_seed42/model_final.pth \
+  dataset/metadata/lvis_claude_prompts_convnextl.npy
+```
+
+应显示 `Kp=5, slot_prior=0.2, mode_strength=0`。训练退出不等于评测成功；没有
+`copypaste` 数字时不能认定已有 AP。保存 config、日志、metrics、2ep/4ep checkpoint
+和正式评测 JSON，不能仅记录最终 rank。
+
+解读边界：
+
+- APr 上升且仍不坍塌：支持固定半径在这组训练条件下有净性能代价；仍非全局保证。
+- APr 上升但坍塌：是“移除半径”的整体收益，**不是保持不坍塌的性能修复**。
+- APr 下降：不能把前述少量固定 query 的局部收益外推到完整训练。
+- 不论结果如何，这项对照包含半径对初始化输出、训练路径和最终前向的全部影响，
+  不会单独证明“中心旋转”或“均值校正”就是全部 APr 差距的原因。
+
+本组不自动满足 12ep 启动条件；仍按约定用正式 4ep APr（优先 40 以上）与 rank
+一起决策，不因 loss 下降、rank 变高或几个事后选中类别改善而自动延长训练。

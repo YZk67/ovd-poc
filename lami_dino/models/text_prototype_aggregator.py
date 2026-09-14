@@ -139,7 +139,12 @@ class TextPrototypeAggregator(nn.Module):
         prototypes: torch.Tensor,
         values: torch.Tensor,
     ) -> torch.Tensor:
-        """Use fixed-radius prompt residuals so modes cannot shrink radially."""
+        """Apply the fixed-radius transform; strength=0 retains raw slots.
+
+        Strength only controls this forward parameterization, not parameter
+        initialization. Zero is the no-radius training control, NOT a request
+        to average the K slots or disable APR/gradient routing.
+        """
         centroid = values.mean(dim=1, keepdim=True)
         residual = prototypes - centroid
         unit_residual = residual / residual.norm(dim=-1, keepdim=True).clamp_min(1e-6)
@@ -339,6 +344,10 @@ class TextPrototypeAggregator(nn.Module):
 
     def get_monitor_dict(self) -> Dict[str, float]:
         out = dict(self.last_loss_terms)
+        # Report the live checkpoint buffer, not merely the requested config:
+        # loading an existing checkpoint can restore a different radius.
+        out["prototype_mode_strength"] = float(self.prototype_mode_strength.item())
+        out["fixed_radius_enabled"] = float(self.prototype_mode_strength.item() > 0.0)
         if not self.last_monitor_terms and self._last_prototypes is not None:
             with torch.no_grad():
                 off_mse, diag_mse = compute_prototype_orthogonality(self._last_prototypes)
