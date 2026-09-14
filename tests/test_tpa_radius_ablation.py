@@ -9,6 +9,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
+from lami_dino.checkpoint_init import load_trusted_torch_file
 from lami_dino.models import TextPrototypeAggregator
 from lami_dino.prototype_ops import calibrated_logmeanexp_similarity
 
@@ -97,13 +98,32 @@ def test_no_radius_task_and_apr_gradients_match_raw_attention_reference():
     assert all(p.grad is None for p in tpa.parameters())
 
 
-def test_no_radius_checkpoint_restores_radius_and_live_monitor(tmp_path):
+@pytest.mark.parametrize("legacy_load_api", [False, True])
+def test_no_radius_checkpoint_restores_radius_and_live_monitor(tmp_path, monkeypatch, legacy_load_api):
+    load_calls = []
+    if legacy_load_api:
+        original_load = torch.load
+
+        def legacy_load(path, **kwargs):
+            load_calls.append(dict(kwargs))
+            if "weights_only" in kwargs:
+                raise TypeError("'weights_only' is an invalid keyword argument for Unpickler()")
+            return original_load(path, **kwargs)
+
+        # Exercise the server's old API even when tests run on modern PyTorch.
+        monkeypatch.setattr(torch, "load", legacy_load)
+
     torch.manual_seed(6)
     control = make_tpa(0.0).eval()
     path = tmp_path / "control.pth"
     torch.save(control.state_dict(), path)
     restored = make_tpa(1.5).eval()
-    restored.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
+    # Trusted fixture created by this test; reuse the production compatibility
+    # loader instead of passing a keyword unsupported by the training server.
+    restored.load_state_dict(load_trusted_torch_file(path))
+    if legacy_load_api:
+        assert load_calls == [
+            {"map_location": "cpu", "weights_only": False}, {"map_location": "cpu"}]
     prompts = torch.randn(7, 8, 16)
     expected, _ = control(prompts, with_loss=False)
     actual, _ = restored(prompts, with_loss=False)
