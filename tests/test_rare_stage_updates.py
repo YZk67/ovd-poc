@@ -266,7 +266,8 @@ def test_paired_panel_uses_geometric_counterpart_not_same_query_index(tmp_path):
     torch.testing.assert_close(features["old"], features["new"])
 
 
-def test_mocked_gpu_pipeline_produces_real_cpu_derivatives_and_no_optimizer(tmp_path, monkeypatch):
+@pytest.mark.parametrize("resume_cpu", [False, True])
+def test_mocked_gpu_pipeline_produces_real_cpu_derivatives_and_no_optimizer(tmp_path, monkeypatch, resume_cpu):
     args = args_fixture(tmp_path)
     states, prompts, banks, features, indices, records, clips = panel_fixture()
     np.save(args.prompt_bank, prompts.numpy())
@@ -283,6 +284,12 @@ def test_mocked_gpu_pipeline_produces_real_cpu_derivatives_and_no_optimizer(tmp_
     def forbidden(*a, **kw):
         raise AssertionError("Audit must not construct an optimizer")
     monkeypatch.setattr(torch.optim.Optimizer, "__init__", forbidden)
+    if resume_cpu:
+        args.resume_cpu = True
+        monkeypatch.setattr(runner, "load_cpu_resume", lambda *a:
+                            (["lasagna", "keg"], identities, states, {}, captures, [1, 2]))
+        for name in ("preflight", "prepare", "dump_and_pair", "capture_endpoints"):
+            monkeypatch.setattr(runner, name, forbidden)
     before = {s: {k: v.clone() for k, v in t.items()} for s, t in states.items()}
     report = runner.run(args)
     assert report["complete"] and not report["optimizer_created"]
@@ -322,3 +329,82 @@ def test_gradient_caches_cover_both_endpoints_and_refuse_changed_probe_inputs(tm
     args.seed += 1
     with pytest.raises(ValueError, match="cache identity changed"):
         runner.capture_endpoints(args, output, states)
+
+
+def cpu_resume_fixture(tmp_path):
+    from tools.audit_tpa_gradients import capture_identity, save_gradients
+    from tools.diagnose_detector_tpa_pairing import locked_manifest
+    from tools.diagnose_rare_fp_regions import fingerprint
+    args = args_fixture(tmp_path)
+    names, identities, states = runner.preflight(args)
+    output = Path(args.output_dir)
+    locked_manifest(output / "manifest.json", {"schema_version": 1, "sources": identities,
+        "categories": names, "max_images": 32, "seed": 42, "windows": 2, "microbatches": 8, "batch_size": 4})
+    pair_fp = locked_manifest(output / "pairing_cache/manifest.json", {
+        "old_sha256": identities["old_checkpoint"]["sha256"],
+        "new_sha256": identities["new_checkpoint"]["sha256"]})
+    (output / "fp_details.json").write_text("{}")
+    regions = {"complete": True, "parent_fingerprint": pair_fp, "selected_image_ids": [1],
+               "annotations": identities["annotations"],
+               "source_details": runner.file_identity(output / "fp_details.json"),
+               "checkpoints": {s: identities[s + "_checkpoint"] for s in ("old", "new")}}
+    (output / "regions.json").write_text(json.dumps(regions))
+    train = tmp_path / "train.json"
+    train.write_text("train annotations")
+    for side, iteration in (("old", 56799), ("new", 70999)):
+        (output / "pairing_cache" / side).mkdir()
+        torch.save({}, output / "pairing_cache" / side / "bank.pt")
+        geometry_path = output / f"{side}_geometry.json"
+        geometry = {"checkpoint": identities[side + "_checkpoint"], "side": side,
+                    "source_report": runner.file_identity(output / "regions.json"),
+                    "prompt_bank": identities["prompt_bank"]}
+        geometry_path.write_text(json.dumps(geometry))
+        probe_args = SimpleNamespace(config_file=args.config_file, geometry_json=str(geometry_path),
+            device="cuda:0", windows=2, microbatches=8, batch_size=4, seed=42)
+        identity = capture_identity(probe_args, geometry)
+        saved = {"inputs": identity, "fingerprint": fingerprint(identity),
+                 "capture": {**capture_fixture(states[side]), "iteration": iteration,
+                             "train_annotations": runner.file_identity(train)}}
+        save_gradients(output / f"{side}_gradients.pt", saved)
+    return runner.parse_args(["--resume-cpu", "--output-dir", str(output)]), output
+
+
+def test_cpu_resume_loads_locked_metadata_without_native_or_geometry_regeneration(tmp_path, monkeypatch):
+    args, output = cpu_resume_fixture(tmp_path)
+    def forbidden(*a, **kw):
+        raise AssertionError("CPU resume must not capture native images/gradients or rewrite geometry")
+    monkeypatch.setattr("tools.audit_tpa_geometry.run", forbidden)
+    monkeypatch.setattr("tools.capture_tpa_gradients.capture", forbidden)
+    monkeypatch.setattr("tools.diagnose_detector_tpa_pairing.dump_checkpoint", forbidden)
+    before = {p: p.read_bytes() for p in output.rglob("*") if p.is_file()}
+    names, identities, states, regions, captures, images = runner.load_cpu_resume(args, output)
+    assert names == ["lasagna", "keg", "bass_horn"] and images == [1]
+    assert captures["old"]["iteration"] == 56799 and captures["new"]["iteration"] == 70999
+    assert args.prompt_bank == identities["prompt_bank"]["path"]
+    assert all(p.read_bytes() == content for p, content in before.items())
+
+
+@pytest.mark.parametrize("changed", ["missing", "checkpoint", "gradient", "geometry", "annotations"])
+def test_cpu_resume_fails_closed_instead_of_starting_gpu(tmp_path, changed):
+    args, output = cpu_resume_fixture(tmp_path)
+    if changed == "missing":
+        (output / "old_gradients.pt").unlink()
+        error = FileNotFoundError
+    else:
+        error = ValueError
+        if changed == "checkpoint":
+            (tmp_path / "old.pth").write_bytes(b"different")
+        elif changed == "gradient":
+            path = output / "new_gradients.pt"
+            saved = load_trusted_torch_file(path)
+            saved["inputs"]["seed"] += 1
+            torch.save(saved, path)
+        elif changed == "geometry":
+            path = output / "old_geometry.json"
+            geometry = json.loads(path.read_text())
+            geometry["source_report"]["sha256"] = "different"
+            path.write_text(json.dumps(geometry))
+        else:
+            (tmp_path / "train.json").write_text("changed train annotations")
+    with pytest.raises(error):
+        runner.load_cpu_resume(args, output)

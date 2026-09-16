@@ -76,7 +76,8 @@ def gradient_directions(gradients, max_norm):
     return directions, {"routing": {k: float(v) for k, v in stats.items()}, "directions": summaries}
 
 
-def text_observables(weights, buffers, prompts, tau, features, class_indices, cls_tau, logit_scale, bias):
+def text_observables(weights, buffers, prompts, tau, features, class_indices, cls_tau, logit_scale, bias,
+                     *, query_only=False):
     """Differentiable eval TPA, including the existing fixed-radius transform.
 
     No detector graph here. Validation-query features are constants and do NOT
@@ -91,21 +92,20 @@ def text_observables(weights, buffers, prompts, tau, features, class_indices, cl
     attention = ((logits + prior[None]) / (math.sqrt(q.shape[1]) * tau)).softmax(-1)
     before = torch.einsum("ckn,cnd->ckd", attention, values)
     c = values.mean(1, keepdim=True)
-    residual = before - c
-    unit_residual = residual / residual.norm(dim=-1, keepdim=True).clamp_min(1e-6)
     strength = buffers["prototype_mode_strength"]
-    fixed = c + strength * c.norm(dim=-1, keepdim=True).clamp_min(1e-6) * unit_residual
-    after = before + (strength > 0).to(before.dtype) * (fixed - before)
+    radius_enabled = bool(strength > 0)
+    # Strength is a fixed buffer, NOT a differentiated parameter. Avoid the
+    # disabled branch: 0 * an undefined norm double-backward is still NaN.
+    if radius_enabled:
+        residual = before - c
+        unit_residual = residual / residual.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        fixed = c + strength * c.norm(dim=-1, keepdim=True).clamp_min(1e-6) * unit_residual
+        after = before + (fixed - before)
+    else:
+        after = before
     centers = torch.stack((c[:, 0], before.mean(1), after.mean(1)), dim=1)
-    pre_unit, post_unit = F.normalize(before, dim=-1), F.normalize(after, dim=-1)
+    post_unit = F.normalize(after, dim=-1)
     k = after.shape[1]
-    gram = post_unit @ post_unit.transpose(-1, -2)
-    cosine = ((gram.sum((-1, -2)) - gram.diagonal(dim1=-2, dim2=-1).sum(-1)) / (k * (k - 1))
-              if k > 1 else after.sum((-1, -2)) * 0)
-    c_norm = c[:, 0].norm(dim=-1).clamp_min(1e-6)
-    scalars = torch.stack((residual.flatten(1).norm(dim=-1) / math.sqrt(k) / c_norm,
-                           (centers[:, 2] - centers[:, 1]).norm(dim=-1) / c_norm,
-                           pre_unit.mean(1).norm(dim=-1), post_unit.mean(1).norm(dim=-1), cosine), dim=-1)
     x = F.normalize(features, dim=-1)
     slots = post_unit[class_indices]
     cosines = (slots * x[:, None]).sum(-1)
@@ -113,6 +113,22 @@ def text_observables(weights, buffers, prompts, tau, features, class_indices, cl
     mean_score = logit_scale * cosines.mean(-1)
     native = logit_scale * cls_tau * (torch.logsumexp(cosines / cls_tau, dim=-1) - math.log(k)) + bias
     query_logits = torch.stack((center_score, mean_score, native - bias - mean_score, native), dim=-1)
+    if query_only:
+        # Ranking audits need logits, not geometric norm derivatives. Do not
+        # let an unrelated, nonsmooth geometry diagnostic poison their JVP.
+        return query_logits
+    pre_unit = F.normalize(before, dim=-1)
+    gram = post_unit @ post_unit.transpose(-1, -2)
+    cosine = ((gram.sum((-1, -2)) - gram.diagonal(dim1=-2, dim2=-1).sum(-1)) / (k * (k - 1))
+              if k > 1 else after.sum((-1, -2)) * 0)
+    c_norm = c[:, 0].norm(dim=-1).clamp_min(1e-6)
+    # For no-radius the shift is identically zero for ALL parameter values.
+    # Its derivative is exactly zero; differentiating norm(0) with PyTorch
+    # 1.12's divide-then-mask norm backward needlessly creates 0/0 in JVP.
+    shift = ((centers[:, 2] - centers[:, 1]).norm(dim=-1) / c_norm if radius_enabled
+             else before.new_zeros(before.shape[0]))
+    scalars = torch.stack(((before - c).flatten(1).norm(dim=-1) / math.sqrt(k) / c_norm,
+                           shift, pre_unit.mean(1).norm(dim=-1), post_unit.mean(1).norm(dim=-1), cosine), dim=-1)
     return centers, scalars, query_logits
 
 
@@ -127,7 +143,7 @@ def parameter_block_norms(flat, state):
     return output
 
 
-def direction_jvp(state, prompts, bank, query_features, query_classes, gradient):
+def direction_jvp(state, prompts, bank, query_features, query_classes, gradient, *, query_only=False):
     """J[ -g/||g|| ] at the unchanged checkpoint; no parameter assignment."""
     weights = tuple(state[name].detach().cpu().double() for name in WEIGHTS)
     buffers = {k: state[k].detach().cpu().double() for k in ("slot_prior_strength", "prototype_mode_strength")}
@@ -144,17 +160,25 @@ def direction_jvp(state, prompts, bank, query_features, query_classes, gradient)
     if offset != len(gradient):
         raise ValueError("Gradient length differs from TPA weights")
     def function(*args):
-        return text_observables(args, buffers, prompts.cpu().double(), bank["tpa_tau"],
-                                query_features.cpu().double(), query_classes.cpu(),
-                                bank["temperature"], bank["logit_scale"], bank["cls_bias"])
+        result = text_observables(args, buffers, prompts.cpu().double(), bank["tpa_tau"],
+                                  query_features.cpu().double(), query_classes.cpu(),
+                                  bank["temperature"], bank["logit_scale"], bank["cls_bias"],
+                                  query_only=query_only)
+        return (result,) if query_only else result
     if norm <= 1e-12:
         with torch.no_grad():
             values = function(*weights)
         derivatives = tuple(torch.zeros_like(v) for v in values)
     else:
         values, derivatives = torch.autograd.functional.jvp(function, weights, tuple(tangents), create_graph=False)
-    if not all(torch.isfinite(x).all() for x in values + derivatives):
-        raise ValueError("Nonfinite text-side JVP")
+    labels = ("query_logits",) if query_only else ("centers", "scalars", "query_logits")
+    invalid = [f"{kind}.{label}={int((~torch.isfinite(x)).sum())}/{x.numel()}"
+               for kind, tensors in (("values", values), ("derivatives", derivatives))
+               for label, x in zip(labels, tensors) if not torch.isfinite(x).all()]
+    if invalid:
+        raise ValueError("Nonfinite text-side JVP: " + ", ".join(invalid))
+    if query_only:
+        return {"query_logits": values[0].tolist(), "query_logit_derivatives": derivatives[0].tolist()}
     centers, scalars, query = values
     dc, ds, dq = derivatives
     center_norms = centers.norm(dim=-1)

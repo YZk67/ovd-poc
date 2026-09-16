@@ -920,3 +920,33 @@ PYTHONPATH=. python -m pytest -q --rootdir=tests --confcutdir=tests \
   tests/test_rare_stage_updates.py tests/test_tpa_gradient_audit.py \
   tests/test_tpa_geometry_audit.py tests/test_rare_region_pairing.py
 ```
+
+### CPU JVP 中断后恢复（PyTorch 1.12.1 / no-radius）
+
+若 GPU 梯度已保存，却在 `[CPU JVP] old` 报 `Nonfinite text-side JVP`，先保留整个
+输出目录。no-radius 下中心位移恒为零；旧审计仍对它执行 `norm(0)` 的双反向 JVP。
+[PyTorch 1.12.1 的 norm backward](https://github.com/pytorch/pytorch/blob/v1.12.1/torch/csrc/autograd/FunctionsManual.cpp#L193-L214)
+先除以 norm 再 mask，在这种双反向路径可能产生 NaN。它是审计数值问题，不能直接
+判定 checkpoint/训练梯度非有限。本地测试按该版本的 norm backward 复现旧故障，
+再检查修复后 JVP 与中心差分一致。
+
+修复仅在诊断代码中：radius=0 时用精确恒等分支，恒零位移报告精确零导数；区域排序
+审计仅请求 logits JVP，不为无关几何量求导。没有 epsilon 扰动、`nan_to_num`、训练
+参数/损失修改；真正非有限的数值仍会中止，并指出是哪块输出或导数。
+
+同步修复提交后直接执行，不必再传 checkpoint 或预测路径：
+
+```bash
+cd ~/LaMI-DETR
+set -o pipefail
+CUDA_VISIBLE_DEVICES="" /root/miniconda3/envs/lami/bin/python -u tools/audit_rare_stage_updates.py \
+  --resume-cpu \
+  --output-dir /root/autodl-tmp/no_radius_8ep_vs_10ep_updates \
+  2>&1 | tee -a /root/autodl-tmp/no_radius_8ep_vs_10ep_updates/jvp_resume.log
+```
+
+`--resume-cpu` 从已锁定 manifest 恢复输入/探针设置，校验 checkpoint、prompt、
+区域报告、梯度及训练标注身份，仅在 CPU 重算分析。不会重新跑 LVIS 匹配、原生图像
+forward、训练梯度捕获或 geometry 报告；不改捕获指纹/训练代码。缺缓存、输入变化或
+指纹不符时直接报错，**绝不自动回退到 GPU**。完成后上传同目录 `report.json`
+（`complete=true`）；若仍失败，上传 `jvp_resume.log`，不要删除或强行重写缓存。

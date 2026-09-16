@@ -128,6 +128,84 @@ def test_zero_direction_and_live_state_mutation_guard():
     assert state_versions(model) != previous
 
 
+def install_torch112_norm_backward(monkeypatch):
+    """Emulate the official 1.12.1 p=2 backward, not a NaN-filling workaround.
+
+    Source: pytorch/pytorch v1.12.1 torch/csrc/autograd/FunctionsManual.cpp,
+    norm_backward: self * (grad / norm).masked_fill_(norm == 0, 0).
+    This makes the version-specific JVP regression testable on newer PyTorch.
+    """
+    original = torch.Tensor.norm
+
+    class LegacyNorm(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, dim, keepdim):
+            norm = original(x, p=2, dim=dim, keepdim=True)
+            ctx.save_for_backward(x, norm)
+            ctx.dim, ctx.keepdim = dim, keepdim
+            return norm if keepdim else (norm.squeeze(dim) if dim is not None else norm.squeeze())
+
+        @staticmethod
+        def backward(ctx, grad):
+            x, norm = ctx.saved_tensors
+            if not ctx.keepdim and ctx.dim is not None:
+                grad = grad.unsqueeze(ctx.dim)
+            return x * (grad / norm).masked_fill(norm == 0, 0), None, None
+
+    def norm(x, p="fro", dim=None, keepdim=False, dtype=None):
+        if p not in ("fro", 2) or isinstance(dim, tuple) or dtype is not None:
+            return original(x, p, dim, keepdim, dtype=dtype)
+        return LegacyNorm.apply(x, dim, keepdim)
+
+    monkeypatch.setattr(torch.Tensor, "norm", norm)
+
+
+@pytest.mark.parametrize("strength", [0., 1.5])
+def test_query_only_jvp_equals_full_query_block(strength):
+    state, prompts, bank, x, indices, g = jvp_fixture()
+    state["prototype_mode_strength"].fill_(strength)
+    full = direction_jvp(state, prompts, bank, x, indices, g)
+    query = direction_jvp(state, prompts, bank, x, indices, g, query_only=True)
+    for key in ("query_logits", "query_logit_derivatives"):
+        torch.testing.assert_close(torch.tensor(full[key]), torch.tensor(query[key]))
+
+
+def test_no_radius_jvp_with_torch112_zero_norm_backward_is_finite_and_correct(monkeypatch):
+    install_torch112_norm_backward(monkeypatch)
+    x = torch.ones(3, dtype=torch.float64)
+    # First establish the exact old failure: norm of an identically zero shift.
+    _, derivative = torch.autograd.functional.jvp(lambda a: (a - a).norm(), x, x)
+    assert not torch.isfinite(derivative)
+    state, prompts, bank, features, indices, g = jvp_fixture()
+    state["prototype_mode_strength"].zero_()
+    full = direction_jvp(state, prompts, bank, features, indices, g)
+    query = direction_jvp(state, prompts, bank, features, indices, g, query_only=True)
+    assert torch.tensor(full["scalar_derivatives"])[:, 1].eq(0).all()
+    torch.testing.assert_close(torch.tensor(full["query_logit_derivatives"]),
+                               torch.tensor(query["query_logit_derivatives"]))
+    weights = tuple(state[n].double() for n in WEIGHTS)
+    buffers = {n: state[n].double() for n in ("slot_prior_strength", "prototype_mode_strength")}
+    flat, offset, tangents = -g.double() / g.double().norm(), 0, []
+    for w in weights:
+        tangents.append(flat[offset:offset + w.numel()].reshape_as(w))
+        offset += w.numel()
+    def evaluate(sign):
+        return text_observables(tuple(w + sign * 1e-5 * d for w, d in zip(weights, tangents)),
+            buffers, prompts.double(), bank["tpa_tau"], features.double(), indices,
+            bank["temperature"], bank["logit_scale"], bank["cls_bias"], query_only=True)
+    torch.testing.assert_close(torch.tensor(query["query_logit_derivatives"], dtype=torch.float64),
+                               (evaluate(1) - evaluate(-1)) / 2e-5, atol=1e-7, rtol=1e-5)
+
+
+def test_query_only_zero_direction_and_real_nonfinite_still_fail():
+    state, prompts, bank, features, indices, g = jvp_fixture()
+    result = direction_jvp(state, prompts, bank, features, indices, g * 0, query_only=True)
+    assert not torch.tensor(result["query_logit_derivatives"]).any()
+    prompts[0, 0, 0] = float("nan")
+    with pytest.raises(ValueError, match="values.query_logits"):
+        direction_jvp(state, prompts, bank, features, indices, g, query_only=True)
+
+
 def pipeline_fixture(tmp_path):
     geo_args, _, _, _, _ = geometry_fixture(tmp_path)
     geometry = run_geometry(geo_args)

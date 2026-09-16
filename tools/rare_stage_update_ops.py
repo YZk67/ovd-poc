@@ -117,7 +117,7 @@ def local_margin_audit(captured, state, prompts, bank, features, indices, record
                                "common_clip_coefficient": clip, "directions": {}}
         for name, gradient in directions.items():
             print(f"[JVP] window={window['window']} direction={name}", flush=True)
-            jvp = direction_jvp(state, prompts, bank, features, indices, gradient)
+            jvp = direction_jvp(state, prompts, bank, features, indices, gradient, query_only=True)
             logits = torch.tensor(jvp["query_logits"], dtype=torch.float64)[:, -1]
             cached = torch.tensor([r["native_cache_logit"] for r in records], dtype=torch.float64)
             if float((logits - cached).abs().max()) > 2e-3:

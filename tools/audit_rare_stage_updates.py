@@ -211,6 +211,78 @@ def capture_endpoints(args, output, states):
     return captures
 
 
+def load_cpu_resume(args, output):
+    """Validate existing artifacts; NEVER call native dump/capture on a miss.
+
+    Probe identity keeps its ORIGINAL device even on a CPU-only host. The saved
+    gradients were captured on that device; this operation only reads them.
+    """
+    from tools.audit_tpa_gradients import capture_identity
+    from tools.diagnose_rare_fp_regions import fingerprint, read_manifest
+
+    paths = [output / name for name in ("manifest.json", "regions.json", "fp_details.json",
+                                        "old_geometry.json", "new_geometry.json",
+                                        "old_gradients.pt", "new_gradients.pt",
+                                        "pairing_cache/manifest.json", "pairing_cache/old/bank.pt",
+                                        "pairing_cache/new/bank.pt")]
+    missing = [str(p) for p in paths if not p.is_file()]
+    if missing:
+        raise FileNotFoundError(f"CPU resume needs completed caches; no GPU work permitted: {missing}")
+    inputs = read_manifest(output / "manifest.json")["inputs"]
+    identities = inputs["sources"]
+    for key in ("old_checkpoint", "new_checkpoint", "prompt_bank", "annotations", "config_file"):
+        source = identities[key]
+        print(f"[CPU identity] {key}", flush=True)
+        if file_identity(source["path"])["sha256"] != source["sha256"]:
+            raise ValueError(f"CPU resume input changed: {key}")
+    regions = load_json(output / "regions.json")
+    pair_manifest = read_manifest(output / "pairing_cache/manifest.json")
+    if not regions.get("complete") or regions["parent_fingerprint"] != pair_manifest["fingerprint"]:
+        raise ValueError("CPU resume needs complete regions from the locked pairing cache")
+    if (regions["source_details"]["sha256"] != file_identity(output / "fp_details.json")["sha256"]
+            or regions["annotations"]["sha256"] != identities["annotations"]["sha256"]):
+        raise ValueError("CPU resume region sources changed")
+    states, captures = {}, {}
+    for side, iteration in (("old", 56799), ("new", 70999)):
+        source = identities[side + "_checkpoint"]
+        if (pair_manifest["inputs"][side + "_sha256"] != source["sha256"]
+                or regions["checkpoints"][side]["sha256"] != source["sha256"]):
+            raise ValueError(f"CPU resume {side} checkpoint/cache mismatch")
+        checkpoint = load_trusted_torch_file(source["path"])
+        states[side], info = extract_shared_tpa(checkpoint)
+        del checkpoint
+        if info["iteration"] != iteration or float(states[side]["prototype_mode_strength"]) != 0.:
+            raise ValueError(f"CPU resume needs the no-radius {side} checkpoint at {iteration}")
+        geometry_path = output / f"{side}_geometry.json"
+        geometry = load_json(geometry_path)
+        if (geometry["checkpoint"]["sha256"] != source["sha256"]
+                or geometry["source_report"]["sha256"] != file_identity(output / "regions.json")["sha256"]
+                or geometry["prompt_bank"]["sha256"] != identities["prompt_bank"]["sha256"]):
+            raise ValueError(f"CPU resume {side} geometry sources changed")
+        saved = load_trusted_torch_file(output / f"{side}_gradients.pt")
+        probe_args = SimpleNamespace(
+            config_file=identities["config_file"]["path"], geometry_json=str(geometry_path),
+            device=saved["inputs"]["device"], **{key: inputs[key] for key in
+                                                   ("windows", "microbatches", "batch_size", "seed")})
+        identity = capture_identity(probe_args, geometry)
+        if saved.get("inputs") != identity or saved.get("fingerprint") != fingerprint(identity):
+            raise ValueError(f"CPU resume {side} gradient provenance changed; not recapturing")
+        captured = saved["capture"]
+        annotation = captured["train_annotations"]
+        if file_identity(annotation["path"])["sha256"] != annotation["sha256"]:
+            raise ValueError("Training annotations changed since cached gradient probe")
+        if (captured["iteration"] != iteration or not captured["weights_unchanged"]
+                or captured["optimizer_created"]):
+            raise ValueError("Cached capture does not certify the unchanged endpoint")
+        captures[side] = captured
+        print(f"[CPU reuse gradients] {side}; native forwards/gradient recapture forbidden", flush=True)
+    # Restore locked metadata, not CLI defaults, for the output and text replay.
+    args.prompt_bank = identities["prompt_bank"]["path"]
+    for key in ("windows", "microbatches", "batch_size"):
+        setattr(args, key, inputs[key])
+    return inputs["categories"], identities, states, regions, captures, regions["selected_image_ids"]
+
+
 def display(report):
     print("\n=== Frozen regional TP-FP margin change: 10ep - 8ep ===", flush=True)
     print("class                   terminal-TPA   query/bias   CLIP/ROI       total", flush=True)
@@ -237,23 +309,31 @@ def display(report):
 
 def run(args):
     torch.set_num_threads(max(1, args.cpu_threads))
-    names, identities, states = preflight(args)
     output = Path(args.output_dir).resolve()
-    _, image_ids = prepare(args, names, identities, output)
-    if args.prepare_only:
-        print("[prepared] CPU selection only; rerun without --prepare-only to allow the bounded GPU audit", flush=True)
-        return
-    regions = dump_and_pair(args, names, identities, image_ids, output)
+    captures = None
+    if args.resume_cpu:
+        names, identities, states, regions, captures, image_ids = load_cpu_resume(args, output)
+    else:
+        names, identities, states = preflight(args)
+        _, image_ids = prepare(args, names, identities, output)
+        if args.prepare_only:
+            print("[prepared] CPU selection only; rerun without --prepare-only to allow the bounded GPU audit", flush=True)
+            return
+        regions = dump_and_pair(args, names, identities, image_ids, output)
     prompts = torch.from_numpy(np.load(args.prompt_bank, allow_pickle=False)).float()
     banks, features, indices, records, clip, excluded = load_panel(regions, output / "pairing_cache", states, prompts)
     effects = endpoint_effects(features, indices, banks, records["new"], clip, .3)
-    captures = capture_endpoints(args, output, states)
+    if captures is None:
+        captures = capture_endpoints(args, output, states)
     report = {"schema_version": 1, "complete": False, "sources": identities,
               "categories": names, "selected_validation_images": image_ids,
               "gradient_probe_image_exposures": 2 * args.windows * args.microbatches * args.batch_size,
               "paired_regions": records, "excluded_regions": excluded,
               "endpoint_effects": effects, "probe_pairing": probe_pairing(captures["old"], captures["new"]),
               "local_gradient_audit": {}, "optimizer_created": False,
+              "analysis_metadata": {"torch_version": str(torch.__version__),
+                                    "resume_cpu_only": args.resume_cpu,
+                                    "jvp_outputs": "query_logits_only; no-radius uses exact identity branch"},
               "probe_metadata": {s: {k: v for k, v in c.items() if k != "windows"}
                                  for s, c in captures.items()},
               "scope": "selected regional score attribution and local TPA-only gradients; NOT historical optimizer replay or full-validation AP"}
@@ -273,8 +353,11 @@ def run(args):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("comparison", "old-checkpoint", "new-checkpoint", "old-predictions", "new-predictions", "output-dir"):
-        parser.add_argument("--" + name, required=True)
+    for name in ("comparison", "old-checkpoint", "new-checkpoint", "old-predictions", "new-predictions"):
+        parser.add_argument("--" + name)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--resume-cpu", action="store_true",
+                        help="Only replay completed native/gradient caches; no GPU or recapture, locked inputs/settings")
     parser.add_argument("--config-file", default="lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_no_radius.py")
     parser.add_argument("--annotations", default="dataset/lvis/lvis_v1_val.json")
     parser.add_argument("--prompt-bank", default="dataset/metadata/lvis_claude_prompts_convnextl.npy")
@@ -287,7 +370,16 @@ def parse_args(argv=None):
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--cpu-threads", type=int, default=4)
     parser.add_argument("--prepare-only", action="store_true")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.resume_cpu and args.prepare_only:
+        parser.error("--resume-cpu and --prepare-only are mutually exclusive")
+    if not args.resume_cpu:
+        missing = ["--" + key.replace("_", "-") for key in
+                   ("comparison", "old_checkpoint", "new_checkpoint", "old_predictions", "new_predictions")
+                   if getattr(args, key) is None]
+        if missing:
+            parser.error("required without --resume-cpu: " + ", ".join(missing))
+    return args
 
 
 if __name__ == "__main__":
