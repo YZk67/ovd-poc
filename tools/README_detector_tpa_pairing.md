@@ -1083,6 +1083,68 @@ PYTHONPATH=. python -m pytest -q --rootdir=tests --confcutdir=tests \
   tests/test_decoder_rollback.py tests/test_query_path_updates.py
 ```
 
+### Decoder 训练来源：第一步只做一阶 loss 梯度审计
+
+`audit_decoder_loss_sources.py` 不重复混合 checkpoint 评测，不续训，不创建 optimizer，
+不模拟 AdamW/梯度投影/裁剪。读取同一份已完成的 query-path 审计，并使用它锁定的
+no-radius 8ep/10ep checkpoint、配置和资源。
+
+默认硬预算：每端 **4 个窗口 × 8 个 microbatch × 4 张图 = 128 次训练图像曝光**，
+合计 **256 次**。每个窗口只是同一 checkpoint 上的 32-image 平均梯度，没有更新。
+只用 `lvis_v1_train_norare`，保留训练增强、FedLoss、denoising、Hungarian matching、
+原生 loss 权重和对应迭代的 RPSA/APR 设置。两端配对检查输入图像/框/类别 hash 及
+FedLoss 采样类别。**单卡串行 microbatch 不等价于原四卡 DDP optimizer batch**，
+不宣称重放了历史梯度或训练随机状态。
+
+五组 loss 在同一次 forward 的图上分别求导：classification（含 aux/enc/DN）、
+bbox L1、bbox GIoU、RPSA、APR。只启用 `decoder_core` 参数的梯度，其他模块保持权重
+及前向数值，不对其求导。明确记录 `None`（无梯度路径）与 connected zero 的区别；
+RPSA/APR 无直接 decoder 梯度不排除其通过上游表示或共享裁剪的间接作用。
+
+验证侧延用三个 focus 类的固定区域，再**按标注和固定 seed、而非 AP 下降或分数**
+预选 4 个其他 rare 类和 4 个 base 类，每类一张独立图像。10ep 原生 top-300 中用官方
+LVIS IoU=.5 匹配/ignore 规则确定控制区域，每类最多 3 TP/3 FP；8ep 用几何对应查询。
+没有 TP/FP、配对失败时记为 NA，**不另选更有利的类别**。默认本次最多 26 次单图验证
+forward（原 5 张 focus + 8 张 control，两端各一次）。验证 GT 不进入训练 loss。
+
+测量的量是固定类别、固定原生 CLIP 项和区域标签的 TP−FP 平均 log-score 间隔 `M`。
+通过一阶 reverse-mode 得到 `h=∇decoder M`，与训练梯度 `g` 做 CPU 点积，报告
+`−h·g` 和 `−h·g/||g||`。负号表示该 loss 的局部下降方向使间隔缩小；不是预测 AP
+下降多少，也不是实际 AdamW 步长。不调用二阶/JVP，不改变参数做有限步更新。
+这里保留原生 `reference_points.detach()` 等 stop-gradient 和离散 query 选择，
+所以是**沿现有 autograd 路径、固定这些中间选择的条件敏感度**，不包含参数改变后
+参考框重新计算/候选切换的全部效果，不等同于端到端有限差分。
+另报负梯度与 8→10ep 实际 decoder 权重差的 cosine，仅作方向一致性证据。
+
+服务器同步提交后运行（**单卡**，普通前台运行，日志保存到输出目录旁）：
+
+```bash
+cd ~/LaMI-DETR
+set -o pipefail
+CUDA_VISIBLE_DEVICES=0 /root/miniconda3/envs/lami/bin/python -u \
+  tools/audit_decoder_loss_sources.py \
+  --query-audit /root/autodl-tmp/no_radius_8ep_vs_10ep_query_updates/report.json \
+  --output-dir /root/autodl-tmp/no_radius_decoder_loss_sources \
+  2>&1 | tee /root/autodl-tmp/no_radius_decoder_loss_sources.log
+```
+
+它不会改动原权重。逐窗口保存 CPU 梯度，逐图保存局部导数；默认梯度缓存约 0.9 GB。
+普通重跑会复用完整窗口/图像/端点，未完成的窗口需重算；不要修改预算/seed 后复用
+同目录。`--prepare-only` 只做 CPU 身份/预算预检和控制样本锁定。全部捕获结束后，
+`--analyze-only` 只读缓存，缺少完成的端点就报错，绝不自动启动 GPU。
+
+最终上传 **`/root/autodl-tmp/no_radius_decoder_loss_sources/report.json`**，不用上传
+梯度 `.pt`。报告包含每端每窗口各组梯度、逐类局部间隔导数、有效对照配对数和输入
+配对校验。四窗口符号一致仅是筛查证据；对照不足时不能宣称广泛改善或无副作用。
+本步骤不自动进入第二步优化器反事实，更不会启动短程或完整训练。
+
+CPU 测试：
+
+```bash
+PYTHONPATH=. python -m pytest -q --rootdir=tests --confcutdir=tests \
+  tests/test_decoder_loss_audit.py tests/test_decoder_rollback.py tests/test_query_path_updates.py
+```
+
 ### 一次性全模型轨迹平均：8ep/12ep = 50:50
 
 decoder-only 回退在完整 LVIS 上得到 AP `37.1461`、APr `42.0543`，相对原生 10ep
