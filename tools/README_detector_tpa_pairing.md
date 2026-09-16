@@ -950,3 +950,81 @@ CUDA_VISIBLE_DEVICES="" /root/miniconda3/envs/lami/bin/python -u tools/audit_rar
 forward、训练梯度捕获或 geometry 报告；不改捕获指纹/训练代码。缺缓存、输入变化或
 指纹不符时直接报错，**绝不自动回退到 GPU**。完成后上传同目录 `report.json`
 （`complete=true`）；若仍失败，上传 `jvp_resume.log`，不要删除或强行重写缓存。
+
+### Query 路径实际参数变化：8ep/10ep 双向模块替换
+
+`audit_query_path_updates.py` 接在**完整**的 `audit_rare_stage_updates.py` 输出后运行。
+它补查 TPA-only 梯度探针没有覆盖的 query 生成路径，**不做训练、不计算梯度、不创建
+optimizer，不修改 checkpoint 文件**。这里的“实际更新”指两端 checkpoint 中真实的
+参数差，而不是重放 AdamW 中间步骤，更不能直接归因于某项 loss 或训练修改。
+
+当前报告原选 6 张图，排除无法配对的区域后只用 **5 张图、10 个区域**：需要一次单卡小面板前向，不能仅靠已保存的最终 query 特征
+在 CPU 重建 encoder/decoder 改变后的输出。默认硬上限为 8 张图、两端合计 192 次
+单图 forward；8 个模块均有变化时，本次 5 张图是 100 次（含两端原生和联合对照）。
+**不重跑 19,809 张全验证集，不做任何 train_norare 探针**。耗时取决于模型加载和单图
+前向速度；预检会打印预算，每张图会打印进度，可中断后原命令恢复。
+
+模块分组：
+
+| 输出名称 | 替换的参数 |
+|---|---|
+| `visual_adapter` | backbone 输出 norm、neck、位置编码（CLIP trunk 必须完全一致） |
+| `encoder_memory` | encoder、level embeddings、encoder output projection/norm |
+| `proposal_head` | encoder 用的分类 projection/bias 与 box head |
+| `query_content` | `content_layer`：原型到 query 初始化空间的投影 |
+| `decoder_core` | decoder attention/FFN、norm、reference-point position head |
+| `decoder_box` | decoder 各层 box refinement，可能改变后续注意力采样位置 |
+| `final_projection` | 最后一个 decoder classifier 的 feature projection |
+| `upstream_tpa` | 共享 TPA 权重在 encoder 类别选择/query fusion 路径中的作用 |
+
+`final_bias_only` 单独在 CPU 计算，无需额外 forward；`all_query` 联合替换以上八组，
+用于对照非线性交互，**各模块效果不能相加解释整体变化**。训练专用、辅助分类头、
+未改变的张量也列在 inventory 中，不把它们悄悄混入其他模块。未知张量、CLIP trunk
+或协议 buffer 若改变则预检失败。共享 TPA/classifier/bbox 的所有 alias 同步替换并
+恢复，原型 eval cache 每次清空，防止旧缓存让替换虚假“无效”。
+
+每组双向执行：8ep 模型中放入 10ep 模块；10ep 模型中换回 8ep 模块。测量时：
+
+- 最终分类 bank、最终 scalar bias 和 CLIP 分数固定在接收端；因此 `upstream_tpa`
+  的最终分类 bank 变化不混入测量。偏置效果单列。
+- 原生 forward 必须复现原缓存的 features/boxes/prototypes，否则立即停止。
+- 使用原报告的 TP/FP 区域；新产生的候选按框 IoU 做**不看分数**的一对一匹配，不假定
+  query index 恒定，不根据新模型分数挑选更有利的候选。重复来源 query 可复用同一
+  匹配；不同 query 不共享对应候选。几何并列不强行配对。
+- 输出每个区域的匹配 IoU、特征 cosine、融合 log-score 变化，以及类别 TP−FP 间隔
+  变化。只在全部区域匹配成功时输出 `full_panel_margin_change`；缺失/歧义框显示
+  `NA`，不能算成“FP 被修好了”。子集统计保留供检查，不能和完整面板直接比较。
+- 这不是锁死网络内部框的位置：box refinement 可以改变特征和候选位置，最终通过
+  几何对应区域进行条件评分，且不重算 CLIP 项。它不是新推理协议或可部署 gate。
+
+服务器同步本次提交后运行（固定 lami Python，避免 base 环境 detrex 错误）：
+
+```bash
+cd ~/LaMI-DETR
+mkdir -p /root/autodl-tmp/no_radius_8ep_vs_10ep_query_updates
+set -o pipefail
+CUDA_VISIBLE_DEVICES=0 /root/miniconda3/envs/lami/bin/python -u tools/audit_query_path_updates.py \
+  --stage-dir /root/autodl-tmp/no_radius_8ep_vs_10ep_updates \
+  --output-dir /root/autodl-tmp/no_radius_8ep_vs_10ep_query_updates \
+  2>&1 | tee -a /root/autodl-tmp/no_radius_8ep_vs_10ep_query_updates/audit.log
+```
+
+`--prepare-only` 仅做 CPU 输入/参数分组/预算预检；`--analyze-only` 仅分析新工具已经
+完成的 forward cache，缺失时拒绝运行，绝不回退到 GPU。恢复时保留原 `--device`
+字符串（它是缓存身份的一部分）；可设置 `CUDA_VISIBLE_DEVICES=""`，证明没有 GPU
+调用。普通重跑同样自动复用已完成的逐图缓存。身份锁包含源 report、checkpoint、
+模型/配置/诊断代码、资源、PyTorch 版本和匹配协议；不覆盖旧 stage 的任何文件。
+
+完成后上传新目录的 `report.json`。优先看 `bidirectional_check` 和区域覆盖率：
+“8ep 加入新模块使间隔变小，10ep 换回旧模块使间隔变大”支持该模块的**端点局部负作用**；
+只在一个方向改善、或两端混合都变差，可能是模块协同适配/混合模型分布外行为，不能
+马上冻结或删掉该模块。面板只有事后选定的几类/几个区域，不代表全验证集 APr，也不
+证明是 APR、RPSA 或某一种历史优化更新造成的。不自动启动消融训练或全量评测。
+
+本地 CPU 回归：
+
+```bash
+PYTHONPATH=. python -m pytest -q --rootdir=tests --confcutdir=tests \
+  tests/test_query_path_updates.py tests/test_rare_stage_updates.py \
+  tests/test_tpa_gradient_audit.py tests/test_rare_region_pairing.py
+```
