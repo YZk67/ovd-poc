@@ -173,6 +173,22 @@ def test_missing_query_cache_fails_before_gpu_capture(tmp_path, monkeypatch):
         run(args)
 
 
+def test_old_side_gradient_audit_reads_old_query_cache(tmp_path, monkeypatch):
+    args, captured, geometry = pipeline_fixture(tmp_path)
+    from pathlib import Path
+    directory = Path(geometry["regions"][0]["cache_directory"])
+    (directory / "old").mkdir()
+    for path in (directory / "new").glob("*.pt"):
+        saved = torch.load(path, weights_only=True)
+        saved["label"] = "old"
+        torch.save(saved, directory / "old" / path.name)
+        path.unlink()  # ensure an accidental hard-coded new/ path cannot work
+    geometry["side"] = "old"
+    Path(args.geometry_json).write_text(json.dumps(geometry))
+    monkeypatch.setattr("tools.audit_tpa_gradients.capture", lambda *a: captured)
+    assert run(args)["complete"]
+
+
 def test_changed_capture_identity_refuses_reuse_and_existing_cache_requires_explicit_flag(tmp_path, monkeypatch):
     args, captured, _ = pipeline_fixture(tmp_path)
     monkeypatch.setattr("tools.audit_tpa_gradients.capture", lambda *a: captured)
@@ -233,6 +249,8 @@ def test_real_capture_loop_averages_losses_without_updates_or_extra_forwards(mon
     for key in ("detector", "apr", "rpsa"):
         torch.testing.assert_close(result[0]["gradients"][key], result[1]["gradients"][key])
     losses = result[0]["microbatches"]
+    assert losses[0]["mapped_inputs"][0]["image_sha256"]
+    assert losses[0]["mapped_inputs"][0]["gt_classes_sha256"]
     assert result[0]["mean_losses"]["loss_class"] == pytest.approx(
         (losses[0]["losses"]["loss_class"] + losses[1]["losses"]["loss_class"]) / 2)
 

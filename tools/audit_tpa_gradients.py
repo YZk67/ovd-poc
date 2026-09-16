@@ -46,6 +46,7 @@ def save_gradients(path, value):
 
 
 def load_queries(geometry, state, prompts):
+    side = geometry["side"]
     categories = [{k: c[k] for k in ("id", "name", "frequency")} for c in geometry["classes"]]
     indices = {c["name"]: i for i, c in enumerate(categories)}
     reconstruction = reconstruct_tpa(prompts, state, geometry["protocol"]["tpa_tau"])
@@ -66,7 +67,7 @@ def load_queries(geometry, state, prompts):
             if (manifest["fingerprint"] != geometry["parent_fingerprint"]
                     and manifest["inputs"].get("parent_fingerprint") != geometry["parent_fingerprint"]):
                 raise ValueError("Query cache is unrelated to geometry report")
-            candidate = load_trusted_torch_file(directory / "new" / "bank.pt")
+            candidate = load_trusted_torch_file(directory / side / "bank.pt")
             if candidate["category_ids"] != [c["id"] for c in categories]:
                 raise ValueError("Cached category order differs")
             validate_reconstructed_bank(reconstruction, candidate)
@@ -74,8 +75,8 @@ def load_queries(geometry, state, prompts):
                 bank = candidate
             elif any(candidate[k] != bank[k] for k in ("temperature", "logit_scale", "cls_bias", "tpa_tau")):
                 raise ValueError("Cached classifier protocol differs")
-            sample = load_trusted_torch_file(directory / "new" / f"{row['image_id']}.pt")
-            validate_sample(sample, candidate, manifest["fingerprint"], "new", row["image_id"])
+            sample = load_trusted_torch_file(directory / side / f"{row['image_id']}.pt")
+            validate_sample(sample, candidate, manifest["fingerprint"], side, row["image_id"])
             cache[sample_key] = sample
         sample = cache[sample_key]
         q = entry["query_id"]
@@ -86,7 +87,8 @@ def load_queries(geometry, state, prompts):
         features.append(sample["features"][q].cpu())
         query_indices.append(indices[row["category"]])
         records.append({"category": row["category"], "kind": row["kind"], "image_id": row["image_id"],
-                        "query_id": q, "native_cache_logit": entry["native_cache_logit"]})
+                        "query_id": q, "native_cache_logit": entry["native_cache_logit"],
+                        "clip_log_probability": entry["clip_log_probability_fixed"]})
     if not records:
         raise ValueError("No unambiguous selected native queries")
     return categories, bank, torch.stack(features), torch.tensor(query_indices, dtype=torch.long), records
@@ -162,8 +164,8 @@ def run(args):
         raise ValueError("Hard audit budget is 128 training-image exposures; no unbounded runs")
     torch.set_num_threads(args.cpu_threads)
     geometry = load_json(args.geometry_json)
-    if geometry.get("complete") is not True or geometry.get("side") != "new":
-        raise ValueError("Use the completed NEW-checkpoint geometry audit")
+    if geometry.get("complete") is not True or geometry.get("side") not in ("old", "new"):
+        raise ValueError("Use a completed old/new checkpoint geometry audit")
     checkpoint_path = Path(args.checkpoint or geometry["checkpoint"]["path"]).resolve()
     prompt_path = Path(geometry["prompt_bank"]["path"]).resolve()
     output = Path(args.output).resolve()
@@ -212,7 +214,7 @@ def run(args):
                               "magnitude": "Multiply unit derivative by the direction norm for raw -g; for hypothetical clipped SGD also multiply by clip coefficient and LR. NOT AdamW.",
                               "angular_speed": "Unsigned angular speed, not movement toward correct semantics",
                               "zero_centers": "Undefined directions flagged; excluded from mean angular speeds",
-                              "scope": "Local TPA-only derivatives at one final checkpoint, not historical training causation or AP prediction",
+                              "scope": "Local TPA-only derivatives at one checkpoint, not historical training causation or AP prediction",
                               "queries": "Validation labels only label frozen diagnostic queries, never training-loss targets. Query fusion/features/boxes are held fixed in score JVP.",
                               "comparisons": "Unit-normalized direction rows do not add linearly; recover raw magnitudes before comparing component sums."}}
     save_json(output, report)

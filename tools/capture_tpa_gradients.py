@@ -45,6 +45,14 @@ def collect_windows(model, tpa, loader, args):
                 if len(data) != args.batch_size:
                     raise ValueError("Unexpected micro-batch size")
                 gt_classes = [d["instances"].gt_classes.tolist() for d in data]
+                # Record pre-forward mapped inputs: forward may remap GT classes
+                # in-place for FedLoss. These hashes check endpoint probe pairing.
+                mapped_inputs = [{
+                    "image_sha256": tensor_digest(d["image"]),
+                    "gt_classes_sha256": tensor_digest(d["instances"].gt_classes),
+                    "gt_boxes_sha256": (tensor_digest(d["instances"].gt_boxes.tensor)
+                                        if hasattr(d["instances"], "gt_boxes") else None),
+                } for d in data]
                 if any(c < 0 or c >= len(model.novel_idx) or bool(model.novel_idx[c])
                        for classes in gt_classes for c in classes):
                     raise ValueError("A rare/invalid GT entered the training-loss audit")
@@ -61,6 +69,7 @@ def collect_windows(model, tpa, loader, args):
                 micro_rows.append({"image_ids": [int(d["image_id"]) for d in data],
                                    "global_gt_classes_before_remap": gt_classes,
                                    "mapped_image_shapes": [list(d["image"].shape) for d in data],
+                                   "mapped_inputs": mapped_inputs,
                                    "fedloss_category_indices": sampled["category_indices"],
                                    "fedloss_rare_category_count": sampled["rare_category_count"],
                                    "unused_parameter_indices": unused, "losses": loss_values})

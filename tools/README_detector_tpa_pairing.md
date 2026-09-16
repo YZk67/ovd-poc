@@ -846,3 +846,77 @@ PYTHONPATH=. python -m pytest -q --rootdir=tests --confcutdir=tests \
   tests/test_lvis_rare_pr.py tests/test_rare_pr_curve_replay.py \
   tests/test_run_rare_stage_comparison.py
 ```
+
+## no-radius 8ep→10ep：排序退化的更新来源审计（有界、单卡、不更新参数）
+
+`audit_rare_stage_updates.py` 接上面的完整 `comparison.json`。它不是新的训练实验，
+也不声称能用两个 checkpoint 还原中间的 AdamW 历史。默认从报告的 focus 类别中选择
+**AP、AP50 都下降且 IoU=.50 TP 数保持不变**的前三类；本次结果应是
+`lasagna`、`keg`、`bass_horn`。不把仅 AP75 下降的 `chocolate_mousse` 当作 AP50 排序退化。
+
+执行顺序与硬预算：
+
+1. 核对 8ep/10ep APr、checkpoint iteration=56799/70999、K=5、radius=0、slot prior=.2；
+   锁定所有输入的 SHA256。用已有全类预测在 CPU 重放这三类的官方 LVIS 匹配，取得新模型
+   TP 和前置 FP 的真实身份。不是重跑全验证集 GPU inference。
+2. 仅对相关图像分别执行两端原生 forward，**最多 32 张不同验证图/端**，超预算先报错。
+   按框位置和分数恢复来源 query；另一端按 IoU≥.5 配对，不假定 query index 一致。
+   无合格对应框/来源不唯一的区域列入 excluded，不硬凑配对。
+3. 固定缓存的 query，交叉使用 8ep/10ep 的末端 TPA bank，分解融合 log-score 的变化：
+   `terminal_tpa_bank`、`query_and_bias_path`、`clip_roi_path`，检查逐区域加法闭合。
+   使用两种替换顺序的平均来分配交互项，不称作独立训练因果贡献。
+4. 分别在两端用 `train_norare` 做 2 个窗口×8 microbatches×4 张的原生损失梯度探针，
+   **两端合计最多 128 次训练图像使用**。只求 TPA 参数的检测损失、RPSA、APR 梯度，
+   先平均再做原有冲突投影/TPA clipping。不创建 optimizer/scheduler，不做参数更新，
+   不修改原 checkpoint；验证图像标签只标记诊断 TP/FP，绝不作为训练损失输入。
+5. CPU 方向导数报告各方向如何改变这些固定区域的 `mean(TP log-score)−mean(FP log-score)`。
+   同时报告 `cos(-g, TPA_10ep−TPA_8ep)`，仅作为局部方向与总漂移的一致性证据。
+
+同步代码后在有 `lvis`、已编译 detrex 的 **lami 环境**运行：
+
+```bash
+cd ~/LaMI-DETR
+mkdir -p /root/autodl-tmp/no_radius_8ep_vs_10ep_updates
+set -o pipefail
+CUDA_VISIBLE_DEVICES=0 /root/miniconda3/envs/lami/bin/python -u tools/audit_rare_stage_updates.py \
+  --comparison /root/autodl-tmp/no_radius_8ep_vs_10ep_pr/comparison.json \
+  --old-checkpoint /root/autodl-tmp/instructdet_k5_no_radius_bs32_4ep_seed42/model_0056799.pth \
+  --new-checkpoint /root/autodl-tmp/instructdet_k5_no_radius_bs32_4ep_seed42/model_0070999.pth \
+  --old-predictions /root/autodl-tmp/eval_k5_no_radius_bs32_8ep/lvis_instances_results.json \
+  --new-predictions /root/autodl-tmp/eval_k5_no_radius_bs32_10ep/lvis_instances_results.json \
+  --output-dir /root/autodl-tmp/no_radius_8ep_vs_10ep_updates \
+  2>&1 | tee -a /root/autodl-tmp/no_radius_8ep_vs_10ep_updates/audit.log
+```
+
+如只想先知道图像数量，在该命令加 `--prepare-only`：只做 CPU 预检/匹配，之后去掉此参数
+原命令重跑。完整执行会缓存原生区域和两端梯度；同一输入/配置重跑时校验后复用，不重复
+已完成的 GPU 探针。输入、模型代码、采样设置不一致则拒绝混用。`--classes 1` 可进一步
+减少目标类别，但要使用新的输出目录；不根据这三类结果调每类阈值。
+
+输出 `report.json`（完成时 `complete=true`），以及可复查的 `fp_details.json`、
+`regions.json`、两端 geometry/gradient 文件、原生 query 缓存。日志包含逐文件 hash、
+逐图 dump、逐 microbatch 和逐 JVP 进度；耗时受读取两份预测 JSON、模型加载和硬件影响。
+
+结果解释：
+
+- `terminal_tpa_bank` 的 margin 变化若明显为负，支持检查末端分类 bank 漂移；
+  若主要在 `query_and_bias_path`，不能据此称“TPA 无关”，因为它还包含上游 TPA query
+  fusion、detector 表示及配对框变化。`clip_roi_path` 包含 ROI 位置变化。
+- `dMargin<0` 表示该**局部假想梯度下降**会缩小选中 TP/FP 分数差；正值相反。
+  各分量使用 routed-total 的同一个 clip 系数，检查加法闭合；未乘 LR，未应用 AdamW
+  动量、二阶矩或 weight decay，不能当作真实训练步的分数变化。
+- 相同 seed 不等于相同 probe batch。报告逐 microbatch 核对 image ID、增强后像素/GT
+  SHA256、FedLoss 子集；`all_verified_equal=false` 时不得把两端梯度差当成严格配对变化。
+  即便为 true，也未证明内部 dropout/denoising 随机数一致，更不是历史四卡采样重放。
+- TP/FP 标签来自 **10ep 的已选区域**，携带到 8ep 的几何对应区域；并非两端重新匹配后
+  同一个 TP/FP。报告不是整条 PR/AP，不是全部 −0.5812 APr 的归因，也不能证明某项
+  训练修改导致了它。只有一致的证据才值得考虑下一项受控训练消融。
+
+本地测试覆盖数值差分、加法闭合、checkpoint/预算/缓存保护、几何 query 配对、输入
+哈希核验和无 optimizer 调用；真实 GPU/D2 损失捕获仍须在服务器环境验证：
+
+```bash
+PYTHONPATH=. python -m pytest -q --rootdir=tests --confcutdir=tests \
+  tests/test_rare_stage_updates.py tests/test_tpa_gradient_audit.py \
+  tests/test_tpa_geometry_audit.py tests/test_rare_region_pairing.py
+```
