@@ -1028,3 +1028,57 @@ PYTHONPATH=. python -m pytest -q --rootdir=tests --confcutdir=tests \
   tests/test_query_path_updates.py tests/test_rare_stage_updates.py \
   tests/test_tpa_gradient_audit.py tests/test_rare_region_pairing.py
 ```
+
+### 正式性能验证：10ep 主体，仅 decoder_core 回退到 8ep
+
+小面板的双向替换不能代表正式 APr。现在只验证这一组混合模型，不重训、不扫参数，
+也不冻结训练模块或调整 APR/LR。`evaluate_decoder_rollback.py` 从已完成的 query-path
+审计读取输入，检查 checkpoint、模型代码、文本资源、标注及原生 10ep 预测的 SHA256。
+要求原生 10ep 日志仍对应 **AP=41.7624、APr=42.3031**，不重新评测原生模型。
+
+只换 `transformer.decoder.layers.*`、`transformer.decoder.norm.*`、
+`transformer.decoder.ref_point_head.*`，键集合必须等于原审计的 `decoder_core`（本次 138
+个张量）。**encoder、query content、所有 class/bbox heads、TPA、CLIP、bias 和 buffer
+全部保留 10ep**。独立写入 `hybrid_10ep_decoder8_eval_only.pth`，重新加载后逐张量校验；
+不复制 optimizer/trainer/scheduler/iteration，不写 `last_checkpoint`，不得用于续训。
+两个原 checkpoint 和审计缓存均只读。
+
+服务器同步提交后执行（输出目录必须是全新的；脚本自行保存并实时显示 console log）：
+
+```bash
+cd ~/LaMI-DETR
+CUDA_VISIBLE_DEVICES=0,1,2,3 /root/miniconda3/envs/lami/bin/python -u \
+  tools/evaluate_decoder_rollback.py \
+  --audit-report /root/autodl-tmp/no_radius_8ep_vs_10ep_query_updates/report.json \
+  --output-dir /root/autodl-tmp/eval_no_radius_10ep_decoder8 \
+  --num-gpus 4
+```
+
+这次恢复**完整 19,809 张 LVIS 验证集的原生推理**：框预测、CLIP ROI 和全图 top-300
+都重新计算，不使用 GT 框、面板配对或冻结的旧 CLIP 分数。固定 calibrated Eq.2、
+`alpha=0, beta=.3, novel_scale=3, tpa_tau=.004375, cls_tau=.07, slot_prior=.2,
+mode_strength=0, eval_mode_scale=1, category_topk=3, query_class_topk=0`。
+GPU 评测通过同一个 Python 解释器调用 `train_net.py --eval-only`，绝不传 `--resume`。
+
+输出 `manifest.json`（来源/替换键/命令/哈希）、`console.log`、`log.txt`、
+`lvis_instances_results.json` 及完成后才写的 **`summary.json`**。最后自动打印原生 10ep、
+混合模型和全部九项指标差值。退出码为零但缺失正式指标/预测，或发生被 train_net 捕获的
+评测异常，也会判为失败，不写成功 summary。失败目录保留排查；重试换新目录，不覆盖。
+`--prepare-only` 仅 CPU 构建和校验，不启动 GPU；它仍占用新目录，不表示评测已完成。
+
+另一终端看日志：
+
+```bash
+tail -n 30 -F /root/autodl-tmp/eval_no_radius_10ep_decoder8/console.log
+```
+
+完成后提供 `summary.json`。只有正式 APr 改善且整体 AP 代价可接受，才继续考虑后期
+decoder 更新约束；即使改善，也只是这对 checkpoint 的端点替换结果，不证明冻结
+decoder 训练会获得同样效果，不归因于某个历史 loss。未改善则不自动增加实验。
+
+CPU 回归（不需要 Detectron2/CUDA，也不会跑正式评测）：
+
+```bash
+PYTHONPATH=. python -m pytest -q --rootdir=tests --confcutdir=tests \
+  tests/test_decoder_rollback.py tests/test_query_path_updates.py
+```
