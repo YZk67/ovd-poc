@@ -179,6 +179,8 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--expected-apr", type=float, required=True)
     parser.add_argument("--apr-tolerance", type=float, default=0.02)
+    parser.add_argument("--all-curves", action="store_true",
+                        help="Save IoU .50/.75 PR curves for every rare class in this same CPU evaluation; --focus still controls printed examples")
     parser.add_argument(
         "--focus", nargs="+", default=[
             "legume", "papaya", "crouton", "dragonfly", "garbage", "liquor",
@@ -190,6 +192,8 @@ def main():
     annotation_path = Path(args.annotations)
     if not prediction_path.is_file() or not annotation_path.is_file():
         raise FileNotFoundError("prediction JSON and LVIS annotation JSON must both exist")
+    if Path(args.output).resolve() in (prediction_path.resolve(), annotation_path.resolve()):
+        raise ValueError("Output must not overwrite predictions or annotations")
     if args.apr_tolerance < 0:
         raise ValueError("--apr-tolerance must be nonnegative")
 
@@ -248,7 +252,7 @@ def main():
     by_name = {row["name"]: (index, row) for index, row in enumerate(per_class_rows)}
     focus = {
         name: focus_report(evaluator, by_name[name][1]["category_id"], *by_name[name])
-        for name in args.focus
+        for name in (by_name if args.all_curves else args.focus)
     }
 
     print("\n=== Official LVIS rare per-class AP, same prediction JSON ===")
@@ -293,6 +297,7 @@ def main():
         "official_apr": official_apr,
         "expected_apr": args.expected_apr,
         "rare_category_count": len(rare),
+        "curve_scope": "all_rare_categories" if args.all_curves else "focus_only",
         "per_class": per_class_rows,
         "focus": focus,
     }

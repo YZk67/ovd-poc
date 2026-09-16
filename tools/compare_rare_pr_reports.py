@@ -77,6 +77,49 @@ def display_ap(comparison):
         print(f"{row['name']:25} {row['gt_annotations']:4d} " + " ".join(parts), flush=True)
 
 
+def display_attribution(comparison, limit=20):
+    summary = comparison["macro_attribution"]
+    print("\n=== All-valid-class APr attribution (new - old) ===", flush=True)
+    print(f"valid classes={summary['valid_category_count']} "
+          f"gains={summary['positive_contribution']:+.4f} "
+          f"losses={summary['negative_contribution']:+.4f} "
+          f"sum={summary['sum_contribution']:+.4f}", flush=True)
+    for title, rows in (
+        ("Largest declines", [r for r in summary["per_class"] if r["delta_AP"] < 0]),
+        ("Largest gains", [r for r in reversed(summary["per_class"]) if r["delta_AP"] > 0]),
+    ):
+        print(f"\n{title}: class / GT / AP old / AP new / delta / APr contribution", flush=True)
+        for row in rows[:limit]:
+            print(f"{row['name']:25} {row['gt_annotations']:4d} "
+                  f"{row['old_AP']:8.3f} {row['new_AP']:8.3f} "
+                  f"{row['delta_AP']:+9.3f} {row['apr_contribution']:+10.4f}", flush=True)
+    print("\nGT strata: range / classes / mean delta AP / median delta AP / APr contribution", flush=True)
+    for row in summary["gt_strata"]:
+        print(f"{row['gt_range']:>5} {row['classes']:4d} {row['mean_delta_AP']:+9.4f} "
+              f"{row['median_delta_AP']:+9.4f} {row['apr_contribution']:+10.4f}", flush=True)
+
+
+def display_recall_ranking(comparison):
+    print("\n=== Recall support vs shared-recall precision (AP points) ===", flush=True)
+    print("class                       IoU    dRecall    lost-R   gained-R  shared-PR       dAP  mean dFP-before", flush=True)
+    for row in comparison["per_class"]:
+        for iou, change in row["recall_ranking"].items():
+            if change is None:
+                print(f"{row['name']:25} {iou} MISSING_CURVE_OR_NO_VALID_GT", flush=True)
+                continue
+            parts = change["ap_partition_points"]
+            fp_delta = change["same_recall_mean_delta_fp_before"]
+            print(f"{row['name']:25} {iou} {change['delta_max_recall_points']:+10.3f} "
+                  f"{parts['lost_recall_support']:+9.3f} {parts['gained_recall_support']:+10.3f} "
+                  f"{parts['shared_recall_precision']:+10.3f} {change['delta_AP_points']:+9.3f} "
+                  f"{(f'{fp_delta:+.2f}' if fp_delta is not None else 'n/a'):>16}", flush=True)
+    print("lost-R + gained-R + shared-PR = delta AP at THIS IoU. Shared-PR is "
+          "precision-envelope change on common recall support, not a causal FP-only effect. "
+          "Mean dFP-before compares equal TP ordinals/recall, NOT paired GT identities. "
+          "IoU 0.50/0.75 diagnostics do not partition the full IoU-averaged APr. "
+          "Recall loss in saved top-300 results is not necessarily missing box proposals.", flush=True)
+
+
 def display_curves(comparison):
     print("\n=== Full-validation ranked TP/FP comparison ===", flush=True)
     print("Ranks are 1-based, within one category across ALL validation images. "
@@ -137,10 +180,20 @@ def run(args):
     if any(output.resolve() == path.resolve() for path in input_paths):
         raise ValueError("Output must not overwrite source reports, annotations or predictions")
     print(f"[load] old={paths['old']} new={paths['new']}; no model/GPU", flush=True)
-    comparison = compare_reports(reports["old"], reports["new"], args.focus)
+    if args.top_declines is not None:
+        if args.top_declines < 1:
+            raise ValueError("--top-declines must be positive")
+        ap_only = compare_reports(reports["old"], reports["new"], [])
+        focus = [row["name"] for row in ap_only["macro_attribution"]["per_class"]
+                 if row["delta_AP"] < -1e-5][:args.top_declines]
+        print(f"[select] largest AP declines: {focus}; diagnostic selection, not a tuning set", flush=True)
+    else:
+        focus = args.focus if args.focus is not None else DEFAULT_FOCUS
+    comparison = compare_reports(reports["old"], reports["new"], focus)
     identities = {label: file_identity(path) for label, path in paths.items()}
     comparison["source_reports"] = identities
     comparison["curve_replay"] = {}
+    display_attribution(comparison)
     display_ap(comparison)
     if comparison["missing_curves"]:
         print("[missing]", json.dumps(comparison["missing_curves"], ensure_ascii=False), flush=True)
@@ -159,10 +212,10 @@ def run(args):
             print(f"[fill {label}] missing full-validation curves only; "
                   f"predictions={prediction_paths[label]}", flush=True)
             reports[label], replay[label] = fill_report_curves(
-                reports[label], args.focus,
+                reports[label], focus,
                 predictions=prediction_paths[label], annotations=args.annotations,
             )
-            comparison = compare_reports(reports["old"], reports["new"], args.focus)
+            comparison = compare_reports(reports["old"], reports["new"], focus)
             comparison.update(source_reports=identities, curve_replay=replay)
             save_json(output, comparison)
             print(f"[fill {label}] selected per-class AP replay: PASS", flush=True)
@@ -170,6 +223,7 @@ def run(args):
                   "AP agreement and hashes recorded now do not authenticate the original "
                   "report's checkpoint/protocol or original FP ordering.", flush=True)
     display_curves(comparison)
+    display_recall_ranking(comparison)
     print(f"[save] {output} complete={comparison['complete']}", flush=True)
     if not comparison["complete"]:
         print("[incomplete] AP comparison is available; missing PR is NOT zero FP. "
@@ -182,7 +236,10 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--old-report", required=True)
     parser.add_argument("--new-report", required=True)
-    parser.add_argument("--focus", nargs="+", default=DEFAULT_FOCUS)
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--focus", nargs="+", help="Explicit PR focus classes (default: legacy diagnostic classes)")
+    selection.add_argument("--top-declines", type=int,
+                           help="Automatically inspect the N largest per-class AP decreases; all-class macro attribution is always saved")
     parser.add_argument("--expected-old-apr", type=float)
     parser.add_argument("--expected-new-apr", type=float)
     parser.add_argument("--fill-missing-curves", action="store_true")

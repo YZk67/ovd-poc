@@ -761,3 +761,88 @@ effective batch=32；radius monitor=0。当前目录的名字仍含 `4ep` 是为
 
 如意外中断，只重跑上面的训练命令部分（仍是 12ep no-radius 配置、同一目录、
 `--resume`）；不要让更晚 checkpoint 再通过仅针对 4ep 的准备步骤或覆盖 4ep 快照。
+
+## no-radius 8ep→10ep：定位 −0.5812 APr（CPU，不再训练）
+
+本次仅比较同一 no-radius run 的两个阶段，不能使用前面原生 radius / Kang 报告替代：
+
+| 阶段 | checkpoint | AP | APr |
+| --- | --- | --- | --- |
+| 8ep | `model_0056799.pth` | 40.4804 | 42.8843 |
+| 10ep | `model_0070999.pth` | 41.7624 | 42.3031 |
+| 12ep（不是本次输入） | `model_final.pth` | 44.6979 | 42.4229 |
+
+`run_rare_stage_comparison.py` 顺序执行两次 **CPU 官方 LVIS 匹配**，在同一次匹配中保存
+所有 rare 类的 IoU 0.50/0.75 PR 曲线，然后比较报告，不加载模型、checkpoint 或 GPU。
+两个预测输入和标注必须都存在才开始；APr 不符立即中止；拒绝覆盖已有报告。
+默认自动选择这对结果中 AP 下降最大的 20 类，不复用以前挑选的类别。
+
+**先确认 8ep 的预测 JSON 是否独立保存。** 训练目录中的同名 JSON 在 12ep 后已被覆盖，
+日志里的 AP 数字无法恢复逐框结果。以下 8ep 路径是独立评测目录的约定，不代表它已存在。
+若另存到其他位置，只替换 `--old-predictions`。不要为了通过文件存在检查改成 12ep 的 JSON。
+
+```bash
+cd ~/LaMI-DETR
+mkdir -p /root/autodl-tmp/no_radius_8ep_vs_10ep_pr
+set -o pipefail
+/root/miniconda3/envs/lami/bin/python -u tools/run_rare_stage_comparison.py \
+  --old-predictions /root/autodl-tmp/eval_k5_no_radius_bs32_8ep/lvis_instances_results.json \
+  --new-predictions /root/autodl-tmp/eval_k5_no_radius_bs32_10ep/lvis_instances_results.json \
+  --expected-old-apr 42.8843 --expected-new-apr 42.3031 \
+  --top-declines 20 \
+  --output-dir /root/autodl-tmp/no_radius_8ep_vs_10ep_pr \
+  2>&1 | tee -a /root/autodl-tmp/no_radius_8ep_vs_10ep_pr/comparison.log
+```
+
+如果 8ep JSON 确实没有保存，需要用户决定是否补 **一次 8ep eval-only**。这不是 CPU
+诊断的一部分，脚本绝不会自动启动它，也不需要重训；原有 10ep JSON 可直接复用。
+以下命令只在尚未存在独立 8ep 目录时执行，保留现有结果，不覆盖训练目录：
+
+```bash
+cd ~/LaMI-DETR
+if [ -e /root/autodl-tmp/eval_k5_no_radius_bs32_8ep ]; then
+  echo '8ep directory already exists: inspect it or choose a new output path; no evaluation started.'
+else
+  CUDA_VISIBLE_DEVICES=0,1,2,3 /root/miniconda3/envs/lami/bin/python tools/train_net.py \
+    --config-file lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_no_radius.py \
+    --num-gpus 4 --eval-only \
+    train.init_checkpoint=/root/autodl-tmp/instructdet_k5_no_radius_bs32_4ep_seed42/model_0056799.pth \
+    train.output_dir=/root/autodl-tmp/eval_k5_no_radius_bs32_8ep \
+    dataloader.evaluator.output_dir=/root/autodl-tmp/eval_k5_no_radius_bs32_8ep \
+    model.alpha=0.0 model.beta=0.3 model.novel_scale=3.0 model.tpa_eval_mode_scale=1.0
+fi
+```
+
+输出：`old_report.json`、`new_report.json`、`comparison.json`。已有两份报告时可以直接：
+
+```bash
+/root/miniconda3/envs/lami/bin/python -u tools/compare_rare_pr_reports.py \
+  --old-report /root/autodl-tmp/no_radius_8ep_vs_10ep_pr/old_report.json \
+  --new-report /root/autodl-tmp/no_radius_8ep_vs_10ep_pr/new_report.json \
+  --expected-old-apr 42.8843 --expected-new-apr 42.3031 \
+  --top-declines 20 \
+  --output /root/autodl-tmp/no_radius_8ep_vs_10ep_pr/comparison.json
+```
+
+读结果时关注：
+
+- `All-valid-class APr attribution`：全部有效 rare 类（本数据通常 178，不是 taxonomy 的
+  337）贡献闭合到官方 ΔAPr；同时列出提升、下降和 GT 数分层。不能只看净下降而忽略抵消。
+- `Recall support vs shared-recall precision`：分别在 IoU .50/.75 的官方 101 点 recall
+  网格，将该 IoU 的 ΔAP 拆为丢失召回区间 `lost-R`、新增召回区间 `gained-R`、共同召回
+  区间精度变化 `shared-PR`；三项精确闭合到 **该类别该 IoU** 的 ΔAP。
+- `mean dFP-before`：在两侧都存在的相同 TP 序号（相同 attained recall）处，前置 FP
+  数变化。TP 序号不是同一 GT 身份；相同分数保持官方稳定顺序，“前置”不等于严格高分。
+- 共同召回精度变差可能是 FP 排名上升，也可能是 TP 排名下降或匹配改变，不能直接称作
+  “FP 新增的因果贡献”。top-300 内召回减少也不证明 detector 没有合格 proposal。
+- .50/.75 的 PR 拆分不是十个 IoU 平均 AP 的完整机制解释；单 GT 类很敏感，所有分析
+  只用于诊断，不据此按验证集类别调整阈值、重训或声称统计显著。
+
+本地回归测试（无需模型或 GPU；真实 LVIS replay 测试在缺少依赖时 skip）：
+
+```bash
+PYTHONPATH=. python -m pytest -q --rootdir=tests --confcutdir=tests \
+  tests/test_rare_pr_comparison_ops.py tests/test_compare_rare_pr_reports_cli.py \
+  tests/test_lvis_rare_pr.py tests/test_rare_pr_curve_replay.py \
+  tests/test_run_rare_stage_comparison.py
+```

@@ -180,3 +180,37 @@ def test_help_needs_only_stdlib():
     completed = subprocess.run([sys.executable, "-S", str(root / "tools/compare_rare_pr_reports.py"), "--help"],
                                capture_output=True, text=True)
     assert completed.returncode == 0 and "--fill-missing-curves" in completed.stdout
+
+
+def test_top_declines_uses_this_pair_instead_of_old_default_classes(inputs, capsys):
+    add_existing_curves(inputs)
+    args = arguments(inputs)
+    args.focus, args.top_declines = None, 20
+    result = run(args)
+    assert result["scope"]["focus_names"] == ["koala"]
+    assert result["complete"]
+    assert result["macro_attribution"]["sum_contribution"] == -75
+    partition = result["per_class"][0]["recall_ranking"]["0.50"]
+    assert partition["delta_max_recall_points"] == 0
+    assert partition["ap_partition_points"]["shared_recall_precision"] == pytest.approx(-75)
+    assert partition["same_recall_mean_delta_fp_before"] == 3
+    text = capsys.readouterr().out
+    assert "All-valid-class APr attribution" in text and "shared-recall precision" in text
+
+
+def test_no_declines_is_complete_without_curves_or_replay(inputs):
+    args = arguments(inputs, "--fill-missing-curves")
+    args.focus, args.top_declines = None, 20
+    args.new_report = args.old_report
+    result = run(args)
+    assert result["complete"] and result["scope"]["focus_names"] == []
+    assert result["curve_replay"] == {}
+
+
+def test_auto_selection_is_validated(inputs):
+    args = arguments(inputs)
+    args.focus, args.top_declines = None, 0
+    with pytest.raises(ValueError, match="must be positive"):
+        run(args)
+    with pytest.raises(SystemExit):
+        arguments(inputs, "--top-declines", "20")  # --focus and --top-declines conflict.

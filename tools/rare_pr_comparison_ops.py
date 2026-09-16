@@ -147,7 +147,101 @@ def summarize_ranked_curve(curve_report):
         "fp_before_tp_median": median(point["fp_before"] for point in every_tp) if every_tp else None,
         "max_recall": previous_tp / counts["num_gt"] if counts["num_gt"] else None,
         "interpolated_AP_points": 100 * sum(interpolated) / 101 if counts["num_gt"] else None,
+        "interpolated_precision_101": interpolated,
         "has_score_ties": has_score_ties,
+    }
+
+
+def compare_recall_and_ranking(old, new):
+    """Partition a single-IoU AP change, not a causal training attribution.
+
+    On the official 101-point grid, separate lost/new recall support from the
+    precision change on shared support. Shared-support precision can change
+    because FP move up OR TP move down; absolute score thresholds are not used.
+    TP ordinal comparisons describe equal attained recall, not paired GT IDs.
+    """
+    if old is None or new is None or not old["num_gt"]:
+        return None
+    if old["num_gt"] != new["num_gt"]:
+        raise ValueError("old/new curve num_gt disagree")
+    parts = {"shared_recall_precision": 0.0, "lost_recall_support": 0.0,
+             "gained_recall_support": 0.0}
+    for index, (before, after) in enumerate(zip(
+        old["interpolated_precision_101"], new["interpolated_precision_101"]
+    )):
+        recall = index * .01
+        was_supported = recall <= old["max_recall"]
+        now_supported = recall <= new["max_recall"]
+        if was_supported and now_supported:
+            key = "shared_recall_precision"
+        elif was_supported:
+            key = "lost_recall_support"
+        elif now_supported:
+            key = "gained_recall_support"
+        else:
+            _same_number(after - before, 0.0, "unsupported recall precision")
+            continue
+        parts[key] += (after - before) * 100 / 101
+    delta_ap = new["interpolated_AP_points"] - old["interpolated_AP_points"]
+    _same_number(sum(parts.values()), delta_ap, "single-IoU AP partition closure")
+    paired = [
+        {"tp_index": before["tp_index"], "recall": before["recall"],
+         "old_fp_before": before["fp_before"], "new_fp_before": after["fp_before"],
+         "delta_fp_before": after["fp_before"] - before["fp_before"]}
+        for before, after in zip(old["every_tp"], new["every_tp"])
+    ]
+    return {
+        "delta_AP_points": delta_ap,
+        "delta_max_recall_points": 100 * (new["max_recall"] - old["max_recall"]),
+        "ap_partition_points": parts,
+        "same_recall_tp_ordinals": paired,
+        "same_recall_mean_delta_fp_before": (
+            sum(row["delta_fp_before"] for row in paired) / len(paired) if paired else None
+        ),
+        "same_recall_ordinals_with_more_fp_before": sum(row["delta_fp_before"] > 0 for row in paired),
+        "same_recall_ordinals_with_fewer_fp_before": sum(row["delta_fp_before"] < 0 for row in paired),
+    }
+
+
+def _macro_attribution(old_rows, new_rows):
+    """All valid classes, including those outside the requested PR focus."""
+    rows = []
+    for name, old in old_rows.items():
+        if old["AP"] is None:
+            continue
+        new = new_rows[name]
+        row = {key: old[key] for key in ("category_id", "name", "gt_annotations")}
+        for metric in ("AP", "AP50", "AP75"):
+            row["old_" + metric], row["new_" + metric] = old[metric], new[metric]
+            row["delta_" + metric] = (
+                new[metric] - old[metric] if old[metric] is not None else None
+            )
+        rows.append(row)
+    count = len(rows)
+    for row in rows:
+        row["apr_contribution"] = row["delta_AP"] / count
+    rows.sort(key=lambda row: (row["delta_AP"], row["category_id"]))
+    strata = []
+    for label, lower, upper in (("0", 0, 0), ("1", 1, 1), ("2-4", 2, 4),
+                                 ("5-9", 5, 9), ("10-19", 10, 19), ("20+", 20, math.inf)):
+        subset = [row for row in rows if lower <= row["gt_annotations"] <= upper]
+        if subset:
+            deltas = [row["delta_AP"] for row in subset]
+            strata.append({
+                "gt_range": label, "classes": len(subset),
+                "mean_delta_AP": math.fsum(deltas) / len(subset),
+                "median_delta_AP": median(deltas),
+                "apr_contribution": math.fsum(deltas) / count,
+            })
+    return {
+        "valid_category_count": count,
+        "positive_contribution": math.fsum(row["apr_contribution"] for row in rows if row["delta_AP"] > 0),
+        "negative_contribution": math.fsum(row["apr_contribution"] for row in rows if row["delta_AP"] < 0),
+        "sum_contribution": math.fsum(row["apr_contribution"] for row in rows),
+        "classes_improved": sum(row["delta_AP"] > 0 for row in rows),
+        "classes_declined": sum(row["delta_AP"] < 0 for row in rows),
+        "classes_unchanged": sum(row["delta_AP"] == 0 for row in rows),
+        "per_class": rows, "gt_strata": strata,
     }
 
 
@@ -271,7 +365,15 @@ def compare_reports(old_report, new_report, focus_names=None):
             row["curves"][iou] = pair
         if len(set(gt_counts)) > 1:
             raise ValueError(f"old/new or IoU curves for {name} num_gt disagree")
+        row["recall_ranking"] = {
+            iou: compare_recall_and_ranking(pair["old"], pair["new"])
+            for iou, pair in row["curves"].items()
+        }
         per_class.append(row)
+    attribution = _macro_attribution(old_names, new_names)
+    _same_number(attribution["sum_contribution"],
+                 new_report["official_apr"] - old_report["official_apr"],
+                 "all-class APr contribution closure", 2 * AP_TOLERANCE)
     return {
         "scope": {
             "evaluation": "LVIS rare categories, bbox, all area",
@@ -287,6 +389,7 @@ def compare_reports(old_report, new_report, focus_names=None):
         "old_apr": old_report["official_apr"],
         "new_apr": new_report["official_apr"],
         "delta_apr": new_report["official_apr"] - old_report["official_apr"],
+        "macro_attribution": attribution,
         "per_class": per_class,
         "missing_curves": missing,
         "complete": not missing,

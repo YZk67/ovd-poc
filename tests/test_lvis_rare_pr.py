@@ -87,3 +87,60 @@ def test_operating_points_follow_score_ordered_tp_fp_curve():
         "tp": 1, "fp": 0, "precision": 1.0, "recall": 0.5
     }
     assert points["0.95"]["precision"] is None
+
+
+def test_all_curves_saved_in_single_evaluation_including_unobserved_classes(tmp_path, monkeypatch):
+    """Synthetic evaluator seam; does not claim real LVIS integration coverage."""
+    import json
+    import sys
+    from tools.report_lvis_rare_pr import main
+
+    categories = [{"id": 1, "name": "koala", "frequency": "r"},
+                  {"id": 2, "name": "unobserved", "frequency": "r"}]
+    evaluations = []
+
+    class GroundTruth:
+        def __init__(self, path):
+            self.dataset = {"annotations": [{"category_id": 1}]}
+
+        def get_cat_ids(self):
+            return [1, 2]
+
+        def load_cats(self, ids):
+            return categories
+
+    class Evaluator:
+        def __init__(self, *args):
+            self.params = SimpleNamespace(
+                area_rng_lbl=["all"], area_rng=[[0, 1e10]], img_ids=[1],
+                iou_thrs=np.array([.5, .75]), rec_thrs=np.linspace(0, 1, 101),
+            )
+            precision = np.ones((2, 101, 2, 1))
+            precision[:, :, 1, :] = -1
+            self.eval = {"precision": precision, "recall": np.array([[[1.], [-1.]], [[1.], [-1.]]])}
+            self.eval_imgs = [{"dt_scores": [.8], "dt_matches": np.array([[1], [1]]),
+                               "dt_ignore": np.zeros((2, 1), dtype=bool), "gt_ignore": [False]}, None]
+
+        def run(self):
+            evaluations.append(1)
+
+        def get_results(self):
+            return {"APr": 1.}
+
+    monkeypatch.setitem(sys.modules, "lvis", SimpleNamespace(
+        LVIS=GroundTruth, LVISEval=Evaluator, LVISResults=lambda *a, **kw: None,
+    ))
+    for name in ("predictions", "annotations"):
+        (tmp_path / (name + ".json")).write_text("[]")
+    monkeypatch.setattr(sys, "argv", [
+        "report_lvis_rare_pr.py", "--predictions", str(tmp_path / "predictions.json"),
+        "--annotations", str(tmp_path / "annotations.json"),
+        "--output", str(tmp_path / "report.json"), "--expected-apr", "100",
+        "--focus", "koala", "--all-curves",
+    ])
+    main()
+    saved = json.loads((tmp_path / "report.json").read_text())
+    assert evaluations == [1]
+    assert saved["curve_scope"] == "all_rare_categories"
+    assert set(saved["focus"]) == {"koala", "unobserved"}
+    assert saved["focus"]["unobserved"]["iou_curves"]["0.50"]["num_gt"] == 0

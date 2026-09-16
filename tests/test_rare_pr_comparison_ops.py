@@ -3,7 +3,9 @@ import json
 
 import pytest
 
-from tools.rare_pr_comparison_ops import compare_reports, summarize_ranked_curve
+from tools.rare_pr_comparison_ops import (
+    compare_recall_and_ranking, compare_reports, summarize_ranked_curve,
+)
 
 
 def _curve(matches, *, num_gt=2, scores=None, ignored=0):
@@ -223,3 +225,89 @@ def test_curve_gt_denominators_must_agree_between_sides_and_ious():
 def test_invalid_focus_is_not_silently_dropped(focus, error):
     with pytest.raises(ValueError, match=error):
         compare_reports(_report(), _report(is_new=True), focus)
+
+
+def test_macro_attribution_covers_nonfocus_classes_with_valid_class_denominator():
+    old, new = _report(), _report(is_new=True)
+    for report, ap in ((old, 20), (new, 40)):
+        report["per_class"].append({
+            "category_id": 99, "name": "many_gt", "gt_annotations": 1000,
+            "AP": ap, "AP50": ap, "AP75": ap,
+        })
+        report["rare_category_count"] = 3
+        report["official_apr"] = (report["official_apr"] + ap) / 2
+    result = compare_reports(old, new, ["koala"])
+    summary = result["macro_attribution"]
+    assert summary["valid_category_count"] == 2  # Not taxonomy size=3 or GT weighted.
+    assert summary["negative_contribution"] == -25
+    assert summary["positive_contribution"] == 10
+    assert summary["sum_contribution"] == result["delta_apr"] == -15
+    assert [row["name"] for row in summary["per_class"]] == ["koala", "many_gt"]
+    assert [row["gt_range"] for row in summary["gt_strata"]] == ["2-4", "20+"]
+    assert sum(row["apr_contribution"] for row in summary["gt_strata"]) == -15
+
+
+def partition(old_matches, new_matches, num_gt=2):
+    return compare_recall_and_ranking(
+        summarize_ranked_curve(_curve(old_matches, num_gt=num_gt)),
+        summarize_ranked_curve(_curve(new_matches, num_gt=num_gt)),
+    )
+
+
+def test_same_terminal_counts_can_lose_ap_only_on_shared_recall():
+    change = partition([True, True, False, False], [False, True, False, True])
+    assert change["delta_max_recall_points"] == 0
+    assert change["ap_partition_points"] == pytest.approx({
+        "shared_recall_precision": -50, "lost_recall_support": 0, "gained_recall_support": 0,
+    })
+    assert change["same_recall_mean_delta_fp_before"] == 1.5
+    assert change["same_recall_ordinals_with_more_fp_before"] == 2
+
+
+def test_pure_recall_loss_includes_101_point_endpoint_correctly():
+    change = partition([True, True], [True])
+    assert change["delta_max_recall_points"] == -50
+    assert change["ap_partition_points"] == pytest.approx({
+        "shared_recall_precision": 0, "lost_recall_support": -5000 / 101,
+        "gained_recall_support": 0,
+    })
+    assert change["same_recall_mean_delta_fp_before"] == 0
+
+
+def test_recall_and_ranking_can_both_worsen_or_have_opposite_signs():
+    change = partition([True, True], [False, True])
+    parts = change["ap_partition_points"]
+    assert parts["lost_recall_support"] < 0 and parts["shared_recall_precision"] < 0
+    crossing = partition([True], [False, True, False, True])
+    parts = crossing["ap_partition_points"]
+    assert parts["gained_recall_support"] > 0 and parts["shared_recall_precision"] < 0
+    assert sum(parts.values()) == pytest.approx(crossing["delta_AP_points"])
+
+
+def test_extra_low_rank_fps_do_not_look_like_ranking_loss():
+    change = partition([True], [True, False, False])
+    assert change["delta_AP_points"] == 0
+    assert change["same_recall_mean_delta_fp_before"] == 0
+    assert all(value == 0 for value in change["ap_partition_points"].values())
+
+
+def test_empty_or_missing_curves_are_not_mislabelled_as_zero_fp_evidence():
+    change = partition([True, True], [])
+    assert sum(change["ap_partition_points"].values()) == pytest.approx(-100)
+    assert change["same_recall_mean_delta_fp_before"] is None
+    assert compare_recall_and_ranking(None, summarize_ranked_curve(_curve([]))) is None
+    no_gt = summarize_ranked_curve(_curve([], num_gt=0))
+    assert compare_recall_and_ranking(no_gt, no_gt) is None
+
+
+def test_partition_closes_over_small_binary_streams_and_is_antisymmetric():
+    from itertools import product
+    streams = [list(bits) for length in range(5) for bits in product((False, True), repeat=length)
+               if sum(bits) <= 2]
+    for before in streams:
+        for after in streams:
+            forward, reverse = partition(before, after), partition(after, before)
+            fp, rp = forward["ap_partition_points"], reverse["ap_partition_points"]
+            assert sum(fp.values()) == pytest.approx(forward["delta_AP_points"], abs=1e-10)
+            assert fp["lost_recall_support"] == pytest.approx(-rp["gained_recall_support"])
+            assert fp["shared_recall_precision"] == pytest.approx(-rp["shared_recall_precision"])
