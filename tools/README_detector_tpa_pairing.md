@@ -1082,3 +1082,53 @@ CPU 回归（不需要 Detectron2/CUDA，也不会跑正式评测）：
 PYTHONPATH=. python -m pytest -q --rootdir=tests --confcutdir=tests \
   tests/test_decoder_rollback.py tests/test_query_path_updates.py
 ```
+
+### 一次性全模型轨迹平均：8ep/12ep = 50:50
+
+decoder-only 回退在完整 LVIS 上得到 AP `37.1461`、APr `42.0543`，相对原生 10ep
+分别下降 `4.6163/0.2488`，因此不再拆模块或扫回退层数。若多个模块沿同一训练轨迹
+共同适配，最低成本的剩余检查是让它们**整体同步移动**：只评测一次
+
+```text
+theta_avg = 0.5 * theta_8ep + 0.5 * theta_12ep
+```
+
+`evaluate_full_checkpoint_average.py` 使用 query-path 审计锁定的 8ep checkpoint、配置、
+数据和外部资源，并要求 12ep 为同一训练目录的 `model_final.pth`（iteration=85199）。
+所有浮点 model-state 张量统一平均，包括 encoder、decoder、class/box heads 和 TPA；
+半精度张量用 float32 计算后转回原 dtype。非浮点训练计数采用 12ep，其余发生变化的
+整数/bool 状态直接拒绝。共享 alias、K=5、slot prior=.2、mode strength=0、形状和 dtype
+均逐项验证。生成的 checkpoint 不含 optimizer、scheduler、trainer 或 iteration，不能续训。
+
+原生 12ep 指标必须仍为 AP `44.6979`、APr `42.4229`，并且同目录完整预测 JSON 存在；
+原结果不重跑。预先锁定成功条件为 **AP>=44.4 且 APr>=42.9**，防止看完结果后改变
+标准。这不是 EMA 历史重放，也不是插值比例 sweep。
+
+服务器同步提交后运行。输出目录必须不存在，脚本会自行创建并实时输出：
+
+```bash
+cd ~/LaMI-DETR
+CUDA_VISIBLE_DEVICES=0,1,2,3 /root/miniconda3/envs/lami/bin/python -u \
+  tools/evaluate_full_checkpoint_average.py \
+  --audit-report /root/autodl-tmp/no_radius_8ep_vs_10ep_query_updates/report.json \
+  --output-dir /root/autodl-tmp/eval_no_radius_avg8_12_50_50 \
+  --num-gpus 4
+```
+
+另一终端查看：
+
+```bash
+tail -n 30 -F /root/autodl-tmp/eval_no_radius_avg8_12_50_50/console.log
+```
+
+完整 LVIS 只运行一次，框、CLIP ROI、融合和 top-300 全部原生重算，推理协议与 12ep
+完全一致。结果写到 `summary.json`，含九项指标、相对 12ep 的差值和成功条件判断。
+若任一条件失败，停止 checkpoint 平均/模块混合方向；不自动改比例或启动 EMA 训练。
+
+本地 CPU 回归：
+
+```bash
+PYTHONPATH=. python -m pytest -q --rootdir=tests --confcutdir=tests \
+  tests/test_full_checkpoint_average.py tests/test_decoder_rollback.py \
+  tests/test_query_path_updates.py
+```
