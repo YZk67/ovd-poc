@@ -248,7 +248,8 @@ def test_cli_without_detectron2_or_cuda():
     assert "--analyze-only" in result.stdout
 
 
-def test_real_validation_loop_first_order_graph_and_cached_resume(tmp_path, monkeypatch):
+@pytest.mark.parametrize("parent_control", [False, True])
+def test_real_validation_loop_first_order_graph_and_cached_resume(tmp_path, monkeypatch, parent_control):
     class Classifier:
         def _compute_tpa_logits(self, x, **_):
             return x
@@ -293,17 +294,29 @@ def test_real_validation_loop_first_order_graph_and_cached_resume(tmp_path, monk
     path.parent.mkdir(parents=True)
     torch.save({"fingerprint": "parent", "features": torch.stack([before, before*2]),
                 "query_boxes": torch.tensor([[5., 5., 15., 15.], [55., 55., 65., 65.]])}, path)
+    side = "new"
+    if parent_control:
+        side = "old"
+        ctx.control_reference_dir = tmp_path / "previous_audit"
+        ctx.control_reference_signature = "previous"
+        ctx.controls = [{"image_id": 1, "panel": "control_rare", "category": "cat1", "category_id": 1}]
+        anchors = [{**row, "panel": "control_rare", "box_xyxy": box} for row, box in zip(
+            rows, ([5., 5., 15., 15.], [55., 55., 65., 65.]))]
+        save_json(ctx.control_reference_dir / "new/validation_1.json",
+                  {"fingerprint": "previous", "anchor_regions": anchors})
     bank = {"category_ids": list(range(1, 13)), "novel_mask": torch.tensor([True]*6+[False]*6)}
     windows = [{"gradients": {g: torch.tensor([1., 0.]) if g == "classification" else None for g in GROUPS}}]
-    probes, controls = runner.validation_probes(model, (model.core,), cfg, None, ctx, "new", windows, bank)
-    assert not controls and len(probes) == 2 and model.calls == 1
+    probes, controls = runner.validation_probes(model, (model.core,), cfg, None, ctx, side, windows, bank)
+    assert bool(controls) == parent_control and len(probes) == 2 and model.calls == 1
+    if parent_control:
+        assert controls[0]["matched_counts"] == {"tp": 1, "fp": 1}
     htp = -.7 * float(torch.sigmoid(torch.tensor(-.1)))
     hfp = -1.4 * float(torch.sigmoid(torch.tensor(-.2)))
     summaries = summarize_probes(probes, 1)
     classified = next(r for r in summaries if r["loss_group"] == "classification")
     assert classified["raw_descent_derivative"]["tp_minus_fp"] == pytest.approx(htp-hfp)
     assert torch.equal(before, model.core) and model.core.grad is None
-    replay, _ = runner.validation_probes(model, (model.core,), cfg, None, ctx, "new", windows, bank)
+    replay, _ = runner.validation_probes(model, (model.core,), cfg, None, ctx, side, windows, bank)
     assert replay == probes and model.calls == 1
 
 

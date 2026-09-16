@@ -28,8 +28,9 @@ from tools.audit_tpa_gradients import save_gradients
 from tools.capture_tpa_gradients import state_versions
 from tools.compare_rare_pr_reports import file_identity, load_json, save_json
 from tools.decoder_loss_audit_ops import (
-    GROUPS, average_gradients, component_gradients, directional_effects, gradient_summary,
-    isolated_rng, official_control_regions, select_controls, summarize_probes,
+    GROUPS, average_gradients, classification_reconstruction, component_gradients,
+    directional_effects, gradient_summary, isolated_rng, official_control_regions,
+    select_controls, summarize_probes,
 )
 from tools.diagnose_rare_fp_regions import fingerprint
 from tools.evaluate_decoder_rollback import endpoint_state, validate_audit
@@ -121,6 +122,7 @@ def training_windows(model, parameters, cfg, args, ctx, side, iteration, delta):
     reference_path = ctx.output / "new_capture.json"
     reference = (read_locked(reference_path, ctx.signature)["windows"]
                  if side == "old" and reference_path.exists() else None)
+    reference = getattr(ctx, "training_reference", reference)
     model.train()
     model.tpa_advance_step = False
     if any(isinstance(m, torch.nn.modules.batchnorm._BatchNorm) and m.training for m in model.modules()):
@@ -168,14 +170,18 @@ def training_windows(model, parameters, cfg, args, ctx, side, iteration, delta):
                     sampled.clear()
                     with isolated_rng(args.seed + 10000 + w * args.microbatches + micro, device_index):
                         losses = model(data)
-                        g, connected, loss_keys, loss_values = component_gradients(losses, parameters)
+                        options = {"splitter": ctx.loss_splitter} if hasattr(ctx, "loss_splitter") else {}
+                        g, connected, loss_keys, loss_values = component_gradients(losses, parameters, **options)
                     if "fedloss_category_indices" not in sampled:
                         raise ValueError("Missing native FedLoss capture")
                     if reference and sampled["fedloss_category_indices"] != reference[w]["microbatches"][micro]["fedloss_category_indices"]:
                         raise ValueError("Endpoint FedLoss category sampling differs")
                     gradients.append(g)
-                    micros.append({"mapped_inputs": mapped, **sampled, "connections": connected,
-                                   "loss_keys": loss_keys, "weighted_losses": loss_values})
+                    record = {"mapped_inputs": mapped, **sampled, "connections": connected,
+                              "loss_keys": loss_keys, "weighted_losses": loss_values}
+                    if hasattr(ctx, "verify_micro"):
+                        ctx.verify_micro(record, reference[w]["microbatches"][micro])
+                    micros.append(record)
                     del losses, data
                     print(f"[train partial gradients] {side} window={w+1}/{args.windows} "
                           f"micro={micro+1}/{args.microbatches}", flush=True)
@@ -185,6 +191,10 @@ def training_windows(model, parameters, cfg, args, ctx, side, iteration, delta):
                     saved = {"fingerprint": ctx.signature, "side": side, "window": w,
                              "train_annotations": annotation, "microbatches": micros,
                              "gradients": averaged, "summary": gradient_summary(averaged, delta)}
+                    if "class_final" in averaged:
+                        saved["classification_reconstruction"] = classification_reconstruction(averaged)
+                    if hasattr(ctx, "verify_window"):
+                        saved["parent_gradient_replay"] = ctx.verify_window(saved, w)
                     save_gradients(path, saved)
                 print(f"[window] {side}/{w} " + str(saved["summary"]), flush=True)
                 windows.append(saved)
@@ -273,7 +283,9 @@ def validation_probes(model, parameters, cfg, args, ctx, side, windows, bank):
                 if side == "new":
                     rows = official_control_regions(ctx.dataset, controls_by_image[image_id], boxes, scores, bank["category_ids"])
                 else:
-                    source = read_locked(ctx.output / "new" / f"validation_{image_id}.json", ctx.signature)
+                    reference_dir = getattr(ctx, "control_reference_dir", ctx.output)
+                    reference_signature = getattr(ctx, "control_reference_signature", ctx.signature)
+                    source = read_locked(reference_dir / "new" / f"validation_{image_id}.json", reference_signature)
                     rows = source["anchor_regions"]
                 matches = ([{"query_id": r["query_id"], "iou": 1.} for r in rows] if side == "new"
                            else match_regions(rows, boxes, .5))

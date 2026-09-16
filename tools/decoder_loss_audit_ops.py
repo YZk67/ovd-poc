@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 import math
 import random
+import re
 
 import numpy as np
 import torch
@@ -15,6 +16,8 @@ from tools.pairing_lvis_support import _lvis_from_dataset
 
 
 GROUPS = ("classification", "bbox_l1", "bbox_giou", "rpsa", "apr")
+CLASSIFICATION_PARTS = ("class_final", "class_aux", "class_dn", "class_encoder")
+DETAIL_GROUPS = ("classification", *CLASSIFICATION_PARTS, *GROUPS[1:])
 
 
 def split_losses(losses):
@@ -40,14 +43,54 @@ def split_losses(losses):
     return groups
 
 
-def component_gradients(losses, parameters):
+def split_classification_losses(losses):
+    """Keep the independently differentiated total as a reconstruction check.
+
+    Encoder classification is not a decoder auxiliary loss. Record it explicitly
+    and require it to be disconnected from decoder_core in this experiment.
+    """
+    base = split_losses(losses)
+    parts = {k: [] for k in CLASSIFICATION_PARTS}
+    for key in base["classification"]:
+        if key == "loss_class":
+            group = "class_final"
+        elif re.fullmatch(r"loss_class_\d+", key):
+            group = "class_aux"
+        elif re.fullmatch(r"loss_class_dn(?:_\d+)?", key):
+            group = "class_dn"
+        elif key == "loss_class_enc":
+            group = "class_encoder"
+        else:
+            raise ValueError(f"Unclassified classification branch: {key}")
+        parts[group].append(key)
+    if any(not keys for keys in parts.values()):
+        raise ValueError("Expected final/aux/DN/encoder classification branches")
+    return {g: (parts[g] if g in parts else base[g]) for g in DETAIL_GROUPS}
+
+
+def classification_reconstruction(gradients):
+    total = gradients["classification"]
+    if gradients["class_encoder"] is not None:
+        raise ValueError("Encoder classification unexpectedly connects to decoder_core")
+    if total is None:
+        raise ValueError("Total classification has no decoder gradient")
+    parts = [gradients[k] for k in CLASSIFICATION_PARTS if gradients[k] is not None]
+    summed = sum(parts, torch.zeros_like(total))
+    error = (summed.double() - total.double()).norm().item()
+    relative = error / max(total.double().norm().item(), 1e-12)
+    if not torch.allclose(summed, total, rtol=5e-4, atol=2e-6) or relative > 5e-4:
+        raise ValueError("Classification branches do not reconstruct total gradient")
+    return {"relative_l2_error": relative, "max_abs_error": (summed-total).abs().max().item()}
+
+
+def component_gradients(losses, parameters, *, splitter=split_losses):
     """Same forward/targets/dropout/matching for every weighted loss component.
 
     None means no autograd path to ANY decoder-core parameter, not a small norm.
     Partially unused parameters are explicit. Frozen upstreams keep their forward
     values; only partial derivatives with respect to decoder_core are requested.
     """
-    groups = split_losses(losses)
+    groups = splitter(losses)
     totals = {g: sum(losses[k] for k in keys) for g, keys in groups.items()}
     active = [g for g, value in totals.items() if value.requires_grad]
     gradients, connections = {}, {}
@@ -60,12 +103,16 @@ def component_gradients(losses, parameters):
                              for p, value in zip(parameters, values)]).cpu() if connected else None)
         if gradients[group] is not None and not torch.isfinite(gradients[group]).all():
             raise ValueError(f"Nonfinite decoder gradient: {group}")
+    if "class_final" in groups:
+        classification_reconstruction(gradients)
     return gradients, connections, groups, {k: float(v.detach()) for k, v in losses.items() if k.startswith("loss")}
 
 
 def average_gradients(rows):
     result = {}
-    for group in GROUPS:
+    if not rows or any(row.keys() != rows[0].keys() for row in rows):
+        raise ValueError("Microbatch gradient group sets differ or are empty")
+    for group in rows[0]:
         present = [row[group] for row in rows if row[group] is not None]
         result[group] = sum(present) / len(rows) if present else None
     return result
@@ -73,7 +120,7 @@ def average_gradients(rows):
 
 def gradient_summary(gradients, historical_delta):
     result = {}
-    dn = float(historical_delta.double().norm())
+    dn = float(historical_delta.double().norm()) if historical_delta is not None else 0.
     for group, gradient in gradients.items():
         norm = float(gradient.double().norm()) if gradient is not None else 0.
         result[group] = {"connected": gradient is not None, "norm": norm,
@@ -206,18 +253,18 @@ def official_control_regions(dataset, control, boxes, scores, category_ids, *, l
     return result
 
 
-def summarize_probes(probes, windows):
+def summarize_probes(probes, windows, *, groups=GROUPS):
     """Aggregate directional TP-FP differences, requiring full paired coverage."""
-    groups = defaultdict(list)
+    buckets = defaultdict(list)
     for probe in probes:
-        groups[probe["panel"], probe["category"]].append(probe)
+        buckets[probe["panel"], probe["category"]].append(probe)
     output = []
-    for (panel, category), rows in sorted(groups.items()):
+    for (panel, category), rows in sorted(buckets.items()):
         expected = {kind: sum(r["expected_count"] for r in rows if r["kind"] == kind) for kind in ("tp", "fp")}
         matched = {kind: sum(r["count"] for r in rows if r["kind"] == kind) for kind in ("tp", "fp")}
         valid = all(expected[k] == matched[k] and matched[k] > 0 for k in ("tp", "fp"))
         for window in range(windows):
-            for source in GROUPS:
+            for source in groups:
                 values = {}
                 for metric in ("raw_descent_derivative", "unit_descent_derivative"):
                     means = {}
