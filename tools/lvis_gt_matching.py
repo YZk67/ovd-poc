@@ -117,7 +117,8 @@ def _gt_rows_from_evaluator(evaluator, iou_index):
 
 
 def match_panel_gt(
-    dataset, image_ids, predictions, *, iou_thresholds=(0.5, 0.75), max_dets=300
+    dataset, image_ids, predictions, *, iou_thresholds=(0.5, 0.75), max_dets=300,
+    include_selected_predictions=False,
 ):
     """Return official rare-GT matches and diagnostic panel TP/FP summaries.
 
@@ -130,6 +131,10 @@ def match_panel_gt(
     Candidate detections have the correct image/category and meet LVIS's IoU
     threshold, but can be assigned to another GT or be ignored. Detection IDs
     are local to this evaluation; GT IDs remain the original global IDs.
+
+    ``include_selected_predictions`` exposes the actual all-category detections
+    AFTER LVISResults' cap, with matching-local IDs. It does not restore any
+    candidates missing from the supplied prediction JSON.
     """
     if not isinstance(max_dets, int) or isinstance(max_dets, bool) or max_dets <= 0:
         raise ValueError("max_dets must be a positive integer")
@@ -223,7 +228,7 @@ def match_panel_gt(
         })
         gt_by_iou[key] = rows
         summary_by_iou[key] = summary
-    return {
+    result = {
         "scope": "official_LVIS_matching_on_selected_panel_not_full_validation_APr",
         "image_ids": selected_ids,
         "rare_category_ids": rare_ids,
@@ -234,3 +239,11 @@ def match_panel_gt(
         "gt_by_iou": gt_by_iou,
         "per_class": per_class,
     }
+    if include_selected_predictions:
+        result["selected_predictions"] = [
+            {"detection_id": int(ann["id"]), "image_id": int(ann["image_id"]),
+             "category_id": int(ann["category_id"]), "score": float(ann["score"]),
+             "bbox": [float(v) for v in ann["bbox"]]}
+            for ann in detections.dataset["annotations"]
+        ]
+    return result

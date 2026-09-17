@@ -102,3 +102,50 @@ unchanged examples are for display only; all classes remain in official APr.
 - PR accounting does not isolate DN, auxiliary classification, APR, RPSA,
   optimizer moments, LR or feature drift as the training cause. The tool
   makes no automatic recommendation to train or change any of them.
+
+## Follow up the unique scarecrow GT, using saved detections only
+
+After the full-IoU comparison completes, run:
+
+```bash
+cd ~/LaMI-DETR
+set -o pipefail
+/root/miniconda3/envs/lami/bin/python -u tools/trace_single_rare_gt.py \
+  --stage-dir /root/autodl-tmp/no_radius_8ep_vs_12ep_full_pr \
+  --category scarecrow \
+  --output /root/autodl-tmp/no_radius_scarecrow_trace/report.json \
+  2>&1 | tee /root/autodl-tmp/no_radius_scarecrow_trace.log
+```
+
+Requires the previous `report.json`, `inputs.json`, `COMPLETE.json`, both PR
+reports, both prediction files and annotations, at their recorded paths with
+unchanged hashes. No checkpoint, raw tensor cache or image pixels are needed.
+Only **one image** is officially matched at ten IoUs on CPU. Prediction arrays
+are streamed, retaining this image's detections in original source order;
+there is no full-validation re-evaluation or GPU/model fallback.
+
+The trace requires exactly one validation annotation for the selected class,
+preserves original all-category LVIS top-300 and ignore rules, and checks
+per-IoU TP presence against the completed stage report. Unique-GT TP counts
+can be cross-checked against the full-validation report; image-local FP counts
+and ranks cannot be equated with full-validation class FP counts and ranks.
+
+The output includes the original GT/image IDs and box, actual selected boxes,
+categories, fused scores, IoUs to the GT, official matching assignments, score
+rank intervals for ties, and new boxes nearest the old matched box. Possible
+outcomes include:
+
+- Correct-class, eligible box officially matches: a TP.
+- Eligible correct-class box remains but is unmatched/ignored: inspect the
+  official assignment evidence; do not invent a missing box.
+- Eligible correct-class pair is explicitly present in the source JSON but
+  removed by LVIS's cap: an observable evaluator-cap loss.
+- Eligible geometry survives only under another category: a good saved box
+  exists, but its true-class pre-selection score/rank remains unknown.
+- No eligible geometry in saved top-300: **unknown raw-query coverage**, not
+  proof that the model generated no eligible query.
+
+Ordinary result JSONs do not retain discarded query/category scores or query
+identities. Detection IDs here are evaluation-local. Spatially similar boxes
+across models are not necessarily the same query. This post-hoc single-GT
+trace cannot establish a general training cause or justify a new training run.

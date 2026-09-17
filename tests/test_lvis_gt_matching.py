@@ -191,6 +191,18 @@ def test_cached_iou_mapping_uses_ids_and_exact_official_threshold_clamp():
     assert rows[888]["selected_candidates"][0]["ignored"]
 
 
+def test_selected_prediction_export_is_opt_in():
+    pytest.importorskip("lvis")
+    source = dataset()
+    predictions = [prediction()]
+    regular = match_panel_gt(source, [1], predictions)
+    exported = match_panel_gt(source, [1], predictions, include_selected_predictions=True)
+    records = exported.pop("selected_predictions")
+    assert regular == exported
+    assert records == [{"detection_id": 1, "image_id": 1, "category_id": 1,
+                        "score": .9, "bbox": [0., 0., 10., 10.]}]
+
+
 def test_nonreciprocal_official_arrays_fail_with_identity_context():
     evaluator = fake_evaluator()
     evaluator.eval_imgs[0]["gt_matches"][0, 0] = 21
