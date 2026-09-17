@@ -75,8 +75,34 @@ def objective_gradients(losses, parameters, multiplier, accumulation=2):
     return result, {name: float(loss.detach()) for name, loss in scalars.items()}
 
 
+def sample_global_categories(model, global_gt, sampler, *, rank=0, broadcast=None):
+    """Native sampler semantics with a size known identically on every rank.
+
+    FedLoss's target is a minimum: never truncate GT to fit it. The audit has
+    already gathered the complete GT union, so no fixed-size receive buffer is
+    necessary. This does not modify DINO's production distributed sampler.
+    """
+    gt = torch.as_tensor(sorted(set(global_gt)), dtype=torch.long, device=model.device)
+    if gt.numel() and (gt.min() < 0 or gt.max() >= model.num_classes):
+        raise ValueError("Invalid global GT union")
+    size = max(gt.numel(), int(model.fed_loss_num_cat))
+    if not 0 < size <= model.num_classes:
+        raise ValueError("Invalid FedLoss sample target")
+    if rank == 0:
+        indices = sampler(gt, model.fed_loss_num_cat, model.num_classes, model.freq_weight)
+        if indices.numel() != size:
+            raise ValueError("Native sampler returned unexpected vocabulary size")
+    else:
+        indices = torch.empty(size, dtype=torch.long, device=model.device)
+    if broadcast is not None:
+        broadcast(indices)
+    elif rank != 0:
+        raise ValueError("Nonzero rank requires category broadcast")
+    return indices
+
+
 @contextmanager
-def paired_fedloss(model, shared_indices=None):
+def paired_fedloss(model, shared_indices=None, native_draw=None):
     """Consume the native sampler RNG in BOTH policies, then remap from global IDs.
 
     Do not reset RNG *after* the native sample: doing so would change the native
@@ -87,10 +113,15 @@ def paired_fedloss(model, shared_indices=None):
 
     def filtered(data):
         global_labels = [x["instances"].gt_classes.clone() for x in data]
-        native, mapped = original(data)
+        if native_draw is None:
+            native, mapped = original(data)
+        else:
+            native, mapped = native_draw(), data
         selected = native if shared_indices is None else shared_indices.to(native.device)
-        if selected.numel() != native.numel() or selected.unique().numel() != selected.numel():
-            raise ValueError("FedLoss policies must have equal, unique vocabulary size")
+        if selected.numel() < native.numel():
+            raise ValueError("Shared FedLoss vocabulary cannot shrink below the native sample")
+        if selected.unique().numel() != selected.numel():
+            raise ValueError("FedLoss vocabulary must be unique")
         if selected.numel() == 0 or selected.min() < 0 or selected.max() >= model.num_classes:
             raise ValueError("Invalid FedLoss category index")
         if len(mapped) != len(global_labels):
@@ -105,7 +136,8 @@ def paired_fedloss(model, shared_indices=None):
                 raise ValueError("Shared FedLoss vocabulary dropped a GT category")
             item["instances"].gt_classes = local
         record.update(native_indices=native.detach().cpu().tolist(),
-                      selected_indices=selected.detach().cpu().tolist())
+                      selected_indices=selected.detach().cpu().tolist(),
+                      native_category_count=native.numel(), selected_category_count=selected.numel())
         return selected, mapped
 
     model.filter_content_info = filtered
@@ -115,6 +147,76 @@ def paired_fedloss(model, shared_indices=None):
             raise ValueError("FedLoss was not called")
     finally:
         model.filter_content_info = original
+
+
+@contextmanager
+def paired_tpa_dropout(dropout, fed_record, *, reference=None, seed=0):
+    """Keep native dropout unchanged; share its masks by GLOBAL category ID.
+
+    For shared-only categories draw independent masks with a private generator.
+    Restore the native post-dropout RNG so a longer bank cannot shift DN's
+    random stream. The cache is ephemeral (contains tensors), not a JSON row.
+    """
+    original = dropout.forward
+    cache, metadata = {}, {}
+
+    def states(x):
+        return (torch.get_rng_state().clone(),
+                torch.cuda.get_rng_state(x.device).clone() if x.is_cuda else None)
+
+    def restore(x, state):
+        torch.set_rng_state(state[0])
+        if x.is_cuda:
+            torch.cuda.set_rng_state(state[1], x.device)
+
+    def forward(x):
+        if metadata or not dropout.training or dropout.inplace or not 0 <= dropout.p < 1:
+            raise ValueError("Expected one non-inplace training TPA dropout per forward")
+        ids = fed_record["selected_indices"]
+        if x.ndim != 3 or x.shape[0] != len(ids):
+            raise ValueError("TPA dropout bank does not match FedLoss categories")
+        before = states(x)
+        if reference is None:
+            result = original(x)
+            after = states(x)
+            # Recover the exact mask, including positions where input is zero,
+            # without consuming an extra RNG draw in the native forward.
+            devices = [x.device.index] if x.is_cuda else []
+            with torch.random.fork_rng(devices=devices), torch.no_grad():
+                restore(x, before)
+                mask = original(torch.ones_like(x))
+            if not torch.allclose(result.detach(), x.detach()*mask, rtol=1e-6, atol=1e-7):
+                raise ValueError("Cannot reconstruct native TPA dropout mask")
+            cache.update(ids=list(ids), mask=mask, before=before, after=after, p=dropout.p)
+            common = len(ids)
+        else:
+            if dropout.p != reference["p"] or tuple(x.shape[1:]) != tuple(reference["mask"].shape[1:]):
+                raise ValueError("TPA dropout layout/probability changed")
+            for a, b in zip(before, reference["before"]):
+                if (a is None) != (b is None) or (a is not None and not torch.equal(a, b)):
+                    raise ValueError("Unpaired RNG before TPA dropout")
+            generator = torch.Generator(device=x.device)
+            generator.manual_seed(seed)
+            mask = torch.empty_like(x).bernoulli_(1-dropout.p, generator=generator).div_(1-dropout.p)
+            native_map = {c: i for i, c in enumerate(reference["ids"])}
+            dst = [i for i, c in enumerate(ids) if c in native_map]
+            src = [native_map[ids[i]] for i in dst]
+            mask[dst] = reference["mask"][src]
+            common = len(dst)
+            result = x * mask
+            restore(x, reference["after"])
+        metadata.update(mode="native" if reference is None else "category_keyed_replay",
+                        category_count=len(ids), shared_masks=common,
+                        fresh_masks=len(ids)-common, native_downstream_rng_preserved=True)
+        return result
+
+    dropout.forward = forward
+    try:
+        yield cache, metadata
+        if not metadata:
+            raise ValueError("TPA dropout was not observed")
+    finally:
+        dropout.forward = original
 
 
 def compare_gradients(reference, candidate, groups):

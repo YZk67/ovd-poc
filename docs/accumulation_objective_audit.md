@@ -22,16 +22,35 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 /root/miniconda3/envs/lami/bin/python -u \
   tools/audit_accumulation_objective.py \
   --checkpoint /root/autodl-tmp/instructdet_k5_no_radius_bs32_4ep_seed42/model_0056799.pth \
   --num-gpus 4 --windows 2 \
-  --output-dir /root/autodl-tmp/no_radius_accumulation_objective \
-  2>&1 | tee /root/autodl-tmp/no_radius_accumulation_objective.log
+  --output-dir /root/autodl-tmp/no_radius_accumulation_objective_v2 \
+  2>&1 | tee /root/autodl-tmp/no_radius_accumulation_objective_v2.log
 ```
 
 Use a new empty output directory. The log is deliberately **outside** it.
 No automatic overwrite, training continuation or fallback inference occurs.
-Upload `no_radius_accumulation_objective/report.json` after `COMPLETE.json`
+Upload `no_radius_accumulation_objective_v2/report.json` after `COMPLETE.json`
 appears. Window receipts are saved incrementally; incomplete output is not a
-completed audit. `tail -F /root/autodl-tmp/no_radius_accumulation_objective.log`
+completed audit. `tail -F /root/autodl-tmp/no_radius_accumulation_objective_v2.log`
 shows progress, including rank, window and policy.
+
+### Fix for the first version's GT-union error
+
+`fed_loss_num_cat=100` is a **minimum sample target, not a hard maximum** in
+`get_fed_loss_inds`: more than 100 GT classes are all retained. The original
+audit incorrectly rejected such windows. Version 2 accepts them without
+skipping batches, dropping GT, increasing the configured training target or
+changing any training/model source file.
+
+The audit invokes that exact sampler using the already gathered global GT
+union and broadcasts its actual length on every rank, both for the native
+microbatch and shared-window policies. This avoids the production DINO
+wrapper's fixed-length nonzero-rank buffer, without modifying that wrapper.
+For a microbatch with <=100 GT classes, sampling results/RNG consumption match
+the original sampler; above 100, the audit reports the native **sampling
+semantics**, not a successful replay of the fixed-buffer production transport.
+The actual micro and shared vocabulary sizes are reported, not forced equal.
+
+Use the `_v2` output directory above; preserve the failed first attempt.
 
 ## The four conditional objectives
 
@@ -55,12 +74,19 @@ APR and RPSA are **not** multiplied by the GT correction. The audit checks the
 actual criterion denominators against this algebra before accepting output.
 
 Shared FedLoss is sampled once from all 32 images' GT union, using the native
-frequency weights and class budget. Every physical forward still consumes its
-native sampler's RNG first, in both policies; only then are the selected IDs
-and global-to-local labels replaced. Inputs are deep-copied because DINO remaps
-labels in place. The audit verifies pairing of all four ranks' mapped inputs,
-native draws, downstream RNG states and DN shapes, and observes Hungarian
-assignment changes. If the GT union exceeds the category budget it stops.
+frequency weights and minimum sample target. Every physical forward still
+consumes its native sampling RNG first, in both policies; only then are the
+selected IDs and global-to-local labels replaced. Inputs are deep-copied because
+DINO remaps labels in place.
+
+The native forward's TPA dropout output is unchanged. Its exact mask is
+captured (including zero-input positions), and shared categories reuse this
+mask by **global category ID**, not row position. Shared-only classes receive
+independent masks from a private RNG. The global post-dropout RNG is restored
+to the native state so larger category banks cannot shift DN's random stream.
+This mask coupling is part of the diagnostic, not a training-code change.
+Incoming/outgoing RNG states are checked, as are all four ranks' mapped
+inputs, native category draws and DN shapes. Matching changes are recorded.
 
 ## How to interpret the report
 
@@ -91,6 +117,9 @@ large gradient change, or declare equivalence from two small sampled windows.
 - DN grouping and image padding remain local to four images, compatible with
   viewing two four-rank microbatches as eight *virtual* four-image ranks, but
   this does not recreate historical dropout streams, collectives or data order.
+- DN's random-label range stays at the production configured value (100), even
+  when the bank contains more categories. It is recorded separately; this audit
+  does not quietly repair or expand that training policy as well.
 - Active training BatchNorm is rejected rather than silently using different
   statistics or turning it off. Parameter/persistent-buffer state and source
   checkpoint identities must remain unchanged. Diagnostic caches may change.

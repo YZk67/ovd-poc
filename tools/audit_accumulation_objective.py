@@ -25,7 +25,7 @@ import torch.distributed as dist
 
 from tools.accumulation_objective_ops import (
     category_overlap, compare_gradients, dn_layout, normalization_plan,
-    objective_gradients, paired_fedloss,
+    objective_gradients, paired_fedloss, paired_tpa_dropout, sample_global_categories,
 )
 from tools.compare_rare_pr_reports import file_identity, save_json
 
@@ -35,6 +35,9 @@ SCOPE = [
     "2x2: native independent vs shared-window FedLoss; micro vs pooled-GT normalization.",
     "GT normalization changes detection class/L1/GIoU (final/aux/encoder/DN) only; APR/RPSA keep native weights.",
     "Shared categories also change query initialization, DN label semantics, TPA/APR/RPSA and matching: NOT a final-loss-only mask.",
+    "FedLoss preserves ALL GT classes, even above its sample target; audit-only broadcasts use the actual length.",
+    "Common categories reuse native TPA dropout masks; extra categories use private masks. Native downstream DN RNG is restored.",
+    "DN random-label range remains the production configured fed_loss_num_cat, even when the actual bank is larger.",
     "Raw FP32 parameter gradients BEFORE APR conflict routing, clipping or AdamW. No mixed-precision replay.",
     "DN grouping and image padding remain local to each four-image forward. Stateful training BatchNorm is rejected.",
     "This is a conditional objective comparison, NOT a physical eight-GPU batch-32 or historical training replay.",
@@ -57,7 +60,7 @@ def prepare(args):
         raise ValueError("Output must be separate from protected source files/directories")
     if output.exists() and any(output.iterdir()):
         raise ValueError("Use a new empty output directory; no silent reuse/overwrite")
-    inputs = {"schema_version": 1, "checkpoint": file_identity(args.checkpoint),
+    inputs = {"schema_version": 2, "checkpoint": file_identity(args.checkpoint),
               "config": file_identity(args.config_file), "windows": args.windows,
               "seed": args.seed, "world_size": 4, "physical_batch": 16,
               "accumulation": 2, "effective_batch": 32, "reference_world_size": 8,
@@ -168,6 +171,8 @@ def validate_pairing(native, shared):
             result.append({"rank": rank, "micro": a["micro"],
                            "changed_image_branch_assignments": changed,
                            "image_branch_assignments": total,
+                           "native_category_count": len(a["selected_indices"]),
+                           "shared_category_count": len(b["selected_indices"]),
                            "category_overlap": category_overlap(a["selected_indices"], b["selected_indices"])})
     for micro in range(2):
         for policy in (native, shared):
@@ -243,6 +248,9 @@ def worker(args, inputs, signature):
                "precision": "FP32 forward and raw gradients; TF32 disabled"}
     protocol = {
         "iteration": 56800, "fed_loss_num_cat": int(model.fed_loss_num_cat),
+        "dn_noise_num_classes": int(model.fed_loss_num_cat),
+        "fedloss_transport": "native sampler, pre-gathered GT union, dynamic-size broadcast; audit-only",
+        "dropout_pairing": "native common-category masks plus privately sampled additional masks",
         "dn_number": int(model.dn_number), "label_noise_ratio": float(model.label_noise_ratio),
         "box_noise_scale": float(model.box_noise_scale),
         "classifier": {k: cfg.model.classifier.get(k) for k in (
@@ -271,17 +279,18 @@ def worker(args, inputs, signature):
             counts = [sum(len(row["class_values"]) for rr in all_mapped for row in rr[m]) for m in range(2)]
             plan = normalization_plan(counts)
             all_gt = sorted({c for rr in all_mapped for rows in rr for row in rows for c in row["class_values"]})
-            if len(all_gt) > model.fed_loss_num_cat:
-                raise ValueError("Window GT union exceeds FedLoss budget; cannot preserve vocabulary shape")
+            micro_gt = [sorted({c for rr in all_mapped for row in rr[m] for c in row["class_values"]})
+                        for m in range(2)]
+            if rank == 0:
+                print(f"[window {window+1}] GT category union={len(all_gt)}, "
+                      f"micro unions={[len(x) for x in micro_gt]}, sample target={model.fed_loss_num_cat}; "
+                      "all GT categories retained", flush=True)
             shared_seed = args.seed + 1000 + window
             with _forward_seed(shared_seed, device_index):
-                if rank == 0:
-                    shared = get_fed_loss_inds(torch.tensor(all_gt, device=device, dtype=torch.long),
-                                              model.fed_loss_num_cat, model.num_classes, model.freq_weight)
-                else:
-                    shared = torch.empty(model.fed_loss_num_cat, device=device, dtype=torch.long)
-                dist.broadcast(shared, src=0)
+                shared = sample_global_categories(model, all_gt, get_fed_loss_inds, rank=rank,
+                                                  broadcast=lambda x: dist.broadcast(x, src=0))
             gradients, records, scalars = {}, {}, {}
+            dropout_references = {}
             for policy in ("native", "shared"):
                 accumulated, rows = {}, []
                 scalars[policy] = {"micro": 0., "pooled_gt": 0.}
@@ -291,13 +300,21 @@ def worker(args, inputs, signature):
                     if actual_inputs != mapped[micro]:
                         raise ValueError("Mapped images/GT changed before paired forward")
                     seed = args.seed + 10000 + window * 100 + micro * 10 + rank
+                    def native_draw():
+                        return sample_global_categories(model, micro_gt[micro], get_fed_loss_inds, rank=rank,
+                                                        broadcast=lambda x: dist.broadcast(x, src=0))
                     with (_forward_seed(seed, device_index),
-                          paired_fedloss(model, shared if policy == "shared" else None) as fed,
+                          paired_fedloss(model, shared if policy == "shared" else None, native_draw) as fed,
+                          paired_tpa_dropout(model.transformer.decoder.class_embed[0].tpa.dropout, fed,
+                                             reference=dropout_references[micro] if policy == "shared" else None,
+                                             seed=seed+1000000) as (dropout_cache, dropout_info),
                           forward_observations(model, plan["criterion_normalizers"][micro]) as obs):
                         losses = model(data)
                         rng = [tensor_digest(torch.get_rng_state()), tensor_digest(torch.cuda.get_rng_state(device_index))]
                         parts, values = objective_gradients(
                             losses, parameters, plan["detection_loss_multipliers"][micro])
+                    if policy == "native":
+                        dropout_references[micro] = dropout_cache
                     expected_dn = dn_layout([len(r["class_values"]) for r in mapped[micro]], model.dn_number)
                     if obs["dn"] != expected_dn:
                         raise ValueError("Native DN grouping differs from expected local grouping")
@@ -309,7 +326,7 @@ def worker(args, inputs, signature):
                                 total.add_(current)
                         scalars[policy][name] += values[name]
                     rows.append({"micro": micro, "inputs": actual_inputs, "seed": seed,
-                                 "rng_after": rng, **fed, **obs,
+                                 "rng_after": rng, **fed, **obs, "dropout_pairing": dropout_info,
                                  "sampled_rare_count": int(model.novel_idx[fed["selected_indices"]].sum()),
                                  "weighted_losses": {k: float(v.detach()) for k, v in losses.items() if k.startswith("loss")}})
                     clear_eval_caches(model)
@@ -348,7 +365,7 @@ def worker(args, inputs, signature):
                 for name, metrics in comparisons.items():
                     print(name, metrics["all_trainable"], flush=True)
                 del a, b
-            del gradients, accumulated, batches, records
+            del gradients, accumulated, batches, records, dropout_references, dropout_cache
             gc.collect()
             dist.barrier()
     del loader

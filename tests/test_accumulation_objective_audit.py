@@ -6,7 +6,7 @@ import torch
 
 from tools.accumulation_objective_ops import (
     category_overlap, compare_gradients, dn_layout, normalization_plan,
-    objective_gradients, paired_fedloss, split_objective,
+    objective_gradients, paired_fedloss, paired_tpa_dropout, sample_global_categories, split_objective,
 )
 from tools.audit_accumulation_objective import forward_observations, validate_pairing
 
@@ -114,6 +114,107 @@ def test_fedloss_remaps_global_labels_and_preserves_downstream_rng():
     assert native["native_indices"] == shared["native_indices"]
     assert model.filter_content_info == original
     assert source[0]["instances"].gt_classes.tolist() == [2, 5]
+
+
+def test_fedloss_accepts_expanded_shared_vocabulary_without_dropping_gt():
+    model = FakeSampler()
+    with paired_fedloss(model, torch.tensor([5, 2, 1, 7, 0, 3])) as record:
+        indices, data = model.filter_content_info(sample_data())
+    assert len(indices) == 6
+    assert data[0]["instances"].gt_classes.tolist() == [1, 0]
+    assert record["native_category_count"] == 4
+    assert record["selected_category_count"] == 6
+
+
+def native_sampler():
+    # Exercise the actual sampling implementation without importing CUDA detrex.
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location(
+        "native_fedloss_utils", Path(__file__).resolve().parents[1]/"detrex/utils/utils.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.get_fed_loss_inds
+
+
+@pytest.mark.parametrize("gt_count", [0, 50, 100, 103, 150])
+def test_sampler_and_four_rank_buffers_keep_all_gt_above_100(gt_count):
+    model = SimpleNamespace(num_classes=200, fed_loss_num_cat=100, device="cpu", freq_weight=torch.ones(200))
+    sampler = native_sampler()
+    gt = list(range(gt_count))
+    torch.manual_seed(19)
+    expected = sampler(torch.tensor(gt, dtype=torch.long), 100, 200, model.freq_weight)
+    expected_rng = torch.get_rng_state().clone()
+    torch.manual_seed(19)
+    transferred = []
+    result = sample_global_categories(model, gt, sampler, broadcast=lambda x: transferred.append(x.clone()))
+    torch.testing.assert_close(expected, result, rtol=0, atol=0)
+    assert torch.equal(expected_rng, torch.get_rng_state())
+    assert set(gt) <= set(result.tolist())
+    for rank in (1,2,3):
+        result = sample_global_categories(model, gt, sampler, rank=rank,
+                                         broadcast=lambda x: x.copy_(transferred[0]))
+        assert result.numel() == max(gt_count,100)
+        torch.testing.assert_close(expected, result, rtol=0, atol=0)
+
+
+def test_precomputed_native_union_avoids_fixed_size_production_broadcast():
+    model = FakeSampler()
+    def unsafe_native(data):
+        raise AssertionError("Production sampler must not be called")
+    model.filter_content_info = unsafe_native
+    with paired_fedloss(model, torch.tensor([5, 2, 1, 7, 0]),
+                        native_draw=lambda: torch.tensor([2,5,0,6])) as record:
+        _, data = model.filter_content_info(sample_data())
+    assert data[0]["instances"].gt_classes.tolist() == [1,0]
+    assert record["selected_category_count"] == 5
+    assert model.filter_content_info is unsafe_native
+
+
+@pytest.mark.parametrize("p", [0., .1, .5])
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA dropout replay needs a GPU"))])
+def test_variable_tpa_dropout_preserves_native_and_pairs_by_category(p, device):
+    dropout = torch.nn.Dropout(p).train()
+    original = dropout.forward
+    x = torch.nn.Parameter(torch.ones(3,5,8, device=device))
+    def rng_state():
+        return torch.cuda.get_rng_state() if device == "cuda" else torch.get_rng_state()
+    ids = {"selected_indices": [2,5,0]}
+    torch.manual_seed(42)
+    expected = dropout(x)
+    expected_after = rng_state().clone()
+    torch.manual_seed(42)
+    with paired_tpa_dropout(dropout, ids) as (cache, info):
+        native = dropout(x)
+    torch.testing.assert_close(native, expected, rtol=0, atol=0)
+    assert torch.equal(expected_after, rng_state())
+    assert info["shared_masks"] == 3
+    # Wider bank and permuted rows: masks follow category IDs, not row positions.
+    torch.manual_seed(42)
+    y = torch.nn.Parameter(torch.ones(5,5,8, device=device))
+    with paired_tpa_dropout(dropout, {"selected_indices":[5,7,2,8,0]}, reference=cache, seed=19) as (_, other):
+        shared = dropout(y)
+    torch.testing.assert_close(shared[[0,2,4]], native[[1,0,2]], rtol=0, atol=0)
+    assert other["shared_masks"] == 3 and other["fresh_masks"] == 2
+    assert torch.equal(expected_after, rng_state())
+    gradient = torch.autograd.grad(shared.sum(), y)[0]
+    torch.testing.assert_close(gradient, shared.detach())
+    assert dropout.forward == original
+    assert x.grad is None and y.grad is None
+
+
+def test_dropout_rejects_unpaired_incoming_rng_and_restores_hook():
+    dropout = torch.nn.Dropout(.1).train()
+    original = dropout.forward
+    torch.manual_seed(42)
+    with paired_tpa_dropout(dropout, {"selected_indices":[1]}) as (cache, _):
+        dropout(torch.ones(1,5,8))
+    torch.manual_seed(43)
+    with pytest.raises(ValueError, match="before TPA"):
+        with paired_tpa_dropout(dropout, {"selected_indices":[1,2]}, reference=cache):
+            dropout(torch.ones(2,5,8))
+    assert dropout.forward == original
 
 
 @pytest.mark.parametrize("indices", [[2,1,0,6], [2,5,6], [2,5,5,6], [2,5,0,8]])
