@@ -52,7 +52,12 @@ def representatives(rows):
     return selected
 
 
-def analyze(a, b):
+def analyze(a, b, *, focus=FOCUS, labels=None):
+    # The PR arithmetic is also used for time-separated checkpoints; callers
+    # must not inherit the A/B intervention's treatment labels or focus classes.
+    labels = dict(labels or {"A": "normal updates", "B": "auxiliary decoder gradient blocked"})
+    if set(labels) != {"A", "B"} or any(not isinstance(v, str) or not v.strip() for v in labels.values()):
+        raise ValueError("Expected explicit nonempty A/B endpoint labels")
     # Validate complete rare taxonomy, AP mask and official macro; curves follow below.
     base = compare_reports(a, b, [])
     if a["max_dets"] != 300:
@@ -98,14 +103,14 @@ def analyze(a, b):
     total = cohort(rows, n)
     close(total["apr_contribution"], base["delta_apr"], "official delta APr")
     close(math.fsum(total["partition_contribution"].values()), base["delta_apr"], "full APr partition")
-    original = [r for r in rows if r["name"] in FOCUS]
+    original = [r for r in rows if r["name"] in focus]
     by_name = {r["name"]: r for r in rows}
     original_rows = [{"name": name, "available": name in by_name,
                       "gt_annotations": by_name[name]["gt_annotations"] if name in by_name else None,
                       "A_AP": by_name[name]["old_AP"] if name in by_name else None,
                       "B_AP": by_name[name]["new_AP"] if name in by_name else None,
                       "delta_AP": by_name[name]["delta_AP"] if name in by_name else None,
-                      "outcome": by_name[name]["outcome"] if name in by_name else "no_valid_AP"} for name in FOCUS]
+                      "outcome": by_name[name]["outcome"] if name in by_name else "no_valid_AP"} for name in focus]
     by_iou = {}
     for iou in IOUS:
         changes = [r["iou"][iou]["change"] for r in rows]
@@ -119,19 +124,20 @@ def analyze(a, b):
                 c["same_recall_mean_delta_fp_before"] is not None and c["same_recall_mean_delta_fp_before"] > EPS for c in changes),
             "classes_without_shared_tp_ordinal": sum(c["same_recall_mean_delta_fp_before"] is None for c in changes),
         }
-    return {"complete": True, "A_apr": base["old_apr"], "B_apr": base["new_apr"], "delta_apr": base["delta_apr"],
+    return {"complete": True, "endpoint_labels": labels,
+            "A_apr": base["old_apr"], "B_apr": base["new_apr"], "delta_apr": base["delta_apr"],
             "valid_classes": n, "all_rare_categories": a["rare_category_count"],
             "global": total, "positive_apr_contribution": base["macro_attribution"]["positive_contribution"],
             "negative_apr_contribution": base["macro_attribution"]["negative_contribution"],
             "gt_strata": [{"gt_range": label, **cohort([r for r in rows if lo <= r["gt_annotations"] <= hi], n)}
                           for label, lo, hi in STRATA],
             "original_focus": {"classes": original_rows, "cohort": cohort(original, n),
-                               "rest": cohort([r for r in rows if r["name"] not in FOCUS], n)},
+                               "rest": cohort([r for r in rows if r["name"] not in focus], n)},
             "by_iou": by_iou, "representatives": representatives(rows),
             "per_class": rows,
             "scope": [
                 "All valid rare classes, all official ten IoUs and original all-image top-300 predictions.",
-                "old=A normal; new=B auxiliary decoder gradient blocked. AP values are percentage points.",
+                f"old=A ({labels['A']}); new=B ({labels['B']}). AP values are percentage points.",
                 "Lost/new recall support and shared-recall precision sum EXACTLY to official B-A APr.",
                 "Shared precision is not an FP-only causal effect: FP can move up OR TP move down.",
                 "FP-before compares TP ordinals at equal recall, not paired GT identities; stable score ties retained.",

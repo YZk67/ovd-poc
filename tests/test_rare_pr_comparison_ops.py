@@ -294,10 +294,22 @@ def test_extra_low_rank_fps_do_not_look_like_ranking_loss():
 def test_empty_or_missing_curves_are_not_mislabelled_as_zero_fp_evidence():
     change = partition([True, True], [])
     assert sum(change["ap_partition_points"].values()) == pytest.approx(-100)
+    assert change["ap_partition_points"]["lost_recall_support"] == pytest.approx(-100)
+    assert change["ap_partition_points"]["shared_recall_precision"] == 0
     assert change["same_recall_mean_delta_fp_before"] is None
     assert compare_recall_and_ranking(None, summarize_ranked_curve(_curve([]))) is None
     no_gt = summarize_ranked_curve(_curve([], num_gt=0))
     assert compare_recall_and_ranking(no_gt, no_gt) is None
+
+
+@pytest.mark.parametrize("no_tp", [[], [False], [False, False]])
+def test_first_or_last_tp_includes_zero_recall_bin_in_support_change(no_tp):
+    loss = partition([False, True], no_tp, num_gt=1)
+    gain = partition(no_tp, [False, True], num_gt=1)
+    assert loss["ap_partition_points"] == pytest.approx({
+        "shared_recall_precision": 0., "lost_recall_support": -50., "gained_recall_support": 0.})
+    assert gain["ap_partition_points"] == pytest.approx({
+        "shared_recall_precision": 0., "lost_recall_support": 0., "gained_recall_support": 50.})
 
 
 def test_partition_closes_over_small_binary_streams_and_is_antisymmetric():

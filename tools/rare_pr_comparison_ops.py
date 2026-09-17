@@ -158,6 +158,8 @@ def compare_recall_and_ranking(old, new):
     On the official 101-point grid, separate lost/new recall support from the
     precision change on shared support. Shared-support precision can change
     because FP move up OR TP move down; absolute score thresholds are not used.
+    A curve with zero TP has no supported recall bins, including recall=0;
+    losing the last TP must not invent a shared-precision/ranking effect.
     TP ordinal comparisons describe equal attained recall, not paired GT IDs.
     """
     if old is None or new is None or not old["num_gt"]:
@@ -170,8 +172,8 @@ def compare_recall_and_ranking(old, new):
         old["interpolated_precision_101"], new["interpolated_precision_101"]
     )):
         recall = index * .01
-        was_supported = recall <= old["max_recall"]
-        now_supported = recall <= new["max_recall"]
+        was_supported = old["tp"] > 0 and recall <= old["max_recall"]
+        now_supported = new["tp"] > 0 and recall <= new["max_recall"]
         if was_supported and now_supported:
             key = "shared_recall_precision"
         elif was_supported:
@@ -191,6 +193,7 @@ def compare_recall_and_ranking(old, new):
         for before, after in zip(old["every_tp"], new["every_tp"])
     ]
     return {
+        "recall_support_policy": "positive_tp_and_grid_recall_le_max_recall",
         "delta_AP_points": delta_ap,
         "delta_max_recall_points": 100 * (new["max_recall"] - old["max_recall"]),
         "ap_partition_points": parts,
