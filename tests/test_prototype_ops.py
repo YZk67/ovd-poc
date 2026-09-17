@@ -1,11 +1,13 @@
 import math
 
+import pytest
 import torch
 import torch.nn.functional as F
 
 from lami_dino.prototype_ops import (
     calibrated_logmeanexp_similarity,
     legacy_uncalibrated_logsumexp_similarity,
+    training_tpa_similarity,
     prototype_eval_mode_view,
     prototype_task_view,
     route_conflicting_task_gradient,
@@ -192,6 +194,56 @@ def test_legacy_logsumexp_adds_log_k_for_duplicate_prototypes():
         atol=1e-5,
         rtol=1e-5,
     )
+
+
+def test_training_tpa_similarity_variants_are_exact_and_validated():
+    torch.manual_seed(29)
+    features = F.normalize(torch.randn(2, 3, 8), dim=-1)
+    prototypes = F.normalize(torch.randn(4, 5, 8), dim=-1)
+    calibrated = calibrated_logmeanexp_similarity(
+        features, prototypes, temperature=0.07, logit_scale=50.0
+    )
+    legacy = legacy_uncalibrated_logsumexp_similarity(
+        features, prototypes, logit_scale=50.0
+    )
+    torch.testing.assert_close(
+        training_tpa_similarity(
+            features,
+            prototypes,
+            aggregation="calibrated",
+            temperature=0.07,
+            logit_scale=50.0,
+        ),
+        calibrated,
+    )
+    torch.testing.assert_close(
+        training_tpa_similarity(
+            features,
+            prototypes,
+            aggregation="calibrated_plus_logK",
+            temperature=0.07,
+            logit_scale=50.0,
+        ),
+        calibrated + math.log(5),
+    )
+    torch.testing.assert_close(
+        training_tpa_similarity(
+            features,
+            prototypes,
+            aggregation="legacy",
+            temperature=0.07,
+            logit_scale=50.0,
+        ),
+        legacy,
+    )
+    with pytest.raises(ValueError, match="Unknown TPA training aggregation"):
+        training_tpa_similarity(
+            features,
+            prototypes,
+            aggregation="typo",
+            temperature=0.07,
+            logit_scale=50.0,
+        )
 
 
 def test_soft_fusion_keeps_top_r_categories_and_normalized_weights():

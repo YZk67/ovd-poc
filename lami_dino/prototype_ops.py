@@ -188,6 +188,50 @@ def legacy_uncalibrated_logsumexp_similarity(
     return torch.logsumexp(float(logit_scale) * similarities, dim=-1)
 
 
+TPA_TRAIN_AGGREGATIONS = (
+    "calibrated",
+    "calibrated_plus_logK",
+    "legacy",
+)
+
+
+def training_tpa_similarity(
+    features: torch.Tensor,
+    prototypes: torch.Tensor,
+    *,
+    aggregation: str,
+    temperature: float,
+    logit_scale: float,
+) -> torch.Tensor:
+    """Select the TPA category-logit equation used *during training*.
+
+    This deliberately does not encode an evaluation policy.  Evaluation stays
+    on the classifier's independently configured calibrated/legacy controls so
+    a training-formula experiment cannot accidentally change its test-time
+    scoring rule.
+    """
+    if aggregation not in TPA_TRAIN_AGGREGATIONS:
+        raise ValueError(
+            f"Unknown TPA training aggregation {aggregation!r}; expected one of "
+            f"{TPA_TRAIN_AGGREGATIONS}"
+        )
+    if aggregation == "legacy":
+        return legacy_uncalibrated_logsumexp_similarity(
+            features,
+            prototypes,
+            logit_scale=logit_scale,
+        )
+    logits = calibrated_logmeanexp_similarity(
+        features,
+        prototypes,
+        temperature=temperature,
+        logit_scale=logit_scale,
+    )
+    if aggregation == "calibrated_plus_logK":
+        logits = logits + math.log(prototypes.shape[1])
+    return logits
+
+
 def soft_category_prototype_fusion(
     region_features: torch.Tensor,
     category_logits: torch.Tensor,

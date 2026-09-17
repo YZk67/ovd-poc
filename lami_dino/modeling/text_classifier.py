@@ -7,8 +7,10 @@ from typing import Optional
 
 from lami_dino.models import TextPrototypeAggregator
 from lami_dino.prototype_ops import (
+    TPA_TRAIN_AGGREGATIONS,
     calibrated_logmeanexp_similarity,
     legacy_uncalibrated_logsumexp_similarity,
+    training_tpa_similarity,
 )
 
 
@@ -45,6 +47,7 @@ class TextClassifier(nn.Module):
         tpa_warmup_steps: Optional[int] = None,
         tpa_eval_legacy_logsumexp: bool = False,
         tpa_eval_logit_bias: float = 0.0,
+        tpa_train_aggregation: str = "calibrated",
     ) -> None:
         super().__init__()
 
@@ -66,6 +69,15 @@ class TextClassifier(nn.Module):
         self.tpa_cls_tau = float(tpa_cls_tau)
         self.tpa_eval_legacy_logsumexp = bool(tpa_eval_legacy_logsumexp)
         self.tpa_eval_logit_bias = float(tpa_eval_logit_bias)
+        # Training and evaluation controls are intentionally independent.  A
+        # formula-screening run can change detector/category learning while all
+        # arms are still evaluated with the exact same calibrated Eq. (2).
+        self.tpa_train_aggregation = str(tpa_train_aggregation)
+        if self.tpa_train_aggregation not in TPA_TRAIN_AGGREGATIONS:
+            raise ValueError(
+                "tpa_train_aggregation must be one of "
+                f"{TPA_TRAIN_AGGREGATIONS}, got {self.tpa_train_aggregation!r}"
+            )
 
         if self.use_tpa:
             train_feats = self._load_text_embeddings(text_embed_path or zs_weight_path)
@@ -246,7 +258,15 @@ class TextClassifier(nn.Module):
         # prediction-invariant.
         features = F.normalize(x, p=2, dim=-1) if self.norm_weight else x
         logit_scale = self.norm_temperature if self.norm_weight else 1.0
-        if not self.training and self.tpa_eval_legacy_logsumexp:
+        if self.training:
+            logits = training_tpa_similarity(
+                features,
+                prototypes,
+                aggregation=self.tpa_train_aggregation,
+                temperature=self.tpa_cls_tau,
+                logit_scale=logit_scale,
+            )
+        elif self.tpa_eval_legacy_logsumexp:
             logits = legacy_uncalibrated_logsumexp_similarity(
                 features,
                 prototypes,

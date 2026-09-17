@@ -147,6 +147,9 @@ model = L(DINO)(
         # Inference-only historical controls; both are no-ops during training.
         tpa_eval_legacy_logsumexp=False,
         tpa_eval_logit_bias=0.0,
+        # Training-only Eq. (2) control. Evaluation has independent controls
+        # above, so ablations cannot silently change the inference protocol.
+        tpa_train_aggregation="calibrated",
     ),
     query_path="dataset/metadata/coco_clip_convnextl_a+cname.npy",
     eval_query_path="dataset/metadata/coco_clip_convnextl_a+cname.npy",
