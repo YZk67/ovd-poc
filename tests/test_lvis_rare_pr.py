@@ -89,7 +89,8 @@ def test_operating_points_follow_score_ordered_tp_fp_curve():
     assert points["0.95"]["precision"] is None
 
 
-def test_all_curves_saved_in_single_evaluation_including_unobserved_classes(tmp_path, monkeypatch):
+@pytest.mark.parametrize("all_ious", [False, True])
+def test_all_curves_saved_in_single_evaluation_including_unobserved_classes(tmp_path, monkeypatch, all_ious):
     """Synthetic evaluator seam; does not claim real LVIS integration coverage."""
     import json
     import sys
@@ -98,6 +99,8 @@ def test_all_curves_saved_in_single_evaluation_including_unobserved_classes(tmp_
     categories = [{"id": 1, "name": "koala", "frequency": "r"},
                   {"id": 2, "name": "unobserved", "frequency": "r"}]
     evaluations = []
+    thresholds = np.linspace(.5, .95, 10) if all_ious else np.array([.5, .75])
+    t = len(thresholds)
 
     class GroundTruth:
         def __init__(self, path):
@@ -113,13 +116,13 @@ def test_all_curves_saved_in_single_evaluation_including_unobserved_classes(tmp_
         def __init__(self, *args):
             self.params = SimpleNamespace(
                 area_rng_lbl=["all"], area_rng=[[0, 1e10]], img_ids=[1],
-                iou_thrs=np.array([.5, .75]), rec_thrs=np.linspace(0, 1, 101),
+                iou_thrs=thresholds, rec_thrs=np.linspace(0, 1, 101),
             )
-            precision = np.ones((2, 101, 2, 1))
+            precision = np.ones((t, 101, 2, 1))
             precision[:, :, 1, :] = -1
-            self.eval = {"precision": precision, "recall": np.array([[[1.], [-1.]], [[1.], [-1.]]])}
-            self.eval_imgs = [{"dt_scores": [.8], "dt_matches": np.array([[1], [1]]),
-                               "dt_ignore": np.zeros((2, 1), dtype=bool), "gt_ignore": [False]}, None]
+            self.eval = {"precision": precision, "recall": np.array([[[1.], [-1.]]]*t)}
+            self.eval_imgs = [{"dt_scores": [.8], "dt_matches": np.ones((t, 1)),
+                               "dt_ignore": np.zeros((t, 1), dtype=bool), "gt_ignore": [False]}, None]
 
         def run(self):
             evaluations.append(1)
@@ -137,10 +140,11 @@ def test_all_curves_saved_in_single_evaluation_including_unobserved_classes(tmp_
         "--annotations", str(tmp_path / "annotations.json"),
         "--output", str(tmp_path / "report.json"), "--expected-apr", "100",
         "--focus", "koala", "--all-curves",
-    ])
+    ] + (["--all-iou-curves"] if all_ious else []))
     main()
     saved = json.loads((tmp_path / "report.json").read_text())
     assert evaluations == [1]
     assert saved["curve_scope"] == "all_rare_categories"
     assert set(saved["focus"]) == {"koala", "unobserved"}
     assert saved["focus"]["unobserved"]["iou_curves"]["0.50"]["num_gt"] == 0
+    assert set(saved["focus"]["koala"]["iou_curves"]) == {f"{x:.2f}" for x in thresholds}

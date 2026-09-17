@@ -150,11 +150,11 @@ def verify_apr(per_class_rows, official_apr, expected_apr, tolerance):
     return macro
 
 
-def focus_report(evaluator, category_id, cat_index, category_ap):
+def focus_report(evaluator, category_id, cat_index, category_ap, *, all_ious=False):
     params = evaluator.params
     area_index = params.area_rng_lbl.index("all")
     result = {"category_id": category_id, **category_ap, "iou_curves": {}}
-    for iou in (0.50, 0.75):
+    for iou in (params.iou_thrs if all_ious else (0.50, 0.75)):
         iou_index = int(np.argmin(abs(params.iou_thrs - iou)))
         if not np.isclose(params.iou_thrs[iou_index], iou):
             raise ValueError(f"LVIS evaluator lacks IoU {iou}")
@@ -180,7 +180,9 @@ def main():
     parser.add_argument("--expected-apr", type=float, required=True)
     parser.add_argument("--apr-tolerance", type=float, default=0.02)
     parser.add_argument("--all-curves", action="store_true",
-                        help="Save IoU .50/.75 PR curves for every rare class in this same CPU evaluation; --focus still controls printed examples")
+                        help="Save PR curves for every rare class in this same CPU evaluation (.50/.75 by default); --focus still controls printed examples")
+    parser.add_argument("--all-iou-curves", action="store_true",
+                        help="Save curves at all official IoUs .50:.05:.95, enabling exact full-AP decomposition")
     parser.add_argument(
         "--focus", nargs="+", default=[
             "legume", "papaya", "crouton", "dragonfly", "garbage", "liquor",
@@ -251,7 +253,7 @@ def main():
         )
     by_name = {row["name"]: (index, row) for index, row in enumerate(per_class_rows)}
     focus = {
-        name: focus_report(evaluator, by_name[name][1]["category_id"], *by_name[name])
+        name: focus_report(evaluator, by_name[name][1]["category_id"], *by_name[name], all_ious=args.all_iou_curves)
         for name in (by_name if args.all_curves else args.focus)
     }
 
@@ -298,6 +300,7 @@ def main():
         "expected_apr": args.expected_apr,
         "rare_category_count": len(rare),
         "curve_scope": "all_rare_categories" if args.all_curves else "focus_only",
+        "curve_iou_thresholds": [float(x) for x in evaluator.params.iou_thrs] if args.all_iou_curves else [0.5, 0.75],
         "per_class": per_class_rows,
         "focus": focus,
     }
