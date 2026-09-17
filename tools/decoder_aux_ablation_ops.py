@@ -48,11 +48,13 @@ def state_digest(value):
     return h.hexdigest()
 
 
-def validate_resume(checkpoint):
+def validate_resume(checkpoint, *, start=START):
+    if start not in (START, 71000):
+        raise ValueError("Only the audited 8ep/10ep high-LR endpoints are supported")
     trainer = checkpoint.get("trainer", {})
-    if checkpoint.get("iteration") != START - 1:
-        raise ValueError("Requires the completed 8ep model_0056799.pth")
-    for key, expected in (("iteration", START-1), ("lr_scheduler_max_iter", HORIZON),
+    if checkpoint.get("iteration") != start - 1:
+        raise ValueError(f"Requires the completed checkpoint at iteration {start-1}")
+    for key, expected in (("iteration", start-1), ("lr_scheduler_max_iter", HORIZON),
                           ("gradient_accumulation_steps", 2)):
         if trainer.get(key) != expected:
             raise ValueError(f"Full resume requires trainer.{key}={expected}")
@@ -60,8 +62,8 @@ def validate_resume(checkpoint):
     scheduler = trainer.get("hooks", {}).get("LRScheduler", {})
     scaler = trainer.get("grad_scaler", {})
     groups = optimizer.get("param_groups", [])
-    if not optimizer.get("state") or not groups or scheduler.get("last_epoch") != START:
-        raise ValueError("Missing optimizer moments or original scheduler at 56800")
+    if not optimizer.get("state") or not groups or scheduler.get("last_epoch") != start:
+        raise ValueError(f"Missing optimizer moments or original scheduler at {start}")
     if (not scaler or not math.isfinite(float(scaler.get("scale", float("nan"))))
             or scaler["scale"] <= 0):
         raise ValueError("Missing valid AMP GradScaler state; weights-only initialization is forbidden")
@@ -69,7 +71,7 @@ def validate_resume(checkpoint):
         raise ValueError("Scheduler and optimizer group layout differ")
     for g, lr in zip(groups, scheduler["base_lrs"]):
         if not math.isfinite(lr) or lr <= 0 or not math.isclose(g["lr"], lr, rel_tol=1e-7):
-            raise ValueError("8ep must remain on the original 12ep high-LR plateau")
+            raise ValueError("Endpoint must remain on the original 12ep high-LR plateau")
         # Native get_default_optimizer_params gives normalization groups zero decay.
         if (tuple(g.get("betas", ())) != (0.9, 0.999)
                 or not any(math.isclose(g.get("weight_decay", -1), wd) for wd in (0., 1e-4))):
