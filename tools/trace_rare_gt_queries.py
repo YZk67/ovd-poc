@@ -51,7 +51,8 @@ def validate_trace(trace):
         verify_predictions(rows, rows)
 
 
-def validate_checkpoint(checkpoint, side):
+def validate_checkpoint(checkpoint, side, *, expected_iteration=None):
+    expected_iteration = ITERATIONS[side] if expected_iteration is None else expected_iteration
     state, info = extract_shared_tpa(checkpoint)
     keys = set()
     for key in checkpoint.get("model", checkpoint):
@@ -61,8 +62,8 @@ def validate_checkpoint(checkpoint, side):
     if any(prefix + name not in keys for prefix in info["prefixes"]
            for name in ("slot_prior_strength", "prototype_mode_strength")):
         raise ValueError("No-radius buffers must be explicit; constructor fallback is not allowed")
-    if info["iteration"] != ITERATIONS[side]:
-        raise ValueError(f"{side}: expected iteration {ITERATIONS[side]}, found {info['iteration']}")
+    if info["iteration"] != expected_iteration:
+        raise ValueError(f"{side}: expected iteration {expected_iteration}, found {info['iteration']}")
     if (float(state["prototype_mode_strength"]) != 0.
             or abs(float(state["slot_prior_strength"]) - .2) > 1e-6
             or tuple(state["prototype_queries"].shape) != (5, 256)):
@@ -115,7 +116,8 @@ def find_caches(manifests, expected, identities):
     return found
 
 
-def load_cache(path, label, target, dataset, image):
+def load_cache(path, label, target, dataset, image, *, expected_iteration=None):
+    expected_iteration = ITERATIONS[target] if expected_iteration is None else expected_iteration
     manifest = read_manifest(path)
     branch = path.parent / label
     bank = load_trusted_torch_file(branch / "bank.pt")
@@ -139,7 +141,7 @@ def load_cache(path, label, target, dataset, image):
             raise ValueError(f"Dense cache {name} shape does not match: expected {expected_shape}, "
                              f"got {actual_shape}; cached classifier/prototype space is 768D, "
                              "not the 256D decoder/attention space")
-    if (bank["iteration"] != ITERATIONS[target] or bank["category_ids"] != ids
+    if (bank["iteration"] != expected_iteration or bank["category_ids"] != ids
             or bank["prototype_mode_strength"] != 0.
             or abs(bank["slot_prior_strength"] - .2) > 1e-6
             or abs(bank["tpa_tau"] - PROTOCOL["tpa_tau"]) > 1e-8
