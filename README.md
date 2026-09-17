@@ -141,6 +141,10 @@ CUDA_VISIBLE_DEVICES=1 python tools/train_net.py --config-file lami_dino/configs
 
 
 ##  🥳 Training
+
+Read-only diagnostics: [paired 8ep/12ep Eq.2 training-formula audit](docs/eq2_training_stage_audit.md)
+(bounded single-GPU capture; no parameter updates).
+
 OV-LVIS 
 ```bash
 python tools/preflight_instructdet.py --hash
