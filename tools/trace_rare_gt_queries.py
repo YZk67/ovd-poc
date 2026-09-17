@@ -123,16 +123,28 @@ def load_cache(path, label, target, dataset, image):
     validate_sample(sample, bank, manifest["fingerprint"], label, IMAGE_ID)
     ids = sorted(c["id"] for c in dataset["categories"])
     rare = {c["id"] for c in dataset["categories"] if c["frequency"] == "r"}
+    # TPA prototype_queries/key attention live in hidden_dim=256, but value_proj
+    # preserves the 768D CLIP text space. The capture hook saves classifier.linear
+    # OUTPUT (256 -> 768), not the raw 256D decoder query. Keep all 900 queries.
+    shapes = {
+        "bank.prototypes": (bank.get("prototypes"), (1203, 5, 768)),
+        "bank.vlm_text": (bank.get("vlm_text"), (1203, 768)),
+        "sample.features": (sample.get("features"), (900, 768)),
+        "sample.query_boxes": (sample.get("query_boxes"), (900, 4)),
+        "sample.roi_features": (sample.get("roi_features"), (900, 768)),
+    }
+    for name, (value, expected_shape) in shapes.items():
+        actual_shape = tuple(value.shape) if torch.is_tensor(value) else None
+        if actual_shape != expected_shape:
+            raise ValueError(f"Dense cache {name} shape does not match: expected {expected_shape}, "
+                             f"got {actual_shape}; cached classifier/prototype space is 768D, "
+                             "not the 256D decoder/attention space")
     if (bank["iteration"] != ITERATIONS[target] or bank["category_ids"] != ids
             or bank["prototype_mode_strength"] != 0.
             or abs(bank["slot_prior_strength"] - .2) > 1e-6
-            or tuple(bank["prototypes"].shape) != (1203, 5, 256)
             or abs(bank["tpa_tau"] - PROTOCOL["tpa_tau"]) > 1e-8
             or abs(bank["temperature"] - PROTOCOL["cls_tau"]) > 1e-8
             or not torch.equal(bank["novel_mask"].bool(), torch.tensor([c in rare for c in ids]))
-            or tuple(sample["features"].shape) != (900, 256)
-            or tuple(sample["query_boxes"].shape) != (900, 4)
-            or tuple(sample["roi_features"].shape) != (900, 768)
             or (sample["width"], sample["height"]) != (image["width"], image["height"])):
         raise ValueError("Dense cache bank/image does not match this no-radius endpoint")
     for value in (*sample.values(), *bank.values()):
@@ -189,6 +201,10 @@ def run(args):
         expected[side + "_sha256"] = identities[side + "_checkpoint"]["sha256"]
     found = find_caches(candidate_manifests(args, cache), expected, identities)
     missing = [s for s in ITERATIONS if s not in found]
+    required_missing = [s for s in args.require_cached if s not in found]
+    if required_missing:
+        raise FileNotFoundError(f"Required cached endpoints unavailable: {required_missing}; "
+                                "NO forward started. Check cache provenance; do not recapture silently.")
     print(f"[budget] image={IMAGE_ID}; cached={list(found)}; new forwards={len(missing)} <= 2; "
           "training updates=0; no full-validation inference", flush=True)
     if missing and args.cache_only:
@@ -271,6 +287,8 @@ def parse_args():
     parser.add_argument("--config-file", default="lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_no_radius.py")
     parser.add_argument("--annotations", help="Defaults to the source trace's annotation file")
     parser.add_argument("--reuse-cache", nargs="*", default=[], help="Explicit dense pairing_cache directories")
+    parser.add_argument("--require-cached", nargs="+", choices=tuple(ITERATIONS), default=[],
+                        help="Fail before any forward unless these endpoints have compatible caches")
     parser.add_argument("--cache-search-root", help="Inspect only */pairing_cache and */cache manifests under this directory")
     parser.add_argument("--cache-only", action="store_true", help="Refuse any missing-cache model forward")
     parser.add_argument("--device", default="cuda:0", help="Only missing-cache forwards use this device; replay is CPU")

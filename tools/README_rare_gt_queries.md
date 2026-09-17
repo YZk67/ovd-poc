@@ -25,6 +25,41 @@ Use the actual path of the completed single-GT trace if it differs. Checkpoint
 paths are authenticated by SHA256, iteration, explicit no-radius buffers, and
 shared TPA aliases; filenames alone are not evidence of identity.
 
+## Recovery from the original 256D cache-validation error
+
+The original script incorrectly expected `(1203, 5, 256)` prototypes and
+`(900, 256)` classifier features. In this model, **256 is the decoder/TPA
+attention hidden dimension; prototypes and already-projected classifier
+features are 768D**. The native dump was correct and remains reusable. The fix
+does not change capture code, weights, inference, or the capture fingerprint.
+
+Do not delete the successful old-side `pairing_cache`. Analysis code hashes are
+intentionally locked, so after updating the script use a **new output directory**
+and explicitly reuse the previous capture:
+
+```bash
+cd ~/LaMI-DETR
+mkdir -p /root/autodl-tmp/no_radius_scarecrow_queries_v2
+set -o pipefail
+CUDA_VISIBLE_DEVICES=0 /root/miniconda3/envs/lami/bin/python -u \
+  tools/trace_rare_gt_queries.py \
+  --trace-json /root/autodl-tmp/no_radius_scarecrow_trace/report.json \
+  --old-checkpoint /root/autodl-tmp/instructdet_k5_no_radius_bs32_4ep_seed42/model_0056799.pth \
+  --new-checkpoint /root/autodl-tmp/instructdet_k5_no_radius_bs32_4ep_seed42/model_final.pth \
+  --reuse-cache /root/autodl-tmp/no_radius_scarecrow_queries/pairing_cache \
+  --require-cached old \
+  --cache-search-root /root/autodl-tmp \
+  --output-dir /root/autodl-tmp/no_radius_scarecrow_queries_v2 \
+  2>&1 | tee /root/autodl-tmp/no_radius_scarecrow_queries_v2/run.log
+```
+
+With the reported partial capture and unchanged model/assets, the budget should
+show `cached=['old']; new forwards=1`. Old is replayed on CPU, verified against
+the saved top300, and only then is the missing 12ep image forwarded. Upload the
+new directory's `report.json`; preserve the previous incomplete report/cache.
+`--require-cached old` stops before any GPU forward if the old cache is missing
+or incompatible, so recovery cannot silently repeat the 8ep inference.
+
 ## Bounded reuse and inference
 
 - Search only `*/pairing_cache/manifest.json` and `*/cache/manifest.json` directly

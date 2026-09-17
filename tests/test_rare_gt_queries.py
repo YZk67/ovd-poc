@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from lami_dino.models import TextPrototypeAggregator
 from tools import trace_rare_gt_queries as cli
 from tools.rare_gt_query_ops import analyze_queries, selected_predictions, verify_predictions
 
@@ -154,11 +155,21 @@ def test_dense_cache_rejects_partial_queries_wrong_bank_and_native_check(tmp_pat
     branch = root / "old"
     branch.mkdir()
     ids = list(range(1, 1204))
+    # Use the REAL aggregator with distinct hidden/output dimensions. The old
+    # all-256 synthetic fixture duplicated the validator's incorrect assumption.
+    tpa = TextPrototypeAggregator(dim=768, hidden_dim=256, num_prototypes=5,
+                                 slot_prior_strength=.2, prototype_mode_strength=0.).eval()
+    with torch.no_grad():
+        prototypes, _ = tpa(torch.randn(1, 8, 768), with_loss=False, update_monitor_state=False)
+        features = torch.nn.Linear(256, 768)(torch.randn(900, 256))
+    assert tpa.prototype_queries.shape == (5, 256)
+    assert prototypes.shape == (1, 5, 768) and features.shape == (900, 768)
     bank = dict(fingerprint=signature, label="old", iteration=56799, category_ids=ids,
-                prototype_mode_strength=0., slot_prior_strength=.2, prototypes=torch.zeros(1203, 5, 256),
+                prototype_mode_strength=0., slot_prior_strength=.2, prototypes=prototypes.repeat(1203, 1, 1),
+                vlm_text=torch.zeros(1203, 768),
                 tpa_tau=.004375, temperature=.07, novel_mask=torch.tensor([c == 920 for c in ids]))
     sample = dict(fingerprint=signature, label="old", image_id=cli.IMAGE_ID, width=640, height=479,
-                  features=torch.zeros(900, 256), roi_features=torch.zeros(900, 768),
+                  features=features, roi_features=torch.zeros(900, 768),
                   query_boxes=torch.zeros(900, 4),
                   native_replay_check={"logit_max_abs_error": 1e-5, "score_max_abs_error": 1e-7})
     dataset = {"categories": [{"id": c, "frequency": "r" if c == 920 else "f"} for c in ids]}
@@ -171,7 +182,13 @@ def test_dense_cache_rejects_partial_queries_wrong_bank_and_native_check(tmp_pat
 
     assert load()[1]["iteration"] == 56799
     with pytest.raises(ValueError, match="does not match"):
-        load(s={**sample, "features": torch.zeros(300, 256)})
+        load(s={**sample, "features": torch.zeros(300, 768)})
+    with pytest.raises(ValueError, match=r"sample.features.*got \(900, 256\)"):
+        load(s={**sample, "features": torch.zeros(900, 256)})
+    with pytest.raises(ValueError, match=r"bank.prototypes.*got \(1203, 5, 256\)"):
+        load(b={**bank, "prototypes": torch.zeros(1203, 5, 256)})
+    with pytest.raises(ValueError, match="bank.vlm_text"):
+        load(b={**bank, "vlm_text": torch.zeros(1203, 256)})
     with pytest.raises(ValueError, match="does not match"):
         load(b={**bank, "prototype_mode_strength": 1.5})
     with pytest.raises(ValueError, match="native"):
@@ -217,7 +234,8 @@ def setup_run(tmp_path, monkeypatch, cache_only=False):
     monkeypatch.setattr(cli, "dump_checkpoint", dump)
     args = SimpleNamespace(cpu_threads=1, trace_json=str(source), annotations=None, old_checkpoint=str(old),
                            new_checkpoint=str(new), config_file=str(config), output_dir=str(tmp_path / "output"),
-                           reuse_cache=[], cache_search_root=None, cache_only=cache_only, device="cpu")
+                           reuse_cache=[], require_cached=[], cache_search_root=None,
+                           cache_only=cache_only, device="cpu")
     return args, calls
 
 
@@ -239,6 +257,14 @@ def test_cache_only_missing_does_not_call_model_or_write_report(tmp_path, monkey
     assert calls == [] and not (Path(args.output_dir) / "report.json").exists()
 
 
+def test_required_old_cache_missing_never_recaptures_it(tmp_path, monkeypatch):
+    args, calls = setup_run(tmp_path, monkeypatch)
+    args.require_cached = ["old"]
+    with pytest.raises(FileNotFoundError, match="Required cached endpoints.*old.*NO forward"):
+        cli.run(args)
+    assert not calls and not (Path(args.output_dir) / "report.json").exists()
+
+
 def test_reproduction_failure_stops_before_other_endpoint_or_conclusion(tmp_path, monkeypatch):
     args, calls = setup_run(tmp_path, monkeypatch)
     monkeypatch.setattr(cli, "replay_sample", lambda *a, **kw: replay())
@@ -246,6 +272,32 @@ def test_reproduction_failure_stops_before_other_endpoint_or_conclusion(tmp_path
         cli.run(args)
     report = json.loads((Path(args.output_dir) / "report.json").read_text())
     assert calls == ["old"] and not report["complete"] and not report["endpoints"]
+
+
+def test_retry_in_fresh_analysis_dir_reuses_old_capture_after_validator_failure(tmp_path, monkeypatch):
+    args, calls = setup_run(tmp_path, monkeypatch)
+    working_load = cli.load_cache
+
+    def failing_load(*args):
+        raise ValueError("previous cache dimension validator failed")
+
+    monkeypatch.setattr(cli, "load_cache", failing_load)
+    with pytest.raises(ValueError, match="dimension validator"):
+        cli.run(args)
+    assert calls == ["old"]
+    old_output = Path(args.output_dir)
+    old_cache = old_output / "pairing_cache"
+    identities = {p: cli.file_identity(p) for p in old_cache.rglob('*') if p.is_file()}
+    incomplete_report = cli.file_identity(old_output / "report.json")
+    monkeypatch.setattr(cli, "load_cache", working_load)
+    args.output_dir = str(tmp_path / "output_v2")
+    args.reuse_cache = [str(old_cache)]
+    args.require_cached = ["old"]
+    result = cli.run(args)
+    assert result["complete"] and result["new_forward_calls"] == 1
+    assert calls == ["old", "new"]  # Old is NEVER forwarded a second time.
+    assert {p: cli.file_identity(p) for p in identities} == identities
+    assert cli.file_identity(old_output / "report.json") == incomplete_report
 
 
 def test_cli_help_without_detectron_or_lvis():
