@@ -87,3 +87,31 @@ PYTHONPATH=.. python -m pytest --rootdir=. --confcutdir=. -q test_decoder_aux_ab
 
 CPU测试用原生 Trainer 的未修改方法验证梯度累积/裁剪和恢复机制；不替代服务器
 PyTorch1.12/CUDA/detrex/NCCL的实际运行。正式评测仍使用原生 `train_net.py --eval-only`。
+
+## 完成后的零 GPU 全 rare 类分解
+
+A/B 的两次完整评测完成后，可用保存的预测和每步梯度日志解释结果。该步骤会重新做
+两次 CPU LVIS 累积及 rare-GT 图像的官方一对一匹配，通常需要一段时间，但不加载
+checkpoint、不训练，也不启动 GPU。输出目录同样必须不存在：
+
+```bash
+cd ~/LaMI-DETR
+CUDA_VISIBLE_DEVICES='' nohup /root/miniconda3/envs/lami/bin/python -u \
+  tools/analyze_decoder_aux_outcome.py \
+  --trial-dir /root/autodl-tmp/no_radius_aux_decoder_ab_500 \
+  --output-dir /root/autodl-tmp/no_radius_aux_decoder_ab_500_analysis \
+  > /root/autodl-tmp/no_radius_aux_decoder_ab_500_analysis.log 2>&1 &
+```
+
+```bash
+tail -n 60 -F /root/autodl-tmp/no_radius_aux_decoder_ab_500_analysis.log
+```
+
+结果保存在 `no_radius_aux_decoder_ab_500_analysis/report.json`。它包含全部有效 rare 类
+的 `ΔAP/ΔAP50/ΔAP75`、GT数分层、IoU=.50/.75 的 recall/ranking AP 分解、A/B
+正式GT命中转移以及全局梯度范数分布。GT漏失原因只在最终top-300内分为：有正确类
+候选但未匹配；存在重叠框但真类候选缺席；最终top-300连重叠框也没有。
+
+最终预测没有保存被top-300丢弃的全query，所以后两项不能继续解释成“proposal不存在”
+或“正确pair只是在top-300以下”。每步梯度日志也没有类别维度，脚本不会伪造逐类
+梯度与ΔAP的相关性。若要回答那两个问题，必须另有训练前锁定的全query缓存。
