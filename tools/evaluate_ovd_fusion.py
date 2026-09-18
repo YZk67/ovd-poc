@@ -155,6 +155,107 @@ def save_metric_report(path, results):
     print(f"[save] {output_path}")
 
 
+SWEEP_PROFILE_PREFIX = "power_beta"
+
+
+def select_profile_names(available, explicit=None, prefix=None):
+    """Explicit names first, then prefix matches; neither selects everything."""
+    available = list(available)
+    if not explicit and not prefix:
+        return available
+    selected = []
+    for name in explicit or []:
+        if name not in available:
+            raise ValueError(f"unknown profile {name!r}; available={available}")
+        if name not in selected:
+            selected.append(name)
+    if prefix:
+        matches = [name for name in available if name.startswith(prefix)]
+        if not matches:
+            raise ValueError(f"no profile starts with {prefix!r}; available={available}")
+        for name in matches:
+            if name not in selected:
+                selected.append(name)
+    return selected
+
+
+def check_current_apr(results, expected, tolerance):
+    """The offline replay of ``current_power`` must reproduce the official APr.
+
+    A mismatch means the cached candidate pool or the box conversion differs
+    from the native evaluation, and every other profile in the dump would be
+    suspect. Returns the signed difference on success.
+    """
+    current = results.get("current_power")
+    if current is None:
+        raise ValueError("--expected-current-apr requires evaluating current_power")
+    difference = float(current["APr"]) - float(expected)
+    if abs(difference) > float(tolerance):
+        raise RuntimeError(
+            "offline current_power APr does not reproduce the official evaluation: "
+            f"replay={float(current['APr']):.4f} expected={float(expected):.4f} "
+            f"difference={difference:+.4f} tolerance={float(tolerance)}"
+        )
+    return difference
+
+
+def sweep_grid(results, profiles_by_name):
+    """Rows are novel CLIP weights (beta), columns are novel_scale values."""
+    grid = {}
+    for name, row in results.items():
+        profile = profiles_by_name.get(name)
+        if profile is None or not name.startswith(SWEEP_PROFILE_PREFIX):
+            continue
+        beta = float(profile["novel_weight"])
+        scale = float(profile["novel_scale"])
+        grid.setdefault(beta, {})[scale] = {
+            "AP": float(row["AP"]),
+            "APr": float(row["APr"]),
+            "profile": name,
+        }
+    return grid
+
+
+def best_sweep_cell(grid):
+    cells = [
+        (beta, scale, cell)
+        for beta, row in grid.items()
+        for scale, cell in row.items()
+    ]
+    if not cells:
+        return None
+    return max(cells, key=lambda item: item[2]["APr"])
+
+
+def print_sweep_grid(grid, baseline=None):
+    if not grid:
+        return
+    scales = sorted({scale for row in grid.values() for scale in row})
+    print("\n=== beta x novel_scale grid (AP / APr) ===")
+    header = " ".join(f"{'scale ' + format(scale, 'g'):>19}" for scale in scales)
+    print(f"{'beta':>6} {header}")
+    for beta in sorted(grid):
+        cells = []
+        for scale in scales:
+            cell = grid[beta].get(scale)
+            if cell is None:
+                cells.append(f"{'--':>19}")
+            else:
+                cells.append(f"{cell['AP']:9.4f} /{cell['APr']:8.4f}")
+        print(f"{beta:>6g} " + " ".join(cells))
+    best = best_sweep_cell(grid)
+    line = (
+        f"best APr in grid: beta={best[0]:g} scale={best[1]:g} "
+        f"AP={best[2]['AP']:.4f} APr={best[2]['APr']:.4f}"
+    )
+    if baseline is not None:
+        line += (
+            f"; vs current_power AP {best[2]['AP'] - float(baseline['AP']):+.4f}"
+            f" APr {best[2]['APr'] - float(baseline['APr']):+.4f}"
+        )
+    print(line)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dump-dir", required=True)
@@ -164,7 +265,21 @@ def main():
         default=None,
         help="profile names from manifest.json; default evaluates all",
     )
+    parser.add_argument(
+        "--profile-prefix",
+        default=None,
+        help="also evaluate every manifest profile whose name starts with this "
+        f"prefix, e.g. {SWEEP_PROFILE_PREFIX}",
+    )
     parser.add_argument("--max-dets", type=int, default=300)
+    parser.add_argument(
+        "--expected-current-apr",
+        type=float,
+        default=None,
+        help="official APr of this checkpoint; the offline current_power replay "
+        "must reproduce it or the run fails after saving the report",
+    )
+    parser.add_argument("--apr-tolerance", type=float, default=0.02)
     parser.add_argument("--output", default=None, help="small JSON metric report")
     parser.add_argument(
         "--resume",
@@ -197,12 +312,12 @@ def main():
         )
 
     profiles_by_name = {profile["name"]: profile for profile in manifest["profiles"]}
-    selected_names = args.profiles or list(profiles_by_name)
-    missing = set(selected_names) - set(profiles_by_name)
-    if missing:
-        raise ValueError(
-            f"unknown profiles {sorted(missing)}; available={list(profiles_by_name)}"
-        )
+    selected_names = select_profile_names(
+        profiles_by_name, args.profiles, args.profile_prefix
+    )
+    if args.expected_current_apr is not None and "current_power" not in selected_names:
+        # Evaluate the reproduction check first so a broken dump fails early.
+        selected_names = ["current_power"] + selected_names
 
     num_classes = max(manifest["novel_class_ids"]) + 1
     # LVIS has contiguous classifier indices [0, 1202]. Infer the full count
@@ -241,8 +356,20 @@ def main():
         gc.collect()
         if args.output:
             save_metric_report(args.output, results)
+        if name == "current_power" and args.expected_current_apr is not None:
+            difference = check_current_apr(
+                results, args.expected_current_apr, args.apr_tolerance
+            )
+            print(
+                f"[check] current_power APr reproduces the official value "
+                f"(difference {difference:+.4f})"
+            )
 
     print_summary(results)
+    print_sweep_grid(sweep_grid(results, profiles_by_name), results.get("current_power"))
+    if args.expected_current_apr is not None:
+        # A resumed report may have skipped the evaluation above; re-check it.
+        check_current_apr(results, args.expected_current_apr, args.apr_tolerance)
 
 
 if __name__ == "__main__":

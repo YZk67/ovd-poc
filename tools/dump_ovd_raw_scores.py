@@ -30,7 +30,64 @@ from lami_dino.diagnostic_ops import (  # noqa: E402
 )
 
 
-def build_profiles(model):
+DEFAULT_SWEEP_BETAS = (0.3, 0.4, 0.5, 0.6)
+DEFAULT_SWEEP_SCALES = (3.0, 5.0)
+SWEEP_PROFILE_PREFIX = "power_beta"
+
+
+def sweep_profile_name(beta, scale):
+    return f"{SWEEP_PROFILE_PREFIX}{float(beta):g}_scale{float(scale):g}"
+
+
+def build_sweep_profiles(
+    betas=DEFAULT_SWEEP_BETAS,
+    scales=DEFAULT_SWEEP_SCALES,
+    *,
+    base_weight=0.0,
+):
+    """Explicit (beta, novel_scale) grid for the current power fusion.
+
+    The grid is written into the manifest independently of the CLI fusion
+    overrides, so the same dump answers "which fixed inference constants suit
+    this checkpoint" without re-running inference. ``base_weight`` (alpha) is
+    held fixed; both the current protocol and the experiment lock use zero.
+    """
+    if not 0.0 <= float(base_weight) <= 1.0:
+        raise ValueError(f"sweep base_weight must be within [0, 1], got {base_weight}")
+    profiles = []
+    seen = set()
+    for beta in betas:
+        beta = float(beta)
+        if not 0.0 <= beta <= 1.0:
+            raise ValueError(f"sweep beta must be within [0, 1], got {beta}")
+        for scale in scales:
+            scale = float(scale)
+            if scale <= 0.0:
+                raise ValueError(f"sweep novel_scale must be positive, got {scale}")
+            name = sweep_profile_name(beta, scale)
+            if name in seen:
+                continue
+            seen.add(name)
+            profiles.append(
+                {
+                    "name": name,
+                    "detector_source": "logmeanexp",
+                    "fusion": "power",
+                    "base_weight": float(base_weight),
+                    "novel_weight": beta,
+                    "novel_scale": scale,
+                }
+            )
+    if not profiles:
+        raise ValueError("fusion sweep requires at least one beta and one novel_scale")
+    return profiles
+
+
+def build_profiles(
+    model,
+    sweep_betas=DEFAULT_SWEEP_BETAS,
+    sweep_scales=DEFAULT_SWEEP_SCALES,
+):
     novel_scale = float(model.novel_scale)
     profiles = [
         {
@@ -101,7 +158,21 @@ def build_profiles(model):
                 "novel_scale": novel_scale,
             }
         )
+    existing = {profile["name"] for profile in profiles}
+    for profile in build_sweep_profiles(sweep_betas, sweep_scales):
+        if profile["name"] in existing:
+            raise ValueError(f"duplicate fusion profile name {profile['name']!r}")
+        existing.add(profile["name"])
+        profiles.append(profile)
     return profiles
+
+
+def parse_float_list(text):
+    """Comma-separated floats; keeps LazyConfig ``key=value`` overrides intact."""
+    values = [float(item) for item in str(text).split(",") if item.strip()]
+    if not values:
+        raise argparse.ArgumentTypeError("expected a comma-separated list of numbers")
+    return values
 
 
 def novel_only_component_pairs(detector_logits, vlm_logits, novel_mask, topk):
@@ -206,6 +277,9 @@ def dump_worker(args):
     from detectron2.data import get_detection_dataset_dicts
     from detectron2.utils import comm
 
+    # Validate the sweep grid before paying for model construction.
+    build_sweep_profiles(args.sweep_betas, args.sweep_scales)
+
     cfg = LazyConfig.load(args.config_file)
     cfg = LazyConfig.apply_overrides(cfg, args.opts)
     dataset_name = cfg.dataloader.test.dataset.names
@@ -220,7 +294,7 @@ def dump_worker(args):
     if not model.score_ensemble:
         raise ValueError("raw score fusion requires model.score_ensemble=True")
     DetectionCheckpointer(model).load(args.checkpoint)
-    profiles = build_profiles(model)
+    profiles = build_profiles(model, args.sweep_betas, args.sweep_scales)
     novel_mask = model.novel_idx.to(device=device)
 
     records = get_detection_dataset_dicts(names=dataset_name, filter_empty=False)
@@ -397,6 +471,16 @@ def dump_worker(args):
             "num_dataset_images": len(records),
             "topk_per_profile": args.topk,
             "profiles": profiles,
+            "fusion_sweep": {
+                "betas": [float(value) for value in args.sweep_betas],
+                "scales": [float(value) for value in args.sweep_scales],
+                "base_weight": 0.0,
+                "profile_names": [
+                    profile["name"]
+                    for profile in profiles
+                    if profile["name"].startswith(SWEEP_PROFILE_PREFIX)
+                ],
+            },
             "candidate_pool_extensions": [
                 "detector_scaled_novel_only",
                 "vlm_scaled_novel_only",
@@ -426,6 +510,19 @@ def main():
     parser.add_argument("--num-images", type=int, default=0, help="0 means all images")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--topk", type=int, default=300)
+    parser.add_argument(
+        "--sweep-betas",
+        type=parse_float_list,
+        default=list(DEFAULT_SWEEP_BETAS),
+        help="comma-separated novel CLIP weights (beta) for the explicit "
+        "power-fusion grid; alpha stays 0",
+    )
+    parser.add_argument(
+        "--sweep-scales",
+        type=parse_float_list,
+        default=list(DEFAULT_SWEEP_SCALES),
+        help="comma-separated novel_scale values for the explicit power-fusion grid",
+    )
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("opts", nargs=argparse.REMAINDER)
