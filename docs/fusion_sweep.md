@@ -68,21 +68,21 @@ LAMI=/root/miniconda3/envs/lami/bin/python
 
 $LAMI -u tools/evaluate_ovd_fusion.py \
   --dump-dir /root/autodl-tmp/fusion_sweep/no_radius_12ep \
-  --profiles current_power --profile-prefix power_beta \
+  --profiles current_power detector_scaled --profile-prefix power_beta \
   --expected-current-apr 42.4229 \
   --output /root/autodl-tmp/fusion_sweep/no_radius_12ep_metrics.json --resume \
   2>&1 | tee /root/autodl-tmp/fusion_sweep/no_radius_12ep_eval.log
 
 $LAMI -u tools/evaluate_ovd_fusion.py \
   --dump-dir /root/autodl-tmp/fusion_sweep/no_radius_8ep \
-  --profiles current_power --profile-prefix power_beta \
+  --profiles current_power detector_scaled --profile-prefix power_beta \
   --expected-current-apr 42.8843 \
   --output /root/autodl-tmp/fusion_sweep/no_radius_8ep_metrics.json --resume \
   2>&1 | tee /root/autodl-tmp/fusion_sweep/no_radius_8ep_eval.log
 
 $LAMI -u tools/evaluate_ovd_fusion.py \
   --dump-dir /root/autodl-tmp/fusion_sweep/kang \
-  --profiles current_power --profile-prefix power_beta \
+  --profiles current_power detector_scaled --profile-prefix power_beta \
   --expected-current-apr 45.2037 \
   --output /root/autodl-tmp/fusion_sweep/kang_metrics.json --resume \
   2>&1 | tee /root/autodl-tmp/fusion_sweep/kang_eval.log
@@ -96,6 +96,12 @@ kang 的 `current_power` 若复现不了 45.2037，说明历史报告用的协�
 放宽 `--apr-tolerance`，把 kang 这份当作自身基线，只在它自己的网格内比较。
 
 ## 读法，事先定好
+
+`detector_scaled` 是 beta 0、scale 3，即 novel 类完全不用 CLIP。12ep 上它的 APr 是 29.72，
+比 `current_power` 低 12.7，同时 APc / APf 各掉 7.3 / 5.6：CLIP 在融合里起的是
+对 novel 假阳性的否决作用，没有它，detector 自己的 novel 分数把 top-300 淹掉，
+连 base 的真阳性也被挤出。所以 `detector_scaled` 的 APr 是 detector 自身 rare
+判别力的最干净读数，跨 checkpoint 比它，比比融合后的 APr 更能说明表示有没有变。
 
 - 对每份权重看网格内 APr 最高的一格在哪里，以及那一格的 AP 代价。
 - 12ep 在 `power_beta0.4_scale5` 或更高 beta 下 APr 比 `current_power` 高 1.0 以上、
