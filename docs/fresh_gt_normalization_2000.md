@@ -34,6 +34,11 @@ empty AdamW, scheduler, AMP scaler, LR-group layout and trainable inventory.
 It also verifies mapped inputs, augmentations, global GT counts, FedLoss sampled
 classes, forward RNG, LR and AMP state on every rank/microbatch. Full-bank
 all/rare rank is checked initially, every 50 updates and at the endpoint.
+Fresh slots are not required to satisfy the trained-endpoint rank threshold at
+iteration zero. During updates 0--500, thresholds tighten linearly and the
+bank may not regress materially below its own initialization; any class rank
+below 2 stops the run. From update 500 onward, the original strict all/rare
+mean-rank, p10-rank and cosine guard is mandatory.
 
 The LR scheduler retains its original 85,200-update horizon and starts at
 iteration zero, including the original short linear warmup. This is not a

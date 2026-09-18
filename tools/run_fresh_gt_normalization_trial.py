@@ -21,8 +21,8 @@ from tools.compare_rare_pr_reports import file_identity, load_json, save_json
 from tools.decoder_aux_ablation_ops import HORIZON
 from tools.diagnose_rare_fp_regions import fingerprint
 from tools.evaluate_decoder_rollback import endpoint_state, evaluation_command, run_evaluation
-from tools.fresh_gt_normalization_ops import verify_fresh_pair
-from tools.gt_normalization_trial_ops import ARMS, RANK_GUARD, RANK_PERIOD
+from tools.fresh_gt_normalization_ops import FRESH_RANK_GUARD, verify_fresh_pair
+from tools.gt_normalization_trial_ops import ARMS, RANK_PERIOD
 from tools.run_gt_normalization_trial import read_rows
 from tools.run_tpa_formula_screen import collect_evaluation
 from tools.summarize_eq2_counterfactual import METRICS
@@ -82,7 +82,7 @@ def prepare(args):
         "assets":assets,"train_annotations":train_ann,"val_annotations":val_ann,
         "updates":2000,"num_gpus":4,"seed":42,"cpu_threads":args.cpu_threads,
         "torch_version":str(torch.__version__),"arms":ARMS,"lr_horizon":HORIZON,
-        "rank_guard":RANK_GUARD,"rank_period":RANK_PERIOD,"code":code,
+        "rank_guard":FRESH_RANK_GUARD,"rank_period":RANK_PERIOD,"code":code,
         "scope":[
             "Both arms start from seed42 random detector/TPA plus the same backbone-only CLIP checkpoint.",
             "A uses native per-micro GT normalization; B pools GT across two physical microbatches.",
@@ -90,6 +90,7 @@ def prepare(args):
             "Physical batch16, accumulation2, effective batch32; original 85200-step LR schedule starts at zero.",
             "No-radius K5, slot prior, APR routing, separate clipping and calibrated inference stay fixed.",
             "Initial model/optimizer/scheduler/scaler and every data/RNG/FedLoss record are paired.",
+            "Fresh-rank formation guard rejects regression/collapse and requires the strict trained guard by update500.",
             "2000 updates are about 0.28 epoch: an early screen, not final 4ep/12ep evidence.",
         ],
     }

@@ -31,6 +31,20 @@ def test_fresh_pair_requires_first_loss_and_all_sampling_fields():
         ops.verify_fresh_pair({**later,"fedloss":[3]},later)
 
 
+def test_fresh_rank_guard_accepts_observed_initial_formation_but_not_collapse_or_deadline_failure():
+    observed = {"all":{"mean_rank":3.1204,"p10_rank":2.784,"min_rank":2.4409,
+                       "mean_cos":.8943,"rank_below_2_count":0},
+                "rare":{"mean_rank":3.1377,"p10_rank":2.8132,"min_rank":2.4794,
+                        "mean_cos":.8909,"rank_below_2_count":0},"guard_pass":False}
+    initial = ops.apply_fresh_rank_guard(observed,0)
+    assert initial["guard_pass"] and not initial["strict_guard_pass"]
+    stable = ops.apply_fresh_rank_guard(observed,50,initial)
+    assert stable["guard_pass"]
+    assert not ops.apply_fresh_rank_guard(observed,500,initial)["guard_pass"]
+    collapsed = {**observed,"rare":{**observed["rare"],"min_rank":1.5,"rank_below_2_count":1}}
+    assert not ops.apply_fresh_rank_guard(collapsed,0)["guard_pass"]
+
+
 def build(tmp_path,monkeypatch,arm,rank=0,distributed=False):
     monkeypatch.setattr(torch.cuda,"is_available",lambda:True)
     monkeypatch.setattr(torch.cuda,"is_current_stream_capturing",lambda:False)

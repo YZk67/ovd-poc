@@ -13,10 +13,50 @@ from tools.compare_rare_pr_reports import load_json, save_json
 from tools.decoder_aux_ablation_ops import HORIZON, state_digest
 from tools.decoder_loss_audit_ops import isolated_rng
 from tools.gt_normalization_trial_ops import (
-    ARMS, RANK_PERIOD, bank_health, reweight_losses,
+    ARMS, RANK_GUARD, RANK_PERIOD, bank_health, reweight_losses,
 )
 from tools.accumulation_objective_ops import normalization_plan
 from tools.tpa_formula_screen_ops import live_tpa_geometry, verify_training_formula
+
+FRESH_RANK_GUARD = {
+    "formation_updates":500,
+    "initial":{"mean_rank_min":2.5,"p10_rank_min":2.25,"min_rank_min":2.0,
+               "mean_cos_max":.95,"rank_below_2_max":0},
+    "max_initial_regression":{"mean_rank":.2,"p10_rank":.2,"mean_cos":.03},
+    "final":RANK_GUARD,
+}
+
+
+def apply_fresh_rank_guard(health, update, initial_health=None):
+    """Allow APR formation from fresh slots, while rejecting actual collapse."""
+    strict = bool(health["guard_pass"])
+    progress = min(max(update/FRESH_RANK_GUARD["formation_updates"],0.),1.)
+    first, final = FRESH_RANK_GUARD["initial"],FRESH_RANK_GUARD["final"]
+    thresholds = {
+        "mean_rank_min":first["mean_rank_min"]+(final["mean_rank_min"]-first["mean_rank_min"])*progress,
+        "p10_rank_min":first["p10_rank_min"]+(final["p10_rank_min"]-first["p10_rank_min"])*progress,
+        "min_rank_min":first["min_rank_min"],
+        "mean_cos_max":first["mean_cos_max"]+(final["mean_cos_max"]-first["mean_cos_max"])*progress,
+        "rank_below_2_max":first["rank_below_2_max"],
+    }
+    passed = True
+    for split in ("all","rare"):
+        row = health[split]
+        passed &= (row["mean_rank"] >= thresholds["mean_rank_min"]
+                   and row["p10_rank"] >= thresholds["p10_rank_min"]
+                   and row["min_rank"] >= thresholds["min_rank_min"]
+                   and row["mean_cos"] <= thresholds["mean_cos_max"]
+                   and row["rank_below_2_count"] <= thresholds["rank_below_2_max"])
+        if initial_health is not None:
+            baseline = initial_health[split]
+            regression = FRESH_RANK_GUARD["max_initial_regression"]
+            passed &= (row["mean_rank"] >= baseline["mean_rank"]-regression["mean_rank"]
+                       and row["p10_rank"] >= baseline["p10_rank"]-regression["p10_rank"]
+                       and row["mean_cos"] <= baseline["mean_cos"]+regression["mean_cos"])
+    result = {k:v for k,v in health.items() if k != "guard_pass"}
+    result.update(strict_guard_pass=strict,guard_thresholds=thresholds,
+                  formation_progress=progress,guard_pass=bool(passed and (strict if progress == 1. else True)))
+    return result
 
 
 def verify_fresh_pair(current, reference):
@@ -57,6 +97,7 @@ def make_trainer_class(native, manifest, arm, rank, prompts, inventory, *, rng_c
             self.reference_stream = ((output.parent/"A"/f"pairing_rank{rank}.jsonl").open()
                                      if arm == "B" else None)
             self.health_records = []
+            self.initial_health = None
             self.inventory = inventory
             original = self.optimizer.step
 
@@ -192,8 +233,11 @@ def make_trainer_class(native, manifest, arm, rank, prompts, inventory, *, rng_c
             packet = [None]
             if rank == 0:
                 try:
-                    health = bank_health(live_tpa_geometry(self.raw_model),prompts,
-                                         self.raw_model.novel_idx.cpu().bool())
+                    raw = bank_health(live_tpa_geometry(self.raw_model),prompts,
+                                      self.raw_model.novel_idx.cpu().bool())
+                    health = apply_fresh_rank_guard(raw,self.actual_updates,self.initial_health)
+                    if self.actual_updates == 0:
+                        self.initial_health = health
                     packet[0] = {"update":self.actual_updates,**health}
                 except Exception as exc:
                     packet[0] = {"update":self.actual_updates,"guard_pass":False,"error":str(exc)}

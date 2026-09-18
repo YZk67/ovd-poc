@@ -17,8 +17,8 @@ import torch
 from tools.compare_rare_pr_reports import file_identity, load_json, save_json
 from tools.decoder_aux_ablation_ops import HORIZON
 from tools.diagnose_rare_fp_regions import fingerprint
-from tools.fresh_gt_normalization_ops import make_trainer_class
-from tools.gt_normalization_trial_ops import ARMS, RANK_GUARD, RANK_PERIOD
+from tools.fresh_gt_normalization_ops import FRESH_RANK_GUARD, make_trainer_class
+from tools.gt_normalization_trial_ops import ARMS, RANK_PERIOD
 
 
 def training_options(manifest, arm):
@@ -50,7 +50,7 @@ def read_manifest(path):
         raise ValueError("Fresh trial manifest fingerprint mismatch")
     if (manifest.get("schema") != "fresh_gt_normalization_ab_v1" or manifest["updates"] != 2000
             or manifest["num_gpus"] != 4 or manifest["seed"] != 42 or manifest["arms"] != ARMS
-            or manifest["lr_horizon"] != HORIZON or manifest["rank_guard"] != RANK_GUARD
+            or manifest["lr_horizon"] != HORIZON or manifest["rank_guard"] != FRESH_RANK_GUARD
             or manifest["rank_period"] != RANK_PERIOD):
         raise ValueError("Unexpected fresh paired protocol")
     if str(torch.__version__) != manifest["torch_version"]:
