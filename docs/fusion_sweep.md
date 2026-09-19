@@ -114,6 +114,61 @@ kang 的 `current_power` 若复现不了 45.2037，说明历史报告用的协�
 
 上传三份 `*_metrics.json` 即可，dump 目录不用传。
 
+## 后续一：有条件的 novel 提升（门控），零训练
+
+`analyze_ovd_rescue_gates.py` 只对 novel 候选生效，把分数改成
+`max(当前融合分, d × 纯 detector 分, v × 纯 CLIP 分)`，d、v 各取 {0.1, 0.25, 0.5, 1}，
+连同单边共 25 个门。先在 IoU 0.5 的代理指标上筛（rare 救回的 TP、丢掉的 TP、新增 FP），
+只有"每救回一个 TP 新增 FP 不超过 1 个、丢 TP 不超过 5 个"的门里最好的 3 个才做官方
+LVIS 评测。与全局 novel_scale 的区别：只有 CLIP 或 detector 单边高置信的候选被抬，
+背景框因两边都不确信不受益。
+
+```bash
+cd ~/LaMI-DETR && set -o pipefail
+LAMI=/root/miniconda3/envs/lami/bin/python
+for name in no_radius_8ep kang; do
+  $LAMI -u tools/analyze_ovd_rescue_gates.py \
+    --dump-dir /root/autodl-tmp/fusion_sweep/$name \
+    --baseline-metrics /root/autodl-tmp/fusion_sweep/${name}_metrics.json \
+    --evaluate-top 3 \
+    --output /root/autodl-tmp/fusion_sweep/${name}_rescue_gates.json \
+    2>&1 | tee /root/autodl-tmp/fusion_sweep/${name}_rescue_gates.log
+done
+```
+
+纯 CPU。先看日志里的 `current-miss component partition`：当前漏掉但有合格框的 rare GT
+里，有多少是 detector 单边能救、CLIP 单边能救、都能救、都不能救。这一行直接量出
+"真阳性侧还有多少可捡"。读法事先定：一个门要同时在 8ep 和 kang 上 APr 高 1.0 以上、
+AP 掉不到 0.3 才算数；只在一份权重上有效的门是在拟合那份权重的噪声。
+
+## 后续二：每个 query 限制进榜类别数，一次原生评测
+
+`model.inference_query_class_topk=K` 让每个 query 先只保留分数最高的 K 个类别，再做
+全图 top-300。K=0 是现在的全局选法。它不改任何分数，只是不让同一个 query 的多个
+近义类别占满名额。缓存里没有每个 query 的完整类别分数，必须原生推理，每次约 40 分钟。
+
+```bash
+cd ~/LaMI-DETR && set -o pipefail
+LAMI=/root/miniconda3/envs/lami/bin/python
+for K in 3 1; do
+  CUDA_VISIBLE_DEVICES=0,1,2,3 $LAMI -u tools/train_net.py \
+    --config-file lami_dino/configs/dino_convnext_large_4scale_12ep_lvis_no_radius.py \
+    --num-gpus 4 --eval-only \
+    train.init_checkpoint=/root/autodl-tmp/instructdet_k5_no_radius_bs32_4ep_seed42/model_final.pth \
+    train.output_dir=/root/autodl-tmp/eval_k5_no_radius_12ep_qtopk$K \
+    dataloader.evaluator.output_dir=/root/autodl-tmp/eval_k5_no_radius_12ep_qtopk$K \
+    model.alpha=0.0 model.beta=0.3 model.novel_scale=3.0 model.tpa_eval_mode_scale=1.0 \
+    model.inference_query_class_topk=$K \
+    2>&1 | tee /root/autodl-tmp/eval_k5_no_radius_12ep_qtopk$K.log
+  grep -E 'copypaste: [0-9]' /root/autodl-tmp/eval_k5_no_radius_12ep_qtopk$K/log.txt | tail -n 1
+done
+```
+
+对照 12ep 官方 AP 44.6979 / APr 42.4229。K=3 先跑；K=1 会把每个 query 的第二类别假设
+全部去掉，rare 作为 base 物体第二假设的那部分检测会一起丢，它是用来量这部分有多大的。
+每次评测会写约 1 GB 的 `instances_predictions.pth` 和预测 JSON，看完数字就删。
+若采用某个 K，必须对所有参与比较的权重（含 kang）同样设置并在论文里写明。
+
 ## 本地回归
 
 ```bash
